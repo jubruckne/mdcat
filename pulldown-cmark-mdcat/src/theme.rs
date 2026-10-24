@@ -114,6 +114,8 @@ pub struct Theme {
     pub h1_prefix_style: Style,
     /// Style for H1 heading text (fg + bg color).
     pub h1_text_style: Style,
+    /// Frame H1 titles with a horizontal rule instead of a background banner.
+    pub h1_rule: bool,
 }
 
 impl Theme {
@@ -237,6 +239,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -304,6 +307,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -357,6 +361,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -410,6 +415,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -463,6 +469,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -516,6 +523,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -569,6 +577,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -622,6 +631,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -675,6 +685,7 @@ impl Theme {
             alert_caution_label,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
         }
     }
 
@@ -686,6 +697,7 @@ impl Theme {
             mermaid_palette: MermaidPalette::Generic,
             h1_prefix_style,
             h1_text_style,
+            h1_rule: false,
             ..Self::solarized_dark()
         }
     }

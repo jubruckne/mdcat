@@ -9,7 +9,11 @@
 # [defaults] sets default values for a handful of CLI flags. Each one only applies when the
 # corresponding flag isn't passed explicitly on the command line — the CLI flag always wins.
 [defaults]
-# Add a two-space left margin to all output (same as --margin).
+# Paginate output by default. --paginate/--no-pager override this for any command.
+# Omit to keep command defaults: off for mdcat, on for mdless and mdpick.
+# Use "auto" to page only above 2.5 terminal pages of raw input.
+paginate = "auto"
+# Frame output with the first main heading in the top border (same as --margin).
 margin = true
 # Render typographic punctuation: curly quotes, en/em dashes, an ellipsis (same as
 # --smart-punctuation).
@@ -36,6 +40,8 @@ tabs = 4
 
 # [theme] customises colours and styles, starting from a built-in theme.
 [theme]
+# Frame main headings as "── Title ───" instead of a colored banner.
+h1_rule = true
 # The built-in theme to start from. One of: auto, dark, light, catppuccin-mocha,
 # catppuccin-latte, gruvbox-dark, gruvbox-light, dracula, nord, solarized-dark, solarized-light.
 #

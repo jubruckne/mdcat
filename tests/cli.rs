@@ -26,6 +26,28 @@ mod cli {
     }
 
     #[test]
+    fn analyzer_requires_one_file_and_a_terminal() {
+        for args in [
+            vec!["--analyzer"],
+            vec!["--analyzer", "sample/common-mark.md", "README.md"],
+        ] {
+            let output = run_cargo_mdcat(args);
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("requires exactly one file"));
+            assert!(output.stdout.is_empty());
+        }
+        let output = run_cargo_mdcat(["--analyzer", "sample/common-mark.md"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("interactive terminal"));
+        assert!(output.stdout.is_empty());
+        for flag in ["--paginate", "--no-pager", "--watch"] {
+            let output = run_cargo_mdcat(["--analyzer", flag, "sample/common-mark.md"]);
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
+        }
+    }
+
+    #[test]
     fn show_help() {
         let output = run_cargo_mdcat(["--help"]);
         let stdout = std::str::from_utf8(&output.stdout).unwrap();

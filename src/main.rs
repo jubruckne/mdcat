@@ -33,7 +33,9 @@ use two_face::theme::{EmbeddedThemeName, LazyThemeSet};
 use mdcat::args::{Args, ImageProtocolChoice, ThemeChoice};
 use mdcat::output::{resolved_pager_basename, Output};
 
+mod analyzer;
 mod picker;
+mod query;
 
 /// Clear the terminal screen and scrollback, then move the cursor home.
 fn clear_screen() {
@@ -276,13 +278,13 @@ fn list_themes() -> anyhow::Result<()> {
             theme: resolved.mdcat,
             syntax_theme,
         };
-        writeln!(writer, "=== {name} ===\n").or_else(&ignore_broken_pipe)?;
+        writeln!(writer, "=== {name} ===\n").or_else(ignore_broken_pipe)?;
         let parser = MarkdownParser::new_ext(THEME_SAMPLE, markdown_options(false));
         push_tty(&settings, &env, &NoopResourceHandler, &mut writer, parser)
-            .or_else(&ignore_broken_pipe)?;
-        writeln!(writer).or_else(&ignore_broken_pipe)?;
+            .or_else(ignore_broken_pipe)?;
+        writeln!(writer).or_else(ignore_broken_pipe)?;
     }
-    writer.flush().or_else(&ignore_broken_pipe)?;
+    writer.flush().or_else(ignore_broken_pipe)?;
     Ok(())
 }
 
@@ -368,14 +370,63 @@ fn main() {
         tabs,
     };
 
+    let filenames: Vec<String> = if let mdcat::args::Command::Mdpick { .. } = &args {
+        match args.filenames.as_slice() {
+            [] | [_] => {}
+            _ => {
+                eprintln!("Error: mdpick takes at most one directory argument");
+                std::process::exit(1);
+            }
+        }
+        let directory = match args.filenames.first().map(String::as_str) {
+            None | Some("-") => Path::new("."),
+            Some(directory) => Path::new(directory),
+        };
+        match picker::pick_markdown_file(directory) {
+            Ok(Some(file)) => vec![file.to_string_lossy().into_owned()],
+            Ok(None) => std::process::exit(0),
+            Err(error) => {
+                eprintln!("Error: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        args.filenames.clone()
+    };
+
+    let pagination = args.pagination(defaults.and_then(|d| d.paginate));
+    if args.analyzer && (filenames.len() != 1 || filenames[0] == "-") {
+        eprintln!("Error: --analyzer requires exactly one file argument (not stdin)");
+        std::process::exit(1);
+    }
+    if args.analyzer
+        && !(std::io::IsTerminal::is_terminal(&std::io::stdout())
+            && std::io::IsTerminal::is_terminal(&std::io::stdin()))
+    {
+        eprintln!("Error: --analyzer requires an interactive terminal on stdin and stdout");
+        std::process::exit(1);
+    }
+    let paginate = !args.analyzer
+        && match pagination {
+            mdcat::config::Pagination::Enabled(value) => value,
+            mdcat::config::Pagination::Auto(_) => {
+                !args.watch
+                    && std::io::IsTerminal::is_terminal(&std::io::stdout())
+                    && mdcat::output::should_auto_paginate(
+                        &filenames,
+                        TerminalSize::detect().unwrap_or_default().rows,
+                    )
+            }
+        };
+
     // lessi handles kitty/sixel image escapes without corrupting scrollback (see GH-45),
     // unlike other pagers, so it's exempt from the ansi-only/no-image restrictions below.
     let paginating_with_lessi =
-        args.paginate() && resolved_pager_basename().ok().flatten().as_deref() == Some("lessi");
+        paginate && resolved_pager_basename().ok().flatten().as_deref() == Some("lessi");
 
     let terminal = if args.no_colour {
         TerminalProgram::Dumb
-    } else if args.ansi_only || (args.paginate() && !paginating_with_lessi) {
+    } else if args.ansi_only || (paginate && !paginating_with_lessi) {
         TerminalProgram::Ansi
     } else if paginating_with_lessi || std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         TerminalProgram::detect()
@@ -385,7 +436,7 @@ fn main() {
 
     let terminal_capabilities = {
         let mut caps = terminal.capabilities();
-        if terminal != TerminalProgram::Dumb && (!args.paginate() || paginating_with_lessi) {
+        if terminal != TerminalProgram::Dumb && (!paginate || paginating_with_lessi) {
             if let Some(choice) = image_protocol {
                 caps.image = choice.to_image_capability();
             }
@@ -407,39 +458,15 @@ fn main() {
             Some(0) => terminal_size.with_max_columns(u16::MAX),
             Some(max_columns) => terminal_size.with_max_columns(max_columns),
         };
-        // Reserve the margin's two columns so wrapped output plus margin never
+        // Reserve the frame's borders and padding so wrapped output never
         // exceeds the requested width.
         let terminal_size = if margin {
-            terminal_size.with_max_columns(terminal_size.columns.saturating_sub(2))
+            terminal_size.with_max_columns(terminal_size.columns.saturating_sub(4).max(1))
         } else {
             terminal_size
         };
 
-        let filenames: Vec<String> = if let mdcat::args::Command::Mdpick { .. } = &args {
-            match args.filenames.as_slice() {
-                [] | [_] => {}
-                _ => {
-                    eprintln!("Error: mdpick takes at most one directory argument");
-                    std::process::exit(1);
-                }
-            }
-            let directory = match args.filenames.first().map(String::as_str) {
-                None | Some("-") => Path::new("."),
-                Some(directory) => Path::new(directory),
-            };
-            match picker::pick_markdown_file(directory) {
-                Ok(Some(file)) => vec![file.to_string_lossy().into_owned()],
-                Ok(None) => std::process::exit(0),
-                Err(error) => {
-                    eprintln!("Error: {error:#}");
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            args.filenames.clone()
-        };
-
-        if args.watch && args.paginate() {
+        if args.watch && paginate {
             eprintln!("Error: --watch cannot be combined with --paginate");
             std::process::exit(1);
         }
@@ -463,7 +490,36 @@ fn main() {
         };
         let syntax_theme = resolve_syntax_theme(resolved.is_light, resolved.default_syntax);
         let theme = resolved.mdcat;
-        let exit_code = match Output::new(args.paginate()) {
+        if args.analyzer {
+            let settings = Settings {
+                terminal_capabilities,
+                terminal_size,
+                syntax_set: &extra_newlines(),
+                theme,
+                syntax_theme,
+            };
+            let result = create_resource_handler(if local_only {
+                mdcat::args::ResourceAccess::LocalOnly
+            } else {
+                mdcat::args::ResourceAccess::Remote
+            })
+            .and_then(|handler| {
+                analyzer::run(
+                    &filenames[0],
+                    &settings,
+                    &handler,
+                    render_options,
+                    columns.or(full_width.then_some(u16::MAX)),
+                    args.no_colour,
+                )
+            });
+            if let Err(error) = result {
+                eprintln!("Error: {error:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        let exit_code = match Output::for_files(paginate, &filenames) {
             Ok(mut output) => {
                 let settings = Settings {
                     terminal_capabilities,
@@ -486,7 +542,7 @@ fn main() {
                 };
                 // TODO: Handle this error properly
                 let resource_handler = create_resource_handler(resource_access).unwrap();
-                if args.watch {
+                let code = if args.watch {
                     match watch_file(
                         &filenames[0],
                         &settings,
@@ -522,6 +578,13 @@ fn main() {
                             })
                         })
                         .unwrap_or(1)
+                };
+                match output.finish() {
+                    Ok(()) => code,
+                    Err(error) => {
+                        eprintln!("Error: {error:#}");
+                        1
+                    }
                 }
             }
             Err(error) => {

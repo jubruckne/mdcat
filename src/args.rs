@@ -107,10 +107,10 @@ pub enum Command {
     Mdcat {
         #[command(flatten)]
         args: CommonArgs,
-        /// Paginate the output of mdcat with a pager like less (default for mdless).
+        /// Paginate output with a pager like less. Also settable via defaults.paginate in config.toml.
         #[arg(short, long, overrides_with = "no_pager")]
         paginate: bool,
-        /// Do not paginate output (default). Overrides an earlier --paginate.
+        /// Do not paginate output (default unless configured). Overrides an earlier --paginate.
         #[arg(short = 'P', long)]
         no_pager: bool,
     },
@@ -144,12 +144,32 @@ pub enum Command {
 
 impl Command {
     pub fn paginate(&self) -> bool {
-        match *self {
-            // In both cases look at the option indicating the non-default
-            // behaviour; the overrides above are configured accordingly.
-            Command::Mdcat { paginate, .. } => paginate,
-            Command::Mdless { no_pager, .. } => !no_pager,
-            Command::Mdpick { no_pager, .. } => !no_pager,
+        self.pagination(None) == crate::config::Pagination::Enabled(true)
+    }
+
+    /// Resolve pagination: explicit CLI flags, then config, then the command default.
+    pub fn pagination(
+        &self,
+        default: Option<crate::config::Pagination>,
+    ) -> crate::config::Pagination {
+        use crate::config::Pagination;
+        let (paginate, no_pager, builtin) = match *self {
+            Command::Mdcat {
+                paginate, no_pager, ..
+            } => (paginate, no_pager, false),
+            Command::Mdless {
+                paginate, no_pager, ..
+            }
+            | Command::Mdpick {
+                paginate, no_pager, ..
+            } => (paginate, no_pager, true),
+        };
+        if paginate {
+            Pagination::Enabled(true)
+        } else if no_pager {
+            Pagination::Enabled(false)
+        } else {
+            default.unwrap_or(Pagination::Enabled(builtin))
         }
     }
 }
@@ -169,6 +189,9 @@ impl std::ops::Deref for Command {
 #[derive(Debug, clap::Args)]
 // #[command(author, version, about, after_help = after_help(), long_version = long_version())]
 pub struct CommonArgs {
+    /// Render one file in the built-in Ratatui analyzer (requires a terminal).
+    #[arg(long, conflicts_with_all = ["watch", "paginate", "no_pager"])]
+    pub analyzer: bool,
     /// Files to read.  If - read from standard input instead.
     #[arg(default_value="-", value_hint = ValueHint::FilePath)]
     pub filenames: Vec<String>,
@@ -208,7 +231,7 @@ pub struct CommonArgs {
     /// Watch the input file and re-render on change. Requires a single file argument.
     #[arg(short, long)]
     pub watch: bool,
-    /// Add a two-space left margin to all output. Reduces the effective render width accordingly.
+    /// Frame output with the first main heading in the top border. Reserves four columns.
     /// Also settable via `defaults.margin` in `~/.config/mdcat/config.toml`.
     #[arg(long)]
     pub margin: bool,
@@ -270,10 +293,41 @@ impl CommonArgs {
 #[cfg(test)]
 mod tests {
     use super::Args;
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     #[test]
     fn verify_app() {
         Args::command().debug_assert();
+    }
+    #[test]
+    fn pagination_config_and_cli_precedence() {
+        for (command, builtin) in [("mdcat", false), ("mdless", true), ("mdpick", true)] {
+            for default in [
+                None,
+                Some(crate::config::Pagination::Enabled(false)),
+                Some(crate::config::Pagination::Enabled(true)),
+                Some(crate::config::Pagination::Auto(
+                    crate::config::AutoPagination::Auto,
+                )),
+            ] {
+                let args = Args::try_parse_from([command]).unwrap();
+                assert_eq!(
+                    args.command.pagination(default),
+                    default.unwrap_or(crate::config::Pagination::Enabled(builtin))
+                );
+                for (flags, expected) in [
+                    (vec!["--paginate"], true),
+                    (vec!["--no-pager"], false),
+                    (vec!["--paginate", "--no-pager"], false),
+                    (vec!["--no-pager", "--paginate"], true),
+                ] {
+                    let args = Args::try_parse_from(std::iter::once(command).chain(flags)).unwrap();
+                    assert_eq!(
+                        args.command.pagination(default),
+                        crate::config::Pagination::Enabled(expected)
+                    );
+                }
+            }
+        }
     }
 }

@@ -6,6 +6,28 @@ Fancy `cat` for Markdown (that is, [CommonMark][]):
 $ mdcat sample.md
 ```
 
+Use `mdcat --analyzer sample.md` for the built-in Ratatui/Crossterm viewer.
+Scroll with the arrow keys or j/k, use Page Up/Down and Home/End to navigate,
+and press q to exit. Mouse-wheel scrolling and terminal resizing are supported.
+Images appear as text fallbacks in this mode.
+
+Press `?` to open a prompt popup and ask about the document using Apple's on-device Foundation Models.
+Type a question and press Enter. A small floating window appears immediately with a spinner.
+When the model generates a title, it types into the caption character by character;
+the window expands from 5 to 64 columns over 100 ms once the title is ready.
+If a rendered answer line needs more room, it then expands to 84 columns over 80 ms.
+Both widths are capped by the terminal size; height grows smoothly with the answer.
+Answers are rendered as Markdown with mdcat's styling and syntax highlighting,
+and revealed character by character while preserving that formatting.
+Drag its title bar or use arrow keys (h/j/k/l) to move it; Page Up/Down or the mouse wheel
+scroll the answer. Escape or Tab closes the popup/window, and `?` asks a follow-up.
+Ctrl+L in the response window clears the conversation when idle.
+Queries require Apple Silicon, macOS 26+, and Apple Intelligence with its model downloaded;
+building on macOS requires Xcode 26+. No remote LLM is used. Answers use selected,
+line-numbered source excerpts and a bounded recent conversation, so relevant text can be omitted.
+The character budgets are 18,000 for document passages, 1,500 for recent conversation,
+and 500 for the question; these are approximate context budgets rather than token counts.
+
 ![mdcat showcase with different colour themes][sxs]
 
 mdcat in [Ghostty], with `--theme catppuccin-mocha`, `--theme dracula`,

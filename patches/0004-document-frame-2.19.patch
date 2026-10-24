@@ -1,0 +1,377 @@
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -36,6 +36,8 @@
+ pub mod args;
+ /// User configuration file.
+ pub mod config;
++mod frame;
++
+ /// Output handling for mdcat.
+ pub mod output;
+ /// Resource handling for mdca.
+@@ -45,53 +47,6 @@
+ 
+ /// Default read size limit for resources.
+ pub static DEFAULT_RESOURCE_READ_LIMIT: u64 = 104_857_600;
+-
+-/// A writer that prepends two spaces of left margin after every newline.
+-///
+-/// Only used when `--margin` is passed; callers must shrink the render width
+-/// by 2 columns to account for it.
+-struct MarginWriter<W: Write> {
+-    inner: W,
+-    at_line_start: bool,
+-}
+-
+-impl<W: Write> MarginWriter<W> {
+-    fn new(inner: W) -> Self {
+-        Self {
+-            inner,
+-            at_line_start: true,
+-        }
+-    }
+-}
+-
+-impl<W: Write> Write for MarginWriter<W> {
+-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+-        let mut start = 0;
+-        while start < buf.len() {
+-            if self.at_line_start {
+-                self.inner.write_all(b"  ")?;
+-                self.at_line_start = false;
+-            }
+-            match buf[start..].iter().position(|&b| b == b'\n') {
+-                Some(pos) => {
+-                    let end = start + pos + 1;
+-                    self.inner.write_all(&buf[start..end])?;
+-                    self.at_line_start = true;
+-                    start = end;
+-                }
+-                None => {
+-                    self.inner.write_all(&buf[start..])?;
+-                    start = buf.len();
+-                }
+-            }
+-        }
+-        Ok(buf.len())
+-    }
+-
+-    fn flush(&mut self) -> io::Result<()> {
+-        self.inner.flush()
+-    }
+-}
+ 
+ /// Read input for `filename`.
+ ///
+@@ -120,9 +75,9 @@
+ /// is transformed before and during rendering.
+ #[derive(Debug, Clone, Copy, Default)]
+ pub struct RenderOptions {
+-    /// Prepend a two-space left margin to every rendered line.
++    /// Frame the document, placing its first top-level H1 in the top border.
+     ///
+-    /// Callers must shrink `settings.terminal_size` by 2 columns beforehand so wrapping still
++    /// Callers must shrink `settings.terminal_size` by 4 columns beforehand so wrapping still
+     /// respects the requested output width.
+     pub margin: bool,
+     /// Render typographic punctuation (curly quotes, en/em dashes, ellipsis) instead of the
+@@ -219,18 +174,37 @@
+     let mut sink = BufWriter::new(output.writer());
+     writeln!(sink).or_else(ignore_broken_pipe)?;
+     if render_options.margin {
+-        let mut padded = MarginWriter::new(&mut sink);
+-        pulldown_cmark_mdcat::push_tty(settings, &env, resource_handler, &mut padded, parser)
+-            .and_then(|_| {
+-                event!(Level::TRACE, "Finished rendering, flushing output");
+-                padded.flush()
+-            })
+-            .or_else(ignore_broken_pipe)?;
++        let (title, body) = frame::take_title(parser);
++        // Cursor-moving image/mark protocols cannot be padded into a text frame.
++        let framed_settings = Settings {
++            terminal_capabilities:
++                pulldown_cmark_mdcat::terminal::capabilities::TerminalCapabilities {
++                    style: settings.terminal_capabilities.style,
++                    image: None,
++                    marks: None,
++                },
++            terminal_size: settings.terminal_size,
++            syntax_set: settings.syntax_set,
++            theme: settings.theme.clone(),
++            syntax_theme: settings.syntax_theme.clone(),
++        };
++        let mut rendered = Vec::new();
++        pulldown_cmark_mdcat::push_tty(
++            &framed_settings,
++            &env,
++            resource_handler,
++            &mut rendered,
++            body.into_iter(),
++        )
++        .and_then(|_| frame::write_frame(&mut sink, &title, &rendered, &framed_settings))
++        .or_else(ignore_broken_pipe)?;
+     } else {
+         pulldown_cmark_mdcat::push_tty(settings, &env, resource_handler, &mut sink, parser)
+             .or_else(ignore_broken_pipe)?;
+     }
+-    writeln!(sink).or_else(ignore_broken_pipe)?;
++    if !render_options.margin {
++        writeln!(sink).or_else(ignore_broken_pipe)?;
++    }
+     sink.flush().or_else(ignore_broken_pipe)?;
+     Ok(())
+ }
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -457,10 +457,10 @@
+             Some(0) => terminal_size.with_max_columns(u16::MAX),
+             Some(max_columns) => terminal_size.with_max_columns(max_columns),
+         };
+-        // Reserve the margin's two columns so wrapped output plus margin never
++        // Reserve the frame's borders and padding so wrapped output never
+         // exceeds the requested width.
+         let terminal_size = if margin {
+-            terminal_size.with_max_columns(terminal_size.columns.saturating_sub(2))
++            terminal_size.with_max_columns(terminal_size.columns.saturating_sub(4).max(1))
+         } else {
+             terminal_size
+         };
+diff --git a/src/args.rs b/src/args.rs
+--- a/src/args.rs
++++ b/src/args.rs
+@@ -228,7 +228,7 @@
+     /// Watch the input file and re-render on change. Requires a single file argument.
+     #[arg(short, long)]
+     pub watch: bool,
+-    /// Add a two-space left margin to all output. Reduces the effective render width accordingly.
++    /// Frame output with the first main heading in the top border. Reserves four columns.
+     /// Also settable via `defaults.margin` in `~/.config/mdcat/config.toml`.
+     #[arg(long)]
+     pub margin: bool,
+diff --git a/Cargo.toml b/Cargo.toml
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -29,6 +29,7 @@
+ syntect = { workspace = true }
+ toml = { version = "0.8.19", default-features = false, features = ["parse"] }
+ two-face = "0.5.1"
++textwrap = { version = "0.16.1", default-features = false, features = ["unicode-linebreak", "unicode-width"] }
+ tracing = { workspace = true }
+ tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "std", "fmt", "ansi"] }
+ url = { workspace = true }
+diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2016,6 +2016,7 @@
+  "similar-asserts",
+  "syntect",
+  "terminal-colorsaurus",
++ "textwrap",
+  "toml",
+  "tracing",
+  "tracing-subscriber",
+diff --git a/mdcat.1.adoc b/mdcat.1.adoc
+--- a/mdcat.1.adoc
++++ b/mdcat.1.adoc
+@@ -165,7 +165,9 @@
+     Print a sample rendered with every built-in theme, to help pick one, and exit.
+ 
+ [[margin-option]]--margin::
+-    Add a two-space left margin to all output, reducing the effective render width accordingly.
++    Frame output with rounded borders and the first top-level main heading in the top border.
++    Reserves four columns for borders and padding. Later headings stay in the body.
++    Uses text rendering instead of inline images so the frame stays aligned.
+ 
+ [[smart-punctuation-option]]--smart-punctuation::
+     Render typographic punctuation: straight quotes become curly, `--`/`---` become en/em dashes, and `...` becomes an ellipsis.
+diff --git a/config.toml.example b/config.toml.example
+--- a/config.toml.example
++++ b/config.toml.example
+@@ -13,7 +13,7 @@
+ # Omit to keep command defaults: off for mdcat, on for mdless and mdpick.
+ # Use "auto" to page only above 2.5 terminal pages of raw input.
+ paginate = "auto"
+-# Add a two-space left margin to all output (same as --margin).
++# Frame output with the first main heading in the top border (same as --margin).
+ margin = true
+ # Render typographic punctuation: curly quotes, en/em dashes, an ellipsis (same as
+ # --smart-punctuation).
+diff --git a/src/frame.rs b/src/frame.rs
+new file mode 100644
+--- /dev/null
++++ b/src/frame.rs
+@@ -0,0 +1,172 @@
++//! Document frames for margin output.
++
++use std::io::{self, Write};
++
++use pulldown_cmark::{Event, HeadingLevel, Tag, TagEnd};
++use pulldown_cmark_mdcat::Settings;
++use textwrap::core::display_width;
++
++pub(crate) fn take_title<'a>(events: impl Iterator<Item = Event<'a>>) -> (String, Vec<Event<'a>>) {
++    let mut events = events.peekable();
++    let mut body = Vec::new();
++    let mut title = String::new();
++    let mut depth = 0usize;
++    let mut found = false;
++    while let Some(event) = events.next() {
++        if !found
++            && depth == 0
++            && matches!(
++                &event,
++                Event::Start(Tag::Heading {
++                    level: HeadingLevel::H1,
++                    ..
++                })
++            )
++        {
++            found = true;
++            for part in events.by_ref() {
++                match part {
++                    Event::End(TagEnd::Heading(HeadingLevel::H1)) => break,
++                    Event::Text(text) | Event::Code(text) | Event::InlineMath(text) => {
++                        title.push_str(&text)
++                    }
++                    Event::SoftBreak | Event::HardBreak => title.push(' '),
++                    _ => {}
++                }
++            }
++        } else {
++            match &event {
++                Event::Start(_) => depth += 1,
++                Event::End(_) => depth = depth.saturating_sub(1),
++                _ => {}
++            }
++            body.push(event);
++        }
++    }
++    (title, body)
++}
++
++fn write_row(writer: &mut impl Write, line: &str, width: usize, ansi: bool) -> io::Result<()> {
++    write!(writer, "│ {line}")?;
++    if ansi {
++        write!(writer, "\x1b[0m")?;
++    }
++    writeln!(
++        writer,
++        "{} │",
++        " ".repeat(width.saturating_sub(display_width(line)))
++    )
++}
++
++pub(crate) fn write_frame(
++    writer: &mut impl Write,
++    title: &str,
++    body: &[u8],
++    settings: &Settings,
++) -> io::Result<()> {
++    let width = usize::from(settings.terminal_size.columns).max(1);
++    let inside = width + 2;
++    let ansi = settings.terminal_capabilities.style.is_some();
++    let title = title.trim();
++    let title_lines = textwrap::wrap(title, width);
++    if title.is_empty() {
++        writeln!(writer, "╭{}╮", "─".repeat(inside))?;
++    } else {
++        let first = &title_lines[0];
++        write!(writer, "╭ ")?;
++        if ansi {
++            write!(
++                writer,
++                "{}",
++                settings.theme.h1_text_style.bg_color(None).render()
++            )?;
++        }
++        write!(writer, "{first}")?;
++        if ansi {
++            write!(writer, "\x1b[0m")?;
++        }
++        writeln!(
++            writer,
++            "{}╮",
++            "─".repeat(inside.saturating_sub(1 + display_width(first)))
++        )?;
++        for line in title_lines.iter().skip(1) {
++            write_row(writer, line, width, ansi)?;
++        }
++    }
++    write_row(writer, "", width, ansi)?;
++    let body = String::from_utf8_lossy(body);
++    for line in body
++        .trim_matches('\n')
++        .split('\n')
++        .filter(|_| !body.trim_matches('\n').is_empty())
++    {
++        for wrapped in textwrap::wrap(line, width) {
++            write_row(writer, &wrapped, width, ansi)?;
++        }
++    }
++    writeln!(writer, "╰{}╯", "─".repeat(inside))
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use pulldown_cmark::Parser;
++    use pulldown_cmark_mdcat::{
++        terminal::{TerminalProgram, TerminalSize},
++        Theme,
++    };
++    use syntect::parsing::SyntaxSet;
++
++    #[test]
++    fn title_is_first_top_level_h1_only() {
++        let (title, body) = take_title(Parser::new(
++            "> # Quoted\n\n# Shader **Works**\n\nBody\n\n# Later",
++        ));
++        assert_eq!(title, "Shader Works");
++        let text: String = body
++            .iter()
++            .filter_map(|event| {
++                if let Event::Text(text) = event {
++                    Some(text.as_ref())
++                } else {
++                    None
++                }
++            })
++            .collect();
++        assert_eq!(text, "QuotedBodyLater");
++    }
++
++    #[test]
++    fn frames_align_with_unicode_colors_and_long_lines() {
++        let settings = Settings {
++            terminal_capabilities: TerminalProgram::Dumb.capabilities(),
++            terminal_size: TerminalSize::default().with_max_columns(20),
++            syntax_set: &SyntaxSet::default(),
++            theme: Theme::default(),
++            syntax_theme: None,
++        };
++        for title in [
++            "Shader Works",
++            "日本語",
++            "An exceptionally long document title",
++            "",
++        ] {
++            let mut output = Vec::new();
++            write_frame(
++                &mut output,
++                title,
++                "Text\n\n日本語\n\x1b[31mred\x1b[0m\nA very long body line that should wrap"
++                    .as_bytes(),
++                &settings,
++            )
++            .unwrap();
++            let output = String::from_utf8(output).unwrap();
++            assert!(output.starts_with('╭'));
++            assert!(output.lines().last().unwrap().ends_with('╯'));
++            for line in output.lines() {
++                assert_eq!(display_width(line), 24, "{line:?}");
++            }
++        }
++    }
++}

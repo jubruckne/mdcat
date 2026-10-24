@@ -385,8 +385,12 @@ pub fn write_start_heading<W: Write>(
     let level_style = match level {
         HeadingLevel::H1 => {
             writeln!(writer)?;
-            write_styled(writer, capabilities, &theme.h1_prefix_style, " ")?;
-            theme.h1_text_style
+            if theme.h1_rule {
+                theme.h1_text_style.bg_color(None)
+            } else {
+                write_styled(writer, capabilities, &theme.h1_prefix_style, " ")?;
+                theme.h1_text_style
+            }
         }
         HeadingLevel::H2 => {
             let s = theme.h2_style.on_top_of(&context_style);
