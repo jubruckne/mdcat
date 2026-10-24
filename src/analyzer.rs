@@ -363,7 +363,7 @@ fn draw_prompt(
     let title = if query.busy() {
         " Query · waiting for current response · Esc close "
     } else {
-        " Ask about document (500 chars) · Enter submit · Esc cancel "
+        " Ask about document "
     };
     frame.render_widget(
         Paragraph::new(query.input.as_str())
