@@ -23,12 +23,19 @@ ignore = "0.4.31"
 mime = { workspace = true}
 notify = "8.2.0"
 pulldown-cmark = { workspace = true, features = ['simd'] }
-pulldown-cmark-mdcat = { workspace = true, default-features = true }
+pulldown-cmark-mdcat = { workspace = true, default-features = true, features = ["ratatui"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+crossterm = "0.29"
 serde = { version = "1.0.210", default-features = false, features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11.0"
+signal-hook = "0.3.18"
+tempfile = "3.27.0"
 shell-words = { version = "1.1.0", default-features = false, features = ["std"] }
 syntect = { workspace = true }
-toml = { version = "0.8.19", default-features = false, features = ["parse"] }
+toml = { version = "0.8.19", default-features = false, features = ["parse", "display"] }
 two-face = "0.5.1"
+textwrap = { version = "0.16.1", default-features = false, features = ["unicode-linebreak", "unicode-width"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "std", "fmt", "ansi"] }
 url = { workspace = true }
@@ -39,6 +46,9 @@ similar-asserts = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 anstyle-query = { version = "1.1.0", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+foundation-models = { version = "0.12", features = ["macos_26_0"] }
 
 [package.metadata.release]
 release = true

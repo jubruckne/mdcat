@@ -36,6 +36,9 @@ use output::Output;
 pub mod args;
 /// User configuration file.
 pub mod config;
+mod frame;
+mod history;
+
 /// Output handling for mdcat.
 pub mod output;
 /// Resource handling for mdca.
@@ -45,53 +48,6 @@ pub mod toc;
 
 /// Default read size limit for resources.
 pub static DEFAULT_RESOURCE_READ_LIMIT: u64 = 104_857_600;
-
-/// A writer that prepends two spaces of left margin after every newline.
-///
-/// Only used when `--margin` is passed; callers must shrink the render width
-/// by 2 columns to account for it.
-struct MarginWriter<W: Write> {
-    inner: W,
-    at_line_start: bool,
-}
-
-impl<W: Write> MarginWriter<W> {
-    fn new(inner: W) -> Self {
-        Self {
-            inner,
-            at_line_start: true,
-        }
-    }
-}
-
-impl<W: Write> Write for MarginWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut start = 0;
-        while start < buf.len() {
-            if self.at_line_start {
-                self.inner.write_all(b"  ")?;
-                self.at_line_start = false;
-            }
-            match buf[start..].iter().position(|&b| b == b'\n') {
-                Some(pos) => {
-                    let end = start + pos + 1;
-                    self.inner.write_all(&buf[start..end])?;
-                    self.at_line_start = true;
-                    start = end;
-                }
-                None => {
-                    self.inner.write_all(&buf[start..])?;
-                    start = buf.len();
-                }
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
-    }
-}
 
 /// Read input for `filename`.
 ///
@@ -120,9 +76,9 @@ pub fn read_input<T: AsRef<str>>(filename: T) -> Result<(PathBuf, String)> {
 /// is transformed before and during rendering.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RenderOptions {
-    /// Prepend a two-space left margin to every rendered line.
+    /// Frame the document, placing its first top-level H1 in the top border.
     ///
-    /// Callers must shrink `settings.terminal_size` by 2 columns beforehand so wrapping still
+    /// Callers must shrink `settings.terminal_size` by 4 columns beforehand so wrapping still
     /// respects the requested output width.
     pub margin: bool,
     /// Render typographic punctuation (curly quotes, en/em dashes, ellipsis) instead of the
@@ -219,18 +175,37 @@ pub fn process_file(
     let mut sink = BufWriter::new(output.writer());
     writeln!(sink).or_else(ignore_broken_pipe)?;
     if render_options.margin {
-        let mut padded = MarginWriter::new(&mut sink);
-        pulldown_cmark_mdcat::push_tty(settings, &env, resource_handler, &mut padded, parser)
-            .and_then(|_| {
-                event!(Level::TRACE, "Finished rendering, flushing output");
-                padded.flush()
-            })
-            .or_else(ignore_broken_pipe)?;
+        let (title, body) = frame::take_title(parser);
+        // Cursor-moving image/mark protocols cannot be padded into a text frame.
+        let framed_settings = Settings {
+            terminal_capabilities:
+                pulldown_cmark_mdcat::terminal::capabilities::TerminalCapabilities {
+                    style: settings.terminal_capabilities.style,
+                    image: None,
+                    marks: None,
+                },
+            terminal_size: settings.terminal_size,
+            syntax_set: settings.syntax_set,
+            theme: settings.theme.clone(),
+            syntax_theme: settings.syntax_theme.clone(),
+        };
+        let mut rendered = Vec::new();
+        pulldown_cmark_mdcat::push_tty(
+            &framed_settings,
+            &env,
+            resource_handler,
+            &mut rendered,
+            body.into_iter(),
+        )
+        .and_then(|_| frame::write_frame(&mut sink, &title, &rendered, &framed_settings))
+        .or_else(ignore_broken_pipe)?;
     } else {
         pulldown_cmark_mdcat::push_tty(settings, &env, resource_handler, &mut sink, parser)
             .or_else(ignore_broken_pipe)?;
     }
-    writeln!(sink).or_else(ignore_broken_pipe)?;
+    if !render_options.margin {
+        writeln!(sink).or_else(ignore_broken_pipe)?;
+    }
     sink.flush().or_else(ignore_broken_pipe)?;
     Ok(())
 }

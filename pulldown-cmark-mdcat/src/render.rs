@@ -1468,12 +1468,14 @@ pub fn write_event<'a, W: Write>(
                 .and_data(data.current_line(CurrentLine::empty())))
         }
         (Stacked(stack, Inline(_, _)), End(TagEnd::Heading(HeadingLevel::H1))) => {
-            write_styled(
-                writer,
-                &settings.terminal_capabilities,
-                &settings.theme.h1_prefix_style,
-                " ",
-            )?;
+            if !settings.theme.h1_rule {
+                write_styled(
+                    writer,
+                    &settings.terminal_capabilities,
+                    &settings.theme.h1_prefix_style,
+                    " ",
+                )?;
+            }
             writeln!(writer)?;
             writeln!(writer)?;
             Ok(stack

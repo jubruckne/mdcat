@@ -232,6 +232,60 @@ pub fn substitute_emoji<'e>(
     })
 }
 
+/// Add rules to H1 headings, measuring visible title text rather than Markdown syntax.
+fn h1_rules<'e>(
+    mut events: impl Iterator<Item = Event<'e>>,
+    enabled: bool,
+    columns: u16,
+) -> impl Iterator<Item = Event<'e>> {
+    let mut pending = std::collections::VecDeque::new();
+    std::iter::from_fn(move || {
+        if let Some(event) = pending.pop_front() {
+            return Some(event);
+        }
+        let event = events.next()?;
+        if enabled
+            && matches!(
+                &event,
+                Event::Start(Tag::Heading {
+                    level: pulldown_cmark::HeadingLevel::H1,
+                    ..
+                })
+            )
+        {
+            let mut title = Vec::new();
+            let mut width = 0usize;
+            for part in events.by_ref() {
+                if matches!(
+                    part,
+                    Event::End(TagEnd::Heading(pulldown_cmark::HeadingLevel::H1))
+                ) {
+                    break;
+                }
+                match &part {
+                    Event::Text(text)
+                    | Event::Code(text)
+                    | Event::InlineHtml(text)
+                    | Event::InlineMath(text) => width += textwrap::core::display_width(text),
+                    Event::SoftBreak | Event::HardBreak => width += 1,
+                    _ => {}
+                }
+                title.push(part);
+            }
+            pending.push_back(Event::Text("── ".into()));
+            pending.extend(title);
+            let remaining = usize::from(columns).saturating_sub(width + 4);
+            if remaining > 0 {
+                pending.push_back(Event::Text(format!(" {}", "─".repeat(remaining)).into()));
+            }
+            pending.push_back(Event::End(TagEnd::Heading(
+                pulldown_cmark::HeadingLevel::H1,
+            )));
+        }
+        Some(event)
+    })
+}
+
 /// Write markdown to a TTY.
 ///
 /// Iterate over Markdown AST `events`, format each event for TTY output and
@@ -246,13 +300,18 @@ pub fn push_tty<'a, 'e, W, I>(
     environment: &Environment,
     resource_handler: &dyn ResourceUrlHandler,
     writer: &'a mut W,
-    mut events: I,
+    events: I,
 ) -> Result<()>
 where
     I: Iterator<Item = Event<'e>>,
     W: Write,
 {
     use render::*;
+    let mut events = h1_rules(
+        events,
+        settings.theme.h1_rule,
+        settings.terminal_size.columns,
+    );
     let StateAndData(final_state, final_data) = events.try_fold(
         StateAndData(State::default(), StateData::default()),
         |StateAndData(state, data), event| {
@@ -285,6 +344,32 @@ mod tests {
             Environment::for_local_directory(&std::env::current_dir().expect("Working directory"))?;
         push_tty(settings, &env, &NoopResourceHandler, &mut sink, source)?;
         Ok(String::from_utf8_lossy(&sink).into())
+    }
+
+    #[test]
+    fn h1_rule_fills_width_and_handles_long_and_unicode_titles() {
+        let settings = Settings {
+            syntax_set: &SyntaxSet::default(),
+            terminal_capabilities: TerminalProgram::Dumb.capabilities(),
+            terminal_size: TerminalSize::default().with_max_columns(30),
+            theme: Theme {
+                h1_rule: true,
+                ..Theme::default()
+            },
+            syntax_theme: None,
+        };
+        for (input, title) in [
+            ("# Shader **Works**", "Shader Works"),
+            ("# 日本語", "日本語"),
+        ] {
+            let output = render_string(input, &settings).unwrap();
+            let line = output.lines().find(|line| line.starts_with("── ")).unwrap();
+            assert!(line.starts_with(&format!("── {title} ")));
+            assert_eq!(textwrap::core::display_width(line), 30);
+        }
+        let title = "a".repeat(40);
+        let output = render_string(&format!("# {title}"), &settings).unwrap();
+        assert!(output.contains(&format!("── {title}\n")));
     }
 
     fn render_string_dumb(markup: &str) -> Result<String> {

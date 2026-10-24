@@ -1,0 +1,177 @@
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -4,7 +4,7 @@
+ // License, v. 2.0. If a copy of the MPL was not distributed with this
+ // file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+-use std::io::Write;
++use std::io::{self, Write};
+ use std::process::*;
+ 
+ use anyhow::{bail, Context, Result};
+@@ -15,7 +15,44 @@
+     /// Standard output
+     Stdout(std::io::Stdout),
+     /// A pager
+-    Pager(Child),
++    Pager(PagerOutput),
++}
++
++/// Pager input retained for replay into terminal scrollback after the pager exits.
++pub struct PagerOutput {
++    child: Child,
++    retained: Vec<u8>,
++    closed: bool,
++}
++
++impl Write for PagerOutput {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        self.retained.extend_from_slice(bytes);
++        if !self.closed {
++            if let Err(error) = self.child.stdin.as_mut().unwrap().write_all(bytes) {
++                if error.kind() == io::ErrorKind::BrokenPipe {
++                    // Keep rendering after an early quit so scrollback gets the entire document.
++                    self.closed = true;
++                } else {
++                    return Err(error);
++                }
++            }
++        }
++        Ok(bytes.len())
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        if self.closed {
++            return Ok(());
++        }
++        match self.child.stdin.as_mut().unwrap().flush() {
++            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
++                self.closed = true;
++                Ok(())
++            }
++            result => result,
++        }
++    }
+ }
+ 
+ impl Drop for Output {
+@@ -23,8 +60,8 @@
+     ///
+     /// When outputting to a pager wait for the pager to exit.
+     fn drop(&mut self) {
+-        if let Output::Pager(ref mut child) = *self {
+-            let _ = child.wait();
++        if let Output::Pager(ref mut pager) = *self {
++            let _ = pager.child.wait();
+         }
+     }
+ }
+@@ -80,8 +117,22 @@
+     pub fn writer(&mut self) -> &mut dyn Write {
+         match self {
+             Output::Stdout(handle) => handle,
+-            Output::Pager(child) => child.stdin.as_mut().unwrap(),
+-        }
++            Output::Pager(pager) => pager,
++        }
++    }
++
++    /// Wait for the pager to restore the terminal, then replay the complete document.
++    pub fn finish(&mut self) -> Result<()> {
++        if let Output::Pager(pager) = self {
++            drop(pager.child.stdin.take());
++            pager.child.wait()?;
++            pager.closed = true;
++            let mut stdout = std::io::stdout().lock();
++            stdout.write_all(&pager.retained)?;
++            stdout.flush()?;
++            pager.retained.clear();
++        }
++        Ok(())
+     }
+ 
+     /// Create a new output.
+@@ -116,7 +167,13 @@
+                         .with_context(|| {
+                             format!("Failed to spawn pager {command} with args {args:?}")
+                         })
+-                        .map(Output::Pager)
++                        .map(|child| {
++                            Output::Pager(PagerOutput {
++                                child,
++                                retained: Vec::new(),
++                                closed: false,
++                            })
++                        })
+                 }
+             }
+         } else {
+@@ -163,6 +220,29 @@
+ #[cfg(test)]
+ mod tests {
+     use super::should_auto_paginate;
++
++    #[test]
++    fn early_pager_exit_retains_the_complete_document() {
++        use std::io::Write;
++        let child = std::process::Command::new("sh")
++            .args(["-c", "exit 0"])
++            .stdin(std::process::Stdio::piped())
++            .spawn()
++            .unwrap();
++        std::thread::sleep(std::time::Duration::from_millis(50));
++        let mut pager = super::PagerOutput {
++            child,
++            retained: Vec::new(),
++            closed: false,
++        };
++        let document = vec![b'x'; 256 * 1024];
++        pager.write_all(&document).unwrap();
++        pager.write_all(b"last line").unwrap();
++        pager.flush().unwrap();
++        assert_eq!(pager.retained.len(), document.len() + 9);
++        assert!(pager.retained.ends_with(b"last line"));
++        pager.child.wait().unwrap();
++    }
+ 
+     #[test]
+     fn raw_lines_must_exceed_two_and_a_half_pages() {
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -499,7 +499,7 @@
+                 };
+                 // TODO: Handle this error properly
+                 let resource_handler = create_resource_handler(resource_access).unwrap();
+-                if args.watch {
++                let code = if args.watch {
+                     match watch_file(
+                         &filenames[0],
+                         &settings,
+@@ -535,6 +535,13 @@
+                             })
+                         })
+                         .unwrap_or(1)
++                };
++                match output.finish() {
++                    Ok(()) => code,
++                    Err(error) => {
++                        eprintln!("Error: {error:#}");
++                        1
++                    }
+                 }
+             }
+             Err(error) => {
+diff --git a/mdcat.1.adoc b/mdcat.1.adoc
+--- a/mdcat.1.adoc
++++ b/mdcat.1.adoc
+@@ -368,6 +368,8 @@
+ +
+ If both `$PAGER` and `$MDCAT_PAGER` are unset use `less -r --mouse` as pager.
+ Mouse-wheel scrolling is enabled by default; set a custom pager to override this.
++After the pager exits, the complete rendered document is printed to standard output
++so it remains in terminal scrollback, including when the pager is quit early.
+ 
+ http_proxy::
+ https_proxy::

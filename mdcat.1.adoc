@@ -112,6 +112,35 @@ In this case remote images render as hyperlinks.
 
 == Options
 
+--analyzer::
+    Open exactly one FILE in the built-in Ratatui/Crossterm Markdown viewer.
+    Requires interactive standard input and output; stdin documents are not supported.
+    Overrides configured pagination and cannot be combined with `--paginate`, `--no-pager`,
+    or `--watch`. Images use text fallbacks. The viewer has its own border and status bar.
+    Arrow keys or j/k scroll, Page Up/Page Down or b/Space move by a page,
+    Home/End or g/G jump to the start/end, and q, Escape, or Ctrl+C exit.
+    Mouse-wheel scrolling and reflow on terminal resize are supported.
++
+    Press `?` to open a prompt popup for a plain-text question about the open document.
+    Enter submits and immediately opens a small floating window with a spinner.
+    The generated title types into its caption character by character; the window
+    expands from 5 to 64 columns over 100 ms once the title is ready, then to 84
+    columns over 80 ms if a rendered answer line needs more room. Widths respect
+    the terminal size; height grows smoothly as the answer streams into it.
+    Markdown answers use mdcat's styling and syntax highlighting, with a character-by-character
+    reveal that preserves the rendered formatting.
+    Drag its title bar or use arrow
+    keys (h/j/k/l) to move it. Page Up/Down or the mouse wheel scroll the answer.
+    Escape or Tab closes the popup/window; `?` asks a follow-up. Ctrl+L in the response
+    window clears the conversation when idle. Generation runs in the background.
+    Queries use Apple's on-device Foundation Models on Apple Silicon with macOS 26+
+    and Apple Intelligence enabled and its model downloaded; there is no remote LLM fallback.
+    Answers use bounded source excerpts selected by keyword relevance and the last two
+    conversation turns (shortened to fit). They may omit relevant material.
+    The character budgets are 18,000 for source passages, 1,500 for recent conversation,
+    and 500 for the question; these are approximate budgets, not token counts.
+    Model errors and availability problems appear in the response window. Building on macOS requires Xcode 26+.
+
 -p::
 --paginate::
     Paginate the output of mdcat with a pager like less.
@@ -165,7 +194,9 @@ Defaults to `auto`, which detects dark or light mode from the terminal, unless `
     Print a sample rendered with every built-in theme, to help pick one, and exit.
 
 [[margin-option]]--margin::
-    Add a two-space left margin to all output, reducing the effective render width accordingly.
+    Frame output with rounded borders and the first top-level main heading in the top border.
+    Reserves four columns for borders and padding. Later headings stay in the body.
+    Uses text rendering instead of inline images so the frame stays aligned.
 
 [[smart-punctuation-option]]--smart-punctuation::
     Render typographic punctuation: straight quotes become curly, `--`/`---` become en/em dashes, and `...` becomes an ellipsis.
@@ -245,6 +276,14 @@ alert_note = { text = " NOTE" }
 
 Each key sets the default value for a CLI flag, used only when that flag isn't passed explicitly (and, for `columns`, when `$COLUMNS`/terminal size detection doesn't otherwise apply).
 
+`paginate`::
+    Accepts `true`, `false`, or `"auto"`. Automatic mode counts raw input lines and
+    opens a pager only when it exceeds 2.5 terminal pages (60 lines on a 24-row terminal).
+    Automatic mode bypasses pagination when
+    stdout is redirected, and leaves watch mode unpaginated.
+    Multiple input files count together; stdin is excluded from the automatic line count. Explicit `--paginate` and `--no-pager` override this.
+    If omitted, pagination is off for `mdcat` and on for `mdless` and `mdpick`.
+
 `margin`::
     Default for <<margin-option,`--margin`>>.
 
@@ -277,6 +316,12 @@ Each key sets the default value for a CLI flag, used only when that flag isn't p
     Default for <<tabs-option,`--tabs`>>.
 
 === `[theme]`
+
+`h1_rule`::
+    Set to `true` to render main headings as `── Title ───`, filling the configured
+    column width. The title keeps its foreground and effects, with no background.
+    Defaults to `false`. Long titles are preserved without a trailing rule.
+
 
 The file picks a built-in theme as a starting point (`base`), and overrides individual styles on top of it.
 
@@ -360,7 +405,18 @@ PAGER::
 +
 Subject to the same rules as `$MDCAT_PAGER`.
 +
-If both `$PAGER` and `$MDCAT_PAGER` are unset use `less -r` as pager.
+If both `$PAGER` and `$MDCAT_PAGER` are unset use `less -r --mouse` as pager.
+Mouse-wheel scrolling is enabled by default; set a custom pager to override this.
+After the pager exits, the complete rendered document is printed to standard output
+so it remains in terminal scrollback, including when the pager is quit early.
+
+When viewing one regular file interactively with `less`, mdcat saves the top visible
+rendered line on `q` or Ctrl+C and restores it on the next paginated view.
+Positions are stored in `history.toml` next to `config.toml`, keyed by a SHA-256 hash
+of the canonical absolute input filename. Unpaginated views, stdin, combined
+multi-file views, and other pagers do not update this history. The position is a
+rendered line number; edits or changes to wrapping can shift the corresponding text.
+Delete an entry (or `history.toml`) to reset saved positions.
 
 http_proxy::
 https_proxy::

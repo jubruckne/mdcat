@@ -1,0 +1,39 @@
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -56,8 +56,11 @@
+             }
+         }
+     }
+-    event!(Level::DEBUG, "Falling back to default pager less -r");
+-    Ok(vec!["less".into(), "-r".into()])
++    event!(
++        Level::DEBUG,
++        "Falling back to default pager less -r --mouse"
++    );
++    Ok(vec!["less".into(), "-r".into(), "--mouse".into()])
+ }
+ 
+ /// Get the basename of the pager command that [`Output::new`] would use, or `None` if it's empty.
+@@ -86,7 +89,7 @@
+     /// If `try_paginate` is `true` try to output to a pager.  If stdout is not a TTY, that is, if
+     /// there's no terminal to paginate on, print to stdout nonetheless.
+     ///
+-    /// Take the pager command from `$MDCAT_PAGER` or `$PAGER`, and default to `less -R` if both are
++    /// Take the pager command from `$MDCAT_PAGER` or `$PAGER`, and default to `less -r --mouse` if both are
+     /// unset.  If any of the variables is empty use stdout (assuming that the user
+     /// wanted to disabled paging explicitly).
+     pub fn new(try_paginate: bool) -> Result<Output> {
+diff --git a/mdcat.1.adoc b/mdcat.1.adoc
+--- a/mdcat.1.adoc
++++ b/mdcat.1.adoc
+@@ -358,7 +358,8 @@
+ +
+ Subject to the same rules as `$MDCAT_PAGER`.
+ +
+-If both `$PAGER` and `$MDCAT_PAGER` are unset use `less -r` as pager.
++If both `$PAGER` and `$MDCAT_PAGER` are unset use `less -r --mouse` as pager.
++Mouse-wheel scrolling is enabled by default; set a custom pager to override this.
+ 
+ http_proxy::
+ https_proxy::

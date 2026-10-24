@@ -1,0 +1,301 @@
+diff --git a/pulldown-cmark-mdcat/src/theme.rs b/pulldown-cmark-mdcat/src/theme.rs
+--- a/pulldown-cmark-mdcat/src/theme.rs
++++ b/pulldown-cmark-mdcat/src/theme.rs
+@@ -114,6 +114,8 @@
+     pub h1_prefix_style: Style,
+     /// Style for H1 heading text (fg + bg color).
+     pub h1_text_style: Style,
++    /// Frame H1 titles with a horizontal rule instead of a background banner.
++    pub h1_rule: bool,
+ }
+ 
+ impl Theme {
+@@ -237,6 +239,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -304,6 +307,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -357,6 +361,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -410,6 +415,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -463,6 +469,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -516,6 +523,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -569,6 +577,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -622,6 +631,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -675,6 +685,7 @@
+             alert_caution_label,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+         }
+     }
+ 
+@@ -686,6 +697,7 @@
+             mermaid_palette: MermaidPalette::Generic,
+             h1_prefix_style,
+             h1_text_style,
++            h1_rule: false,
+             ..Self::solarized_dark()
+         }
+     }
+diff --git a/pulldown-cmark-mdcat/src/lib.rs b/pulldown-cmark-mdcat/src/lib.rs
+--- a/pulldown-cmark-mdcat/src/lib.rs
++++ b/pulldown-cmark-mdcat/src/lib.rs
+@@ -250,6 +250,60 @@
+     })
+ }
+ 
++/// Add rules to H1 headings, measuring visible title text rather than Markdown syntax.
++fn h1_rules<'e>(
++    mut events: impl Iterator<Item = Event<'e>>,
++    enabled: bool,
++    columns: u16,
++) -> impl Iterator<Item = Event<'e>> {
++    let mut pending = std::collections::VecDeque::new();
++    std::iter::from_fn(move || {
++        if let Some(event) = pending.pop_front() {
++            return Some(event);
++        }
++        let event = events.next()?;
++        if enabled
++            && matches!(
++                &event,
++                Event::Start(Tag::Heading {
++                    level: pulldown_cmark::HeadingLevel::H1,
++                    ..
++                })
++            )
++        {
++            let mut title = Vec::new();
++            let mut width = 0usize;
++            for part in events.by_ref() {
++                if matches!(
++                    part,
++                    Event::End(TagEnd::Heading(pulldown_cmark::HeadingLevel::H1))
++                ) {
++                    break;
++                }
++                match &part {
++                    Event::Text(text)
++                    | Event::Code(text)
++                    | Event::InlineHtml(text)
++                    | Event::InlineMath(text) => width += textwrap::core::display_width(text),
++                    Event::SoftBreak | Event::HardBreak => width += 1,
++                    _ => {}
++                }
++                title.push(part);
++            }
++            pending.push_back(Event::Text("── ".into()));
++            pending.extend(title);
++            let remaining = usize::from(columns).saturating_sub(width + 4);
++            if remaining > 0 {
++                pending.push_back(Event::Text(format!(" {}", "─".repeat(remaining)).into()));
++            }
++            pending.push_back(Event::End(TagEnd::Heading(
++                pulldown_cmark::HeadingLevel::H1,
++            )));
++        }
++        Some(event)
++    })
++}
++
+ /// Write markdown to a TTY.
+ ///
+ /// Iterate over Markdown AST `events`, format each event for TTY output and
+@@ -264,13 +318,18 @@
+     environment: &Environment,
+     resource_handler: &dyn ResourceUrlHandler,
+     writer: &'a mut W,
+-    mut events: I,
++    events: I,
+ ) -> Result<()>
+ where
+     I: Iterator<Item = Event<'e>>,
+     W: Write,
+ {
+     use render::*;
++    let mut events = h1_rules(
++        events,
++        settings.theme.h1_rule,
++        settings.terminal_size.columns,
++    );
+     let StateAndData(final_state, final_data) = events.try_fold(
+         StateAndData(State::default(), StateData::default()),
+         |StateAndData(state, data), event| {
+@@ -303,6 +362,32 @@
+             Environment::for_local_directory(&std::env::current_dir().expect("Working directory"))?;
+         push_tty(settings, &env, &NoopResourceHandler, &mut sink, source)?;
+         Ok(String::from_utf8_lossy(&sink).into())
++    }
++
++    #[test]
++    fn h1_rule_fills_width_and_handles_long_and_unicode_titles() {
++        let settings = Settings {
++            syntax_set: &SyntaxSet::default(),
++            terminal_capabilities: TerminalProgram::Dumb.capabilities(),
++            terminal_size: TerminalSize::default().with_max_columns(30),
++            theme: Theme {
++                h1_rule: true,
++                ..Theme::default()
++            },
++            syntax_theme: None,
++        };
++        for (input, title) in [
++            ("# Shader **Works**", "Shader Works"),
++            ("# 日本語", "日本語"),
++        ] {
++            let output = render_string(input, &settings).unwrap();
++            let line = output.lines().find(|line| line.starts_with("── ")).unwrap();
++            assert!(line.starts_with(&format!("── {title} ")));
++            assert_eq!(textwrap::core::display_width(line), 30);
++        }
++        let title = "a".repeat(40);
++        let output = render_string(&format!("# {title}"), &settings).unwrap();
++        assert!(output.contains(&format!("── {title}\n")));
+     }
+ 
+     fn render_string_dumb(markup: &str) -> Result<String> {
+diff --git a/pulldown-cmark-mdcat/src/render.rs b/pulldown-cmark-mdcat/src/render.rs
+--- a/pulldown-cmark-mdcat/src/render.rs
++++ b/pulldown-cmark-mdcat/src/render.rs
+@@ -1468,12 +1468,14 @@
+                 .and_data(data.current_line(CurrentLine::empty())))
+         }
+         (Stacked(stack, Inline(_, _)), End(TagEnd::Heading(HeadingLevel::H1))) => {
+-            write_styled(
+-                writer,
+-                &settings.terminal_capabilities,
+-                &settings.theme.h1_prefix_style,
+-                " ",
+-            )?;
++            if !settings.theme.h1_rule {
++                write_styled(
++                    writer,
++                    &settings.terminal_capabilities,
++                    &settings.theme.h1_prefix_style,
++                    " ",
++                )?;
++            }
+             writeln!(writer)?;
+             writeln!(writer)?;
+             Ok(stack
+diff --git a/pulldown-cmark-mdcat/src/render/write.rs b/pulldown-cmark-mdcat/src/render/write.rs
+--- a/pulldown-cmark-mdcat/src/render/write.rs
++++ b/pulldown-cmark-mdcat/src/render/write.rs
+@@ -385,8 +385,12 @@
+     let level_style = match level {
+         HeadingLevel::H1 => {
+             writeln!(writer)?;
+-            write_styled(writer, capabilities, &theme.h1_prefix_style, " ")?;
+-            theme.h1_text_style
++            if theme.h1_rule {
++                theme.h1_text_style.bg_color(None)
++            } else {
++                write_styled(writer, capabilities, &theme.h1_prefix_style, " ")?;
++                theme.h1_text_style
++            }
+         }
+         HeadingLevel::H2 => {
+             let s = theme.h2_style.on_top_of(&context_style);
+diff --git a/src/config.rs b/src/config.rs
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -79,6 +79,8 @@
+ #[derive(Debug, Deserialize, Default)]
+ #[serde(deny_unknown_fields)]
+ pub struct ThemeConfig {
++    /// Frame H1 titles with a horizontal rule instead of a background banner.
++    pub h1_rule: Option<bool>,
+     /// The built-in theme to start from, by name (e.g. `"dark"`, `"catppuccin-mocha"`).
+     pub base: Option<String>,
+     /// Override for the ruler color; a plain color, since rules have no other style.
+@@ -226,6 +228,9 @@
+ /// Apply `config`'s style overrides onto `base`, returning the customised theme.
+ pub fn apply_theme(config: &ThemeConfig, base: Theme) -> Result<Theme> {
+     let mut theme = base;
++    if let Some(h1_rule) = config.h1_rule {
++        theme.h1_rule = h1_rule;
++    }
+     if let Some(rule) = &config.rule {
+         theme.rule_color = resolve_color(rule, &config.palette)?;
+     }
+diff --git a/mdcat.1.adoc b/mdcat.1.adoc
+--- a/mdcat.1.adoc
++++ b/mdcat.1.adoc
+@@ -275,6 +275,12 @@
+     Default for <<tabs-option,`--tabs`>>.
+ 
+ === `[theme]`
++
++`h1_rule`::
++    Set to `true` to render main headings as `── Title ───`, filling the configured
++    column width. The title keeps its foreground and effects, with no background.
++    Defaults to `false`. Long titles are preserved without a trailing rule.
++
+ 
+ The file picks a built-in theme as a starting point (`base`), and overrides individual styles on top of it.
+ 
+diff --git a/config.toml.example b/config.toml.example
+--- a/config.toml.example
++++ b/config.toml.example
+@@ -40,6 +40,8 @@
+ 
+ # [theme] customises colours and styles, starting from a built-in theme.
+ [theme]
++# Frame main headings as "── Title ───" instead of a colored banner.
++h1_rule = true
+ # The built-in theme to start from. One of: auto, dark, light, catppuccin-mocha,
+ # catppuccin-latte, gruvbox-dark, gruvbox-light, dracula, nord, solarized-dark, solarized-light.
+ #

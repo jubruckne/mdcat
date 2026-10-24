@@ -1,0 +1,321 @@
+diff --git a/src/args.rs b/src/args.rs
+--- a/src/args.rs
++++ b/src/args.rs
+@@ -109,6 +109,6 @@
+         args: CommonArgs,
+-        /// Paginate the output of mdcat with a pager like less (default for mdless).
++        /// Paginate output with a pager like less. Also settable via defaults.paginate in config.toml.
+         #[arg(short, long, overrides_with = "no_pager")]
+         paginate: bool,
+-        /// Do not paginate output (default). Overrides an earlier --paginate.
++        /// Do not paginate output (default unless configured). Overrides an earlier --paginate.
+         #[arg(short = 'P', long)]
+@@ -146,8 +146,28 @@
+     pub fn paginate(&self) -> bool {
+-        match *self {
+-            // In both cases look at the option indicating the non-default
+-            // behaviour; the overrides above are configured accordingly.
+-            Command::Mdcat { paginate, .. } => paginate,
+-            Command::Mdless { no_pager, .. } => !no_pager,
+-            Command::Mdpick { no_pager, .. } => !no_pager,
++        self.pagination(None) == crate::config::Pagination::Enabled(true)
++    }
++
++    /// Resolve pagination: explicit CLI flags, then config, then the command default.
++    pub fn pagination(
++        &self,
++        default: Option<crate::config::Pagination>,
++    ) -> crate::config::Pagination {
++        use crate::config::Pagination;
++        let (paginate, no_pager, builtin) = match *self {
++            Command::Mdcat {
++                paginate, no_pager, ..
++            } => (paginate, no_pager, false),
++            Command::Mdless {
++                paginate, no_pager, ..
++            }
++            | Command::Mdpick {
++                paginate, no_pager, ..
++            } => (paginate, no_pager, true),
++        };
++        if paginate {
++            Pagination::Enabled(true)
++        } else if no_pager {
++            Pagination::Enabled(false)
++        } else {
++            default.unwrap_or(Pagination::Enabled(builtin))
+         }
+@@ -273,2 +293,33 @@
+     }
++    #[test]
++    fn pagination_config_and_cli_precedence() {
++        for (command, builtin) in [("mdcat", false), ("mdless", true), ("mdpick", true)] {
++            for default in [
++                None,
++                Some(crate::config::Pagination::Enabled(false)),
++                Some(crate::config::Pagination::Enabled(true)),
++                Some(crate::config::Pagination::Auto(
++                    crate::config::AutoPagination::Auto,
++                )),
++            ] {
++                let args = Args::try_parse_from([command]).unwrap();
++                assert_eq!(
++                    args.command.pagination(default),
++                    default.unwrap_or(crate::config::Pagination::Enabled(builtin))
++                );
++                for (flags, expected) in [
++                    (vec!["--paginate"], true),
++                    (vec!["--no-pager"], false),
++                    (vec!["--paginate", "--no-pager"], false),
++                    (vec!["--no-pager", "--paginate"], true),
++                ] {
++                    let args = Args::try_parse_from(std::iter::once(command).chain(flags)).unwrap();
++                    assert_eq!(
++                        args.command.pagination(default),
++                        crate::config::Pagination::Enabled(expected)
++                    );
++                }
++            }
++        }
++    }
+ }
+@@ -278,3 +329,3 @@
+     use super::Args;
+-    use clap::CommandFactory;
++    use clap::{CommandFactory, Parser};
+ 
+diff --git a/src/config.rs b/src/config.rs
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -33,2 +33,20 @@
+ 
++/// Pagination may be forced on/off or selected from rendered output length.
++#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
++#[serde(untagged)]
++pub enum Pagination {
++    /// Always or never paginate.
++    Enabled(bool),
++    /// Decide from rendered output length.
++    Auto(AutoPagination),
++}
++
++/// Accepted automatic pagination keyword.
++#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
++pub enum AutoPagination {
++    /// Paginate above two and a half terminal pages.
++    #[serde(rename = "auto")]
++    Auto,
++}
++
+ /// Default values for a handful of CLI flags, used when the flag isn't passed explicitly.
+@@ -37,2 +55,4 @@
+ pub struct Defaults {
++    /// Default pagination; explicit `--paginate`/`--no-pager` takes precedence.
++    pub paginate: Option<Pagination>,
+     /// Default for `--margin`.
+@@ -360,2 +380,3 @@
+             [defaults]
++            paginate = true
+             margin = true
+@@ -375,2 +396,3 @@
+         let config: Config = toml::from_str(toml).unwrap();
++        assert_eq!(config.defaults.paginate, Some(Pagination::Enabled(true)));
+         assert_eq!(config.defaults.margin, Some(true));
+@@ -471,4 +493,19 @@
+     #[test]
++    fn pagination_accepts_booleans_and_auto() {
++        for (value, expected) in [
++            ("true", Pagination::Enabled(true)),
++            ("false", Pagination::Enabled(false)),
++            ("\"auto\"", Pagination::Auto(AutoPagination::Auto)),
++        ] {
++            let config: Config =
++                toml::from_str(&format!("[defaults]\npaginate = {value}")).unwrap();
++            assert_eq!(config.defaults.paginate, Some(expected));
++        }
++        assert!(toml::from_str::<Config>("[defaults]\npaginate = \"always\"").is_err());
++    }
++
++    #[test]
+     fn defaults_default_to_none() {
+         let config: Config = toml::from_str("").unwrap();
++        assert_eq!(config.defaults.paginate, None);
+         assert_eq!(config.defaults.margin, None);
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -372,2 +372,39 @@
+ 
++        let filenames: Vec<String> = if let mdcat::args::Command::Mdpick { .. } = &args {
++            match args.filenames.as_slice() {
++                [] | [_] => {}
++                _ => {
++                    eprintln!("Error: mdpick takes at most one directory argument");
++                    std::process::exit(1);
++                }
++            }
++            let directory = match args.filenames.first().map(String::as_str) {
++                None | Some("-") => Path::new("."),
++                Some(directory) => Path::new(directory),
++            };
++            match picker::pick_markdown_file(directory) {
++                Ok(Some(file)) => vec![file.to_string_lossy().into_owned()],
++                Ok(None) => std::process::exit(0),
++                Err(error) => {
++                    eprintln!("Error: {error:#}");
++                    std::process::exit(1);
++                }
++            }
++        } else {
++            args.filenames.clone()
++        };
++
++    let pagination = args.pagination(defaults.and_then(|d| d.paginate));
++    let paginate = match pagination {
++        mdcat::config::Pagination::Enabled(value) => value,
++        mdcat::config::Pagination::Auto(_) => {
++            !args.watch
++                && std::io::IsTerminal::is_terminal(&std::io::stdout())
++                && mdcat::output::should_auto_paginate(
++                    &filenames,
++                    TerminalSize::detect().unwrap_or_default().rows,
++                )
++        }
++    };
++
+     // lessi handles kitty/sixel image escapes without corrupting scrollback (see GH-45),
+@@ -375,3 +412,3 @@
+     let paginating_with_lessi =
+-        args.paginate() && resolved_pager_basename().ok().flatten().as_deref() == Some("lessi");
++        paginate && resolved_pager_basename().ok().flatten().as_deref() == Some("lessi");
+ 
+@@ -379,3 +416,3 @@
+         (TerminalProgram::Dumb, false)
+-    } else if args.ansi_only || (args.paginate() && !paginating_with_lessi) {
++    } else if args.ansi_only || (paginate && !paginating_with_lessi) {
+         (TerminalProgram::Ansi, false)
+@@ -389,3 +426,3 @@
+         let mut caps = terminal.capabilities();
+-        if terminal != TerminalProgram::Dumb && (!args.paginate() || paginating_with_lessi) {
++        if terminal != TerminalProgram::Dumb && (!paginate || paginating_with_lessi) {
+             if let Some(choice) = image_protocol {
+@@ -430,27 +467,4 @@
+ 
+-        let filenames: Vec<String> = if let mdcat::args::Command::Mdpick { .. } = &args {
+-            match args.filenames.as_slice() {
+-                [] | [_] => {}
+-                _ => {
+-                    eprintln!("Error: mdpick takes at most one directory argument");
+-                    std::process::exit(1);
+-                }
+-            }
+-            let directory = match args.filenames.first().map(String::as_str) {
+-                None | Some("-") => Path::new("."),
+-                Some(directory) => Path::new(directory),
+-            };
+-            match picker::pick_markdown_file(directory) {
+-                Ok(Some(file)) => vec![file.to_string_lossy().into_owned()],
+-                Ok(None) => std::process::exit(0),
+-                Err(error) => {
+-                    eprintln!("Error: {error:#}");
+-                    std::process::exit(1);
+-                }
+-            }
+-        } else {
+-            args.filenames.clone()
+-        };
+-
+-        if args.watch && args.paginate() {
++
++        if args.watch && paginate {
+             eprintln!("Error: --watch cannot be combined with --paginate");
+@@ -478,3 +492,3 @@
+         let theme = resolved.mdcat;
+-        let exit_code = match Output::new(args.paginate()) {
++        let exit_code = match Output::new(paginate) {
+             Ok(mut output) => {
+diff --git a/src/output.rs b/src/output.rs
+--- a/src/output.rs
++++ b/src/output.rs
+@@ -123 +123,57 @@
+ }
++
++/// Page when regular input files contain more than 2.5 terminal heights of raw lines.
++/// Stdin is left unpaginated in automatic mode; explicit CLI pagination still works.
++pub fn should_auto_paginate(filenames: &[String], rows: u16) -> bool {
++    use std::io::{BufRead, BufReader};
++    let threshold = usize::from(rows.max(1)) * 5 / 2;
++    let mut lines = 0;
++    for filename in filenames {
++        if filename == "-" || !std::fs::metadata(filename).is_ok_and(|m| m.is_file()) {
++            continue;
++        }
++        let Ok(file) = std::fs::File::open(filename) else {
++            continue;
++        };
++        // Avoid consuming stdin, FIFOs, or other streams during the size check.
++        if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
++            continue;
++        }
++        let mut reader = BufReader::new(file);
++        let mut line = Vec::new();
++        loop {
++            line.clear();
++            match reader.read_until(b'\n', &mut line) {
++                Ok(0) | Err(_) => break,
++                Ok(_) => {
++                    lines += 1;
++                    if lines > threshold {
++                        return true;
++                    }
++                }
++            }
++        }
++    }
++    false
++}
++
++#[cfg(test)]
++mod tests {
++    use super::should_auto_paginate;
++
++    #[test]
++    fn raw_lines_must_exceed_two_and_a_half_pages() {
++        let path = std::env::temp_dir().join(format!("mdcat-auto-{}.md", std::process::id()));
++        let files = vec![path.to_string_lossy().into_owned()];
++        std::fs::write(&path, "line\n".repeat(60)).unwrap();
++        assert!(!should_auto_paginate(&files, 24));
++        std::fs::write(&path, format!("{}last line", "line\n".repeat(60))).unwrap();
++        assert!(should_auto_paginate(&files, 24));
++        assert!(!should_auto_paginate(&files, 30));
++        assert!(should_auto_paginate(
++            &[files[0].clone(), files[0].clone()],
++            24
++        ));
++        std::fs::remove_file(path).unwrap();
++    }
++}
+diff --git a/config.toml.example b/config.toml.example
+--- a/config.toml.example
++++ b/config.toml.example
+@@ -11,2 +11,6 @@
+ [defaults]
++# Paginate output by default. --paginate/--no-pager override this for any command.
++# Omit to keep command defaults: off for mdcat, on for mdless and mdpick.
++# Use "auto" to page only above 2.5 terminal pages of raw input.
++paginate = "auto"
+ # Add a two-space left margin to all output (same as --margin).
+diff --git a/mdcat.1.adoc b/mdcat.1.adoc
+--- a/mdcat.1.adoc
++++ b/mdcat.1.adoc
+@@ -246,2 +246,10 @@
+ Each key sets the default value for a CLI flag, used only when that flag isn't passed explicitly (and, for `columns`, when `$COLUMNS`/terminal size detection doesn't otherwise apply).
++
++`paginate`::
++    Accepts `true`, `false`, or `"auto"`. Automatic mode counts raw input lines and
++    opens a pager only when it exceeds 2.5 terminal pages (60 lines on a 24-row terminal).
++    Automatic mode bypasses pagination when
++    stdout is redirected, and leaves watch mode unpaginated.
++    Multiple input files count together; stdin is excluded from the automatic line count. Explicit `--paginate` and `--no-pager` override this.
++    If omitted, pagination is off for `mdcat` and on for `mdless` and `mdpick`.
+ 

@@ -31,10 +31,30 @@ pub struct Config {
     pub theme: Option<ThemeConfig>,
 }
 
+/// Pagination may be forced on/off or selected from rendered output length.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Pagination {
+    /// Always or never paginate.
+    Enabled(bool),
+    /// Decide from rendered output length.
+    Auto(AutoPagination),
+}
+
+/// Accepted automatic pagination keyword.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum AutoPagination {
+    /// Paginate above two and a half terminal pages.
+    #[serde(rename = "auto")]
+    Auto,
+}
+
 /// Default values for a handful of CLI flags, used when the flag isn't passed explicitly.
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
+    /// Default pagination; explicit `--paginate`/`--no-pager` takes precedence.
+    pub paginate: Option<Pagination>,
     /// Default for `--margin`.
     pub margin: Option<bool>,
     /// Default for `--smart-punctuation`.
@@ -61,6 +81,8 @@ pub struct Defaults {
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ThemeConfig {
+    /// Frame H1 titles with a horizontal rule instead of a background banner.
+    pub h1_rule: Option<bool>,
     /// The built-in theme to start from, by name (e.g. `"dark"`, `"catppuccin-mocha"`).
     pub base: Option<String>,
     /// Override for the ruler color; a plain color, since rules have no other style.
@@ -208,6 +230,9 @@ fn resolve_style(
 /// Apply `config`'s style overrides onto `base`, returning the customised theme.
 pub fn apply_theme(config: &ThemeConfig, base: Theme) -> Result<Theme> {
     let mut theme = base;
+    if let Some(h1_rule) = config.h1_rule {
+        theme.h1_rule = h1_rule;
+    }
     if let Some(rule) = &config.rule {
         theme.rule_color = resolve_color(rule, &config.palette)?;
     }
@@ -358,6 +383,7 @@ mod tests {
     fn parses_full_config_and_applies_overrides() {
         let toml = r##"
             [defaults]
+            paginate = true
             margin = true
             columns = 100
 
@@ -373,6 +399,7 @@ mod tests {
             code = { fg = "bright-yellow" }
         "##;
         let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(config.defaults.paginate, Some(Pagination::Enabled(true)));
         assert_eq!(config.defaults.margin, Some(true));
         assert_eq!(config.defaults.columns, Some(100));
         let theme_config = config.theme.unwrap();
@@ -469,8 +496,23 @@ mod tests {
     }
 
     #[test]
+    fn pagination_accepts_booleans_and_auto() {
+        for (value, expected) in [
+            ("true", Pagination::Enabled(true)),
+            ("false", Pagination::Enabled(false)),
+            ("\"auto\"", Pagination::Auto(AutoPagination::Auto)),
+        ] {
+            let config: Config =
+                toml::from_str(&format!("[defaults]\npaginate = {value}")).unwrap();
+            assert_eq!(config.defaults.paginate, Some(expected));
+        }
+        assert!(toml::from_str::<Config>("[defaults]\npaginate = \"always\"").is_err());
+    }
+
+    #[test]
     fn defaults_default_to_none() {
         let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.defaults.paginate, None);
         assert_eq!(config.defaults.margin, None);
         assert_eq!(config.defaults.smart_punctuation, None);
         assert_eq!(config.defaults.emoji, None);
