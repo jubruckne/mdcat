@@ -787,7 +787,7 @@ where
         syntax_theme: settings.syntax_theme.clone(),
     };
     let events = events.collect::<Vec<_>>();
-    let reference_links = collect_reference_links(&events);
+    let reference_links = collect_reference_links(&events, environment);
     let mut output = Vec::new();
     crate::push_tty(
         &tty_settings,
@@ -803,6 +803,101 @@ where
         )
     })?;
     Ok(ansi_to_text_with_reference_links(&output, reference_links))
+}
+
+/// A clickable portion of a rendered link, measured in terminal cells.
+#[derive(Debug, Clone)]
+pub struct LinkRegion {
+    /// Zero-based rendered line.
+    pub line: usize,
+    /// First column, inclusive.
+    pub start: usize,
+    /// Last column, exclusive.
+    pub end: usize,
+    /// Resolved destination URL.
+    pub target: String,
+}
+
+/// Render events with link destinations and cell ranges for interactive navigation.
+/// Unlike [`push_text`], this retains links as metadata instead of adding references.
+pub fn push_linked_text<'e, I>(
+    settings: &Settings,
+    environment: &Environment,
+    resource_handler: &dyn ResourceUrlHandler,
+    events: I,
+) -> Result<(Text<'static>, Vec<LinkRegion>)>
+where
+    I: Iterator<Item = Event<'e>>,
+{
+    let tty_settings = Settings {
+        terminal_capabilities: TerminalProgram::Ansi.capabilities(),
+        terminal_size: settings.terminal_size,
+        syntax_set: settings.syntax_set,
+        theme: settings.theme.clone(),
+        syntax_theme: settings.syntax_theme.clone(),
+    };
+    let mut output = Vec::new();
+    crate::push_tty(
+        &tty_settings,
+        environment,
+        resource_handler,
+        &mut output,
+        events,
+    )?;
+    let output =
+        String::from_utf8(output).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
+    Ok(ansi_to_linked_text(&output))
+}
+
+fn ansi_to_linked_text(input: &str) -> (Text<'static>, Vec<LinkRegion>) {
+    let mut builder = TextBuilder::default();
+    let mut style = CurrentStyle::default();
+    let mut active: Option<(String, usize)> = None;
+    let mut links = Vec::new();
+    let mut chars = input.chars().peekable();
+    let column = |builder: &TextBuilder| {
+        builder.spans.iter().map(Span::width).sum::<usize>()
+            + Span::raw(builder.buffer.as_str()).width()
+    };
+    let finish =
+        |builder: &TextBuilder, active: &Option<(String, usize)>, links: &mut Vec<LinkRegion>| {
+            if let Some((target, start)) = active {
+                let end = column(builder);
+                if end > *start {
+                    links.push(LinkRegion {
+                        line: builder.lines.len(),
+                        start: *start,
+                        end,
+                        target: target.clone(),
+                    });
+                }
+            }
+        };
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => {
+                builder.flush_span(style);
+                if let Some(osc) = parse_escape(&mut chars, &mut style) {
+                    if let Some(target) = osc.strip_prefix("8;;") {
+                        finish(&builder, &active, &mut links);
+                        active =
+                            (!target.is_empty()).then(|| (target.to_owned(), column(&builder)));
+                    }
+                }
+            }
+            '\n' => {
+                finish(&builder, &active, &mut links);
+                builder.push_newline(style);
+                if let Some((_, start)) = &mut active {
+                    *start = 0;
+                }
+            }
+            '\r' => {}
+            _ => builder.push_char(c),
+        }
+    }
+    finish(&builder, &active, &mut links);
+    (builder.finish(style), links)
 }
 
 /// Render a markdown string into Ratatui text.
@@ -975,11 +1070,15 @@ struct LinkReference {
 
 #[derive(Debug)]
 struct QueuedLink {
+    resolved: Option<String>,
     target: String,
     title: String,
 }
 
-fn collect_reference_links<'e>(events: &[Event<'e>]) -> VecDeque<QueuedLink> {
+fn collect_reference_links<'e>(
+    events: &[Event<'e>],
+    environment: &Environment,
+) -> VecDeque<QueuedLink> {
     let mut result = VecDeque::new();
     let mut link_depth: usize = 0;
     for event in events {
@@ -994,7 +1093,18 @@ fn collect_reference_links<'e>(events: &[Event<'e>]) -> VecDeque<QueuedLink> {
                 dest_url, title, ..
             }) => {
                 link_depth += 1;
+                let resolved = environment.resolve_reference(dest_url).map(|mut url| {
+                    if url.scheme() == "file"
+                        && url.host_str().is_none_or(|host| {
+                            host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+                        })
+                    {
+                        url.set_host(Some(&environment.hostname)).unwrap();
+                    }
+                    url.to_string()
+                });
                 result.push_back(QueuedLink {
+                    resolved,
                     target: dest_url.to_string(),
                     title: title.to_string(),
                 });
@@ -1008,7 +1118,18 @@ fn collect_reference_links<'e>(events: &[Event<'e>]) -> VecDeque<QueuedLink> {
             Event::Start(Tag::Image {
                 dest_url, title, ..
             }) if link_depth == 0 && !dest_url.is_empty() => {
+                let resolved = environment.resolve_reference(dest_url).map(|mut url| {
+                    if url.scheme() == "file"
+                        && url.host_str().is_none_or(|host| {
+                            host == "localhost" || host == "127.0.0.1" || host == "[::1]"
+                        })
+                    {
+                        url.set_host(Some(&environment.hostname)).unwrap();
+                    }
+                    url.to_string()
+                });
                 result.push_back(QueuedLink {
+                    resolved,
                     target: dest_url.to_string(),
                     title: title.to_string(),
                 });
@@ -1120,14 +1241,19 @@ fn handle_osc(
     if target.is_empty() {
         if let Some(link) = active_link.take().filter(ActiveLink::needs_reference) {
             let index = references.len() + 1;
-            let queued = queued_links.pop_front();
+            // Table wrapping can interleave cells and repeat a destination on later
+            // rows. Match by URL instead of consuming source-order entries blindly.
+            let queued = queued_links
+                .iter()
+                .position(|queued| queued.resolved.as_deref() == Some(link.target.as_str()))
+                .and_then(|index| queued_links.remove(index));
             builder.push_styled_str(format!("[{index}]"), link.style);
             references.push(LinkReference {
                 index,
                 target: queued
                     .as_ref()
                     .map_or_else(|| link.target.clone(), |link| link.target.clone()),
-                title: queued.map_or_else(String::new, |link| link.title),
+                title: queued.map_or_else(String::new, |link| link.title.clone()),
                 style: link.style,
             });
         }
@@ -1250,6 +1376,129 @@ mod tests {
     use crate::resources::FileResourceHandler;
 
     use super::*;
+
+    #[test]
+    fn table_links_retain_destinations_through_wrapping_alignment_and_inline_styles() {
+        let renderer = Renderer::default();
+        let environment =
+            Environment::for_local_directory(&std::env::current_dir().unwrap()).unwrap();
+        let markdown = "| Left | Right |\n| :--- | ---: |\n| [ab**cd**](first.glsl)[ef](second.glsl), | [long wrapped text](third.glsl) |\n";
+        for width in [18, 80] {
+            let settings = renderer.settings(width);
+            let (text, links) = push_linked_text(
+                &settings,
+                &environment,
+                &NOOP_RESOURCE_HANDLER,
+                Parser::new_ext(markdown, markdown_options(false)),
+            )
+            .unwrap();
+            for (filename, expected) in [
+                ("first.glsl", "abcd"),
+                ("second.glsl", "ef"),
+                ("third.glsl", "longwrappedtext"),
+            ] {
+                let mut label = String::new();
+                for link in links.iter().filter(|link| link.target.ends_with(filename)) {
+                    let content = text.lines[link.line]
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>();
+                    label.push_str(&content[link.start..link.end]);
+                }
+                assert_eq!(
+                    label.split_whitespace().collect::<String>(),
+                    expected,
+                    "{filename}, width={width}"
+                );
+            }
+            assert!(text
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.content.contains("cd")
+                    && span.style.add_modifier.contains(Modifier::BOLD)));
+        }
+    }
+
+    #[test]
+    fn table_link_ranges_use_unicode_cell_widths_and_exclude_padding() {
+        let renderer = Renderer::default();
+        let environment =
+            Environment::for_local_directory(&std::env::current_dir().unwrap()).unwrap();
+        let markdown =
+            "| 左 | Right |\n| ---: | :---: |\n| [界é](first.glsl) | [Next](second.glsl) |\n";
+        let (text, links) = push_linked_text(
+            &renderer.settings(40),
+            &environment,
+            &NOOP_RESOURCE_HANDLER,
+            Parser::new_ext(markdown, markdown_options(false)),
+        )
+        .unwrap();
+        let first = links
+            .iter()
+            .find(|link| link.target.ends_with("first.glsl"))
+            .unwrap();
+        assert_eq!(first.end - first.start, 3);
+        let content = text.lines[first.line]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        let before = content.split("界é").next().unwrap();
+        assert_eq!(first.start, Line::raw(before).width());
+        let next = links
+            .iter()
+            .find(|link| link.target.ends_with("second.glsl"))
+            .unwrap();
+        assert_eq!(next.end - next.start, 4);
+    }
+
+    #[test]
+    fn interactive_links_track_unicode_cells_and_wrapped_lines() {
+        let (text, links) = ansi_to_linked_text(
+            "前 \x1b]8;;file:///tmp/next.md\x1b\\é\x1b[1m界\n続き\x1b]8;;\x1b\\ end",
+        );
+        assert_eq!(text_content(&text), "前 é界\n続き end");
+        assert_eq!(links.len(), 2);
+        assert_eq!((links[0].line, links[0].start, links[0].end), (0, 3, 6));
+        assert_eq!((links[1].line, links[1].start, links[1].end), (1, 0, 4));
+        assert!(links
+            .iter()
+            .all(|link| link.target == "file:///tmp/next.md"));
+    }
+
+    #[test]
+    fn interactive_markdown_preserves_resolved_targets_without_reference_suffixes() {
+        let renderer = Renderer::default();
+        let settings = renderer.settings(20);
+        let environment =
+            Environment::for_local_directory(&std::env::current_dir().unwrap()).unwrap();
+        let (text, links) = push_linked_text(
+            &settings,
+            &environment,
+            &NOOP_RESOURCE_HANDLER,
+            Parser::new(
+                "[**a long wrapped link with words**](next%20file.md) and <https://example.com>",
+            ),
+        )
+        .unwrap();
+        assert!(!text_content(&text).contains("[1]"));
+        assert!(
+            links
+                .iter()
+                .filter(|link| link.target.ends_with("/next%20file.md"))
+                .count()
+                >= 2
+        );
+        assert!(links
+            .iter()
+            .any(|link| link.target == "https://example.com/"));
+        for link in &links {
+            assert!(link.start < link.end);
+            assert!(link.end <= text.lines[link.line].width());
+        }
+    }
 
     fn text_content(text: &Text<'_>) -> String {
         text.lines

@@ -1322,7 +1322,11 @@ pub fn write_event<'a, W: Write>(
             let current_line = write_styled_and_wrapped(
                 writer,
                 &settings.terminal_capabilities,
-                &settings.theme.code_style.on_top_of(&attrs.style),
+                &if matches!(state, InlineLink) || !data.pending_links.is_empty() {
+                    settings.theme.link_style.on_top_of(&attrs.style)
+                } else {
+                    settings.theme.code_style.on_top_of(&attrs.style)
+                },
                 settings.terminal_size.columns,
                 attrs.indent,
                 data.current_line,
@@ -1744,9 +1748,12 @@ pub fn write_event<'a, W: Write>(
             Stacked(stack, TableBlock(attrs)).and_data(data).ok()
         }
         (Stacked(stack, TableBlock(attrs)), Code(text)) => {
-            let current_table = data
-                .current_table
-                .push_styled_text(text, settings.theme.code_style);
+            let style = if data.current_table.span_link.is_some() {
+                settings.theme.link_style
+            } else {
+                settings.theme.code_style
+            };
+            let current_table = data.current_table.push_styled_text(text, style);
             let data = StateData {
                 current_table,
                 ..data
@@ -1773,8 +1780,8 @@ pub fn write_event<'a, W: Write>(
             );
             write_table(
                 writer,
-                &settings.terminal_capabilities,
-                &settings.terminal_size,
+                settings,
+                &environment.hostname,
                 attrs.indent,
                 &prefix,
                 prefix_cols,
@@ -1841,8 +1848,22 @@ pub fn write_event<'a, W: Write>(
                 })
                 .ok()
         }
-        (Stacked(stack, TableBlock(attrs)), Start(Link { .. })) => {
-            let current_table = data.current_table.enter_span(settings.theme.link_style);
+        (
+            Stacked(stack, TableBlock(attrs)),
+            Start(Link {
+                link_type,
+                dest_url,
+                ..
+            }),
+        ) => {
+            let link = if link_type == LinkType::Email {
+                Url::parse(&format!("mailto:{dest_url}")).ok()
+            } else {
+                environment.resolve_reference(&dest_url)
+            };
+            let current_table = data
+                .current_table
+                .enter_span(settings.theme.link_style, link);
             Stacked(stack, TableBlock(attrs))
                 .and_data(StateData {
                     current_table,
@@ -1850,10 +1871,11 @@ pub fn write_event<'a, W: Write>(
                 })
                 .ok()
         }
-        (Stacked(stack, TableBlock(attrs)), Start(Image { .. })) => {
+        (Stacked(stack, TableBlock(attrs)), Start(Image { dest_url, .. })) => {
+            let link = environment.resolve_reference(&dest_url);
             let current_table = data
                 .current_table
-                .enter_span(settings.theme.image_link_style);
+                .enter_span(settings.theme.image_link_style, link);
             Stacked(stack, TableBlock(attrs))
                 .and_data(StateData {
                     current_table,

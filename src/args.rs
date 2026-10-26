@@ -26,6 +26,9 @@ pub enum ThemeChoice {
     /// Gruvbox dark.
     #[value(name = "gruvbox-dark")]
     GruvboxDark,
+    /// Gruvbox dark with blue links and yellow inline code.
+    #[value(name = "gruvbox-browse")]
+    GruvboxBrowse,
     /// Gruvbox light.
     #[value(name = "gruvbox-light")]
     GruvboxLight,
@@ -190,7 +193,7 @@ impl std::ops::Deref for Command {
 // #[command(author, version, about, after_help = after_help(), long_version = long_version())]
 pub struct CommonArgs {
     /// Render one file in the built-in Ratatui analyzer (requires a terminal).
-    #[arg(long, conflicts_with_all = ["watch", "paginate", "no_pager"])]
+    #[arg(long, visible_alias = "browse", conflicts_with_all = ["watch", "paginate", "no_pager"])]
     pub analyzer: bool,
     /// Files to read.  If - read from standard input instead.
     #[arg(default_value="-", value_hint = ValueHint::FilePath)]

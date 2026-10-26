@@ -34,6 +34,11 @@ use mdcat::args::{Args, ImageProtocolChoice, ThemeChoice};
 use mdcat::output::{resolved_pager_basename, Output};
 
 mod analyzer;
+mod diff_view;
+mod git_links;
+mod json_view;
+mod link_tree;
+mod navigation;
 mod picker;
 mod query;
 
@@ -155,6 +160,11 @@ fn resolve_theme(choice: ThemeChoice, is_tty: bool) -> ResolvedTheme {
         },
         ThemeChoice::GruvboxDark => ResolvedTheme {
             mdcat: Theme::gruvbox_dark(),
+            is_light: false,
+            default_syntax: Some(EmbeddedThemeName::GruvboxDark),
+        },
+        ThemeChoice::GruvboxBrowse => ResolvedTheme {
+            mdcat: Theme::gruvbox_browse(),
             is_light: false,
             default_syntax: Some(EmbeddedThemeName::GruvboxDark),
         },

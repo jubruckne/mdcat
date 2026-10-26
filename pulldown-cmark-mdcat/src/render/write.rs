@@ -9,16 +9,19 @@ use std::io::{Result, Write};
 use std::iter::zip;
 
 use anstyle::Style;
-use pulldown_cmark::{Alignment, CodeBlockKind, CowStr, HeadingLevel};
+use pulldown_cmark::{Alignment, CodeBlockKind, HeadingLevel};
 use syntect::highlighting::HighlightState;
 use syntect::parsing::{ParseState, ScopeStack};
 use textwrap::core::{display_width, Word};
+use url::Url;
 
 use super::quote_line_prefix;
 use textwrap::WordSeparator;
 
 use crate::references::*;
-use crate::render::data::{CurrentLine, CurrentTable, LinkReferenceDefinition, TableCell};
+use crate::render::data::{
+    CurrentLine, CurrentTable, LinkReferenceDefinition, TableCell, TableFragment,
+};
 use crate::render::highlighting::highlighter;
 use crate::render::state::*;
 use crate::terminal::capabilities::{MarkCapability, StyleCapability, TerminalCapabilities};
@@ -452,9 +455,9 @@ fn column_metrics(table: &CurrentTable) -> Option<(Vec<usize>, Vec<usize>)> {
     Some((natural_widths, min_word_widths))
 }
 
-fn line_longest_word_width(line: &[(Style, CowStr<'_>)]) -> usize {
+fn line_longest_word_width(line: &[TableFragment<'_>]) -> usize {
     let mut full_text = String::new();
-    for (_, text) in line {
+    for (_, text, _) in line {
         full_text.push_str(text.as_ref());
     }
     WordSeparator::UnicodeBreakProperties
@@ -562,142 +565,124 @@ fn write_table_rule<W: Write>(
     writeln!(writer)
 }
 
-/// A word carrying the style it (and its trailing whitespace, which may
-/// belong to a differently-styled fragment, e.g. a plain space between two
-/// styled runs) should be rendered with.
-#[derive(Debug, Clone, Copy)]
-struct StyledWord<'a> {
+/// One output run with a shared style and hyperlink destination.
+#[derive(Debug, Clone)]
+struct TableRun {
     style: Style,
-    whitespace_style: Style,
-    word: Word<'a>,
+    text: String,
+    link: Option<Url>,
 }
 
-impl textwrap::core::Fragment for StyledWord<'_> {
-    fn width(&self) -> f64 {
-        self.word.width()
-    }
-
-    fn whitespace_width(&self) -> f64 {
-        self.word.whitespace_width()
-    }
-
-    fn penalty_width(&self) -> f64 {
-        self.word.penalty_width()
-    }
-}
-
-/// Break a single (possibly overlong) styled word into pieces no wider than
-/// `width`, eagerly, so the pieces don't borrow from the temporary `word`.
-///
-/// Only the last piece keeps the trailing whitespace (and its style), same
-/// as `Word::break_apart` itself.
-fn break_apart_styled(word: StyledWord<'_>, width: usize) -> Vec<StyledWord<'_>> {
-    word.word
-        .break_apart(width)
-        .map(|w| StyledWord {
-            style: word.style,
-            whitespace_style: word.whitespace_style,
-            word: w,
-        })
-        .collect()
-}
-
-/// Push `text` onto `runs`, merging into the last run if it has the same style.
-fn push_run(runs: &mut Vec<(Style, String)>, style: Style, text: &str) {
+fn push_run(runs: &mut Vec<TableRun>, style: Style, link: &Option<Url>, text: &str) {
     if text.is_empty() {
         return;
     }
     match runs.last_mut() {
-        Some((s, buffer)) if *s == style => buffer.push_str(text),
-        _ => runs.push((style, text.to_owned())),
+        Some(run) if run.style == style && run.link == *link => run.text.push_str(text),
+        _ => runs.push(TableRun {
+            style,
+            text: text.to_owned(),
+            link: link.clone(),
+        }),
     }
 }
 
-/// Word-wrap a single explicit line (a `<br>`-delimited segment) of a table
-/// cell to `width` columns, returning the resulting output lines as runs of
-/// styled text ready to be written out.
-///
-/// Fragment boundaries don't necessarily align with word boundaries (e.g. a
-/// plain space between two differently-styled runs is its own fragment), so
-/// all fragments are concatenated into a single string for tokenizing, and
-/// each resulting word is then mapped back to the style of the fragment its
-/// first byte falls in.
-fn wrap_cell_line(line: &[(Style, CowStr<'_>)], width: usize) -> Vec<Vec<(Style, String)>> {
+/// Wrap using visible text widths, then restore exact style and link boundaries.
+/// A word may contain several adjacent links, so its first byte is not enough.
+fn wrap_cell_line(line: &[TableFragment<'_>], width: usize) -> Vec<Vec<TableRun>> {
     let mut full_text = String::new();
-    let mut style_spans: Vec<(usize, usize, Style)> = Vec::with_capacity(line.len());
-    for (style, text) in line {
+    let mut spans = Vec::new();
+    for (style, text, link) in line {
         let start = full_text.len();
         full_text.push_str(text.as_ref());
-        style_spans.push((start, full_text.len(), *style));
+        spans.push((start..full_text.len(), *style, link));
     }
-    let style_at = |offset: usize| -> Style {
-        style_spans
-            .iter()
-            .find(|(start, end, _)| *start <= offset && offset < *end)
-            .map_or_else(Style::new, |(_, _, style)| *style)
-    };
-
-    let words: Vec<StyledWord<'_>> = WordSeparator::UnicodeBreakProperties
+    let words: Vec<Word<'_>> = WordSeparator::UnicodeBreakProperties
         .find_words(&full_text)
-        .flat_map(|word| {
-            let offset = word.word.as_ptr() as usize - full_text.as_ptr() as usize;
-            let style = style_at(offset);
-            let whitespace_style = if word.whitespace.is_empty() {
-                style
-            } else {
-                style_at(offset + word.word.len())
-            };
-            break_apart_styled(
-                StyledWord {
-                    style,
-                    whitespace_style,
-                    word,
-                },
-                width.max(1),
-            )
-        })
+        .flat_map(|word| word.break_apart(width.max(1)).collect::<Vec<_>>())
         .collect();
-
     if words.is_empty() {
         return vec![Vec::new()];
     }
-
-    let wrapped = textwrap::wrap_algorithms::wrap_first_fit(&words, &[width as f64]);
-    wrapped
+    let append = |runs: &mut Vec<TableRun>, text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        let start = text.as_ptr() as usize - full_text.as_ptr() as usize;
+        let end = start + text.len();
+        for (range, style, link) in &spans {
+            let left = start.max(range.start);
+            let right = end.min(range.end);
+            if left < right {
+                push_run(runs, *style, link, &full_text[left..right]);
+            }
+        }
+    };
+    textwrap::wrap_algorithms::wrap_first_fit(&words, &[width as f64])
         .into_iter()
         .map(|words| {
-            let mut runs: Vec<(Style, String)> = Vec::new();
-            let Some((last, heads)) = words.split_last() else {
-                return runs;
-            };
-            for word in heads {
-                push_run(&mut runs, word.style, word.word.word);
-                push_run(&mut runs, word.whitespace_style, word.word.whitespace);
+            let mut runs = Vec::new();
+            if let Some((last, heads)) = words.split_last() {
+                for word in heads {
+                    append(&mut runs, word.word);
+                    append(&mut runs, word.whitespace);
+                }
+                append(&mut runs, last.word);
             }
-            // Drop the last word's trailing whitespace: it's just padding
-            // before the next wrapped line or the cell's closing space.
-            push_run(&mut runs, last.style, last.word.word);
             runs
         })
         .collect()
 }
 
 /// Word-wrap every explicit line of `cell` to `width` columns.
-fn wrap_cell(cell: TableCell<'_>, width: usize) -> Vec<Vec<(Style, String)>> {
+fn wrap_cell(cell: TableCell<'_>, width: usize) -> Vec<Vec<TableRun>> {
     cell.lines
         .iter()
         .flat_map(|line| wrap_cell_line(line, width))
         .collect()
 }
 
-fn line_text_width(line: &[(Style, String)]) -> usize {
-    line.iter().map(|(_, text)| display_width(text)).sum()
+fn line_text_width(line: &[TableRun]) -> usize {
+    line.iter().map(|run| display_width(&run.text)).sum()
+}
+
+struct TableOutput<'a> {
+    capabilities: &'a TerminalCapabilities,
+    hostname: &'a str,
+}
+
+fn write_table_runs<W: Write>(
+    writer: &mut W,
+    output: &TableOutput<'_>,
+    line: &[TableRun],
+) -> Result<()> {
+    let mut active = None;
+    for run in line {
+        let link = run
+            .link
+            .as_ref()
+            .filter(|_| output.capabilities.style.is_some());
+        if link != active {
+            if active.is_some() {
+                clear_link(writer)?;
+            }
+            if let Some(url) = link {
+                set_link_url(writer, url.clone(), output.hostname)?;
+            }
+            active = link;
+        }
+        write_styled(writer, output.capabilities, &run.style, &run.text)?;
+    }
+    if active.is_some() {
+        clear_link(writer)?;
+    }
+    Ok(())
 }
 
 fn write_table_cell_line<W: Write>(
     writer: &mut W,
-    capabilities: &TerminalCapabilities,
-    line: &[(Style, String)],
+    output: &TableOutput<'_>,
+    line: &[TableRun],
     width: usize,
     alignment: Alignment,
 ) -> Result<()> {
@@ -706,25 +691,19 @@ fn write_table_cell_line<W: Write>(
     match alignment {
         Alignment::Right => {
             write!(writer, " {:>padding$}", "")?;
-            for (style, text) in line {
-                write_styled(writer, capabilities, style, text)?;
-            }
+            write_table_runs(writer, output, line)?;
             write!(writer, " ")?;
         }
         Alignment::Center => {
             let left = padding / 2;
             let right = padding - left;
             write!(writer, " {:>left$}", "")?;
-            for (style, text) in line {
-                write_styled(writer, capabilities, style, text)?;
-            }
+            write_table_runs(writer, output, line)?;
             write!(writer, "{:>right$} ", "")?;
         }
         _ => {
             write!(writer, " ")?;
-            for (style, text) in line {
-                write_styled(writer, capabilities, style, text)?;
-            }
+            write_table_runs(writer, output, line)?;
             write!(writer, "{:>padding$} ", "")?;
         }
     }
@@ -736,10 +715,10 @@ fn write_table_cell_line<W: Write>(
 /// widths.
 fn write_table_row<W: Write>(
     writer: &mut W,
-    capabilities: &TerminalCapabilities,
+    output: &TableOutput<'_>,
     indent: u16,
     line_prefix: &str,
-    wrapped_cells: &[Vec<Vec<(Style, String)>>],
+    wrapped_cells: &[Vec<Vec<TableRun>>],
     widths: &[usize],
     alignments: &[Alignment],
 ) -> Result<()> {
@@ -749,12 +728,12 @@ fn write_table_row<W: Write>(
         .max()
         .unwrap_or(1)
         .max(1);
-    let empty_line: Vec<(Style, String)> = Vec::new();
+    let empty_line: Vec<TableRun> = Vec::new();
     for line_idx in 0..height {
         write_table_prefix(writer, indent, line_prefix)?;
         for ((cell, &width), &alignment) in zip(zip(wrapped_cells, widths), alignments) {
             let line = cell.get(line_idx).unwrap_or(&empty_line);
-            write_table_cell_line(writer, capabilities, line, width, alignment)?;
+            write_table_cell_line(writer, output, line, width, alignment)?;
         }
         writeln!(writer)?;
     }
@@ -763,13 +742,19 @@ fn write_table_row<W: Write>(
 
 pub fn write_table<W: Write>(
     writer: &mut W,
-    capabilities: &TerminalCapabilities,
-    terminal_size: &TerminalSize,
+    settings: &Settings,
+    hostname: &str,
     indent: u16,
     line_prefix: &str,
     prefix_cols: u16,
     table: CurrentTable,
 ) -> Result<()> {
+    let capabilities = &settings.terminal_capabilities;
+    let terminal_size = &settings.terminal_size;
+    let output = TableOutput {
+        capabilities,
+        hostname,
+    };
     if let Some((natural_widths, min_word_widths)) = column_metrics(&table) {
         let n = natural_widths.len();
         let overhead = 2 * n;
@@ -794,7 +779,7 @@ pub fn write_table<W: Write>(
                 .collect();
             write_table_row(
                 writer,
-                capabilities,
+                &output,
                 indent,
                 line_prefix,
                 &wrapped_cells,
@@ -810,7 +795,7 @@ pub fn write_table<W: Write>(
                 .collect();
             write_table_row(
                 writer,
-                capabilities,
+                &output,
                 indent,
                 line_prefix,
                 &wrapped_cells,

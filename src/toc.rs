@@ -72,6 +72,34 @@ fn slugify(title: &str, used: &mut HashMap<String, usize>) -> String {
     unique_slug
 }
 
+/// Find the source offset of a heading using the same slugs as the table of contents.
+pub fn heading_offset(markdown: &str, options: Options, anchor: &str) -> Option<usize> {
+    let mut used = HashMap::new();
+    let mut heading = None;
+    for (event, range) in Parser::new_ext(markdown, options).into_offset_iter() {
+        match event {
+            Event::Start(Tag::Heading { id, .. }) => {
+                heading = Some((range.start, String::new(), id))
+            }
+            Event::Text(text) | Event::Code(text) => {
+                if let Some((_, title, _)) = &mut heading {
+                    title.push_str(&text);
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((offset, title, id)) = heading.take() {
+                    let slug = slugify(&title, &mut used);
+                    if slug == anchor || id.as_deref() == Some(anchor) {
+                        return Some(offset);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 struct Node {
     title: String,
     slug: String,

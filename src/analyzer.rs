@@ -1,6 +1,6 @@
 //! Interactive Markdown viewer.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -8,18 +8,16 @@ use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
 };
-use pulldown_cmark::Parser;
+use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, LinkType, Parser, Tag, TagEnd};
 use pulldown_cmark_mdcat::ratatui::{RenderOptions as TuiRenderOptions, Renderer};
 use pulldown_cmark_mdcat::resources::ResourceUrlHandler;
-use pulldown_cmark_mdcat::{
-    expand_tabs, markdown_options, substitute_emoji, Environment, Settings,
-};
+use pulldown_cmark_mdcat::{markdown_options, substitute_emoji, Settings};
 use ratatui::{
     style::{Color, Style},
     text::{Line, Text},
     widgets::{
-        Block, BorderType, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
+        Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState,
     },
 };
 
@@ -31,8 +29,8 @@ pub fn run(
     columns: Option<u16>,
     no_colour: bool,
 ) -> Result<()> {
-    let (base_dir, input) =
-        mdcat::read_input(filename).with_context(|| format!("Failed to read {filename}"))?;
+    let working_directory = std::env::current_dir()?;
+    let mut document = crate::navigation::Document::load(filename.into(), options)?;
     let mut query = crate::query::Query::default();
     let mut response = ResponseWindow {
         no_colour,
@@ -40,33 +38,12 @@ pub fn run(
         animate_text: true,
         ..Default::default()
     };
-    let document = input.clone();
-    let (body, frontmatter) = pulldown_cmark_mdcat::split_frontmatter(&input);
-    let with_frontmatter_table;
-    let input = if options.frontmatter {
-        match frontmatter
-            .and_then(|(format, raw)| pulldown_cmark_mdcat::frontmatter_table_markdown(format, raw))
-        {
-            Some(table) => {
-                with_frontmatter_table = format!("{table}\n{body}");
-                with_frontmatter_table.as_str()
-            }
-            None => body,
-        }
-    } else {
-        body
-    };
-    let input = match options.tabs {
-        Some(width) => expand_tabs(input, width),
-        None => input.into(),
-    };
-    let environment = Environment::for_local_directory(&base_dir)?;
-    let response_renderer = Renderer::new(
+    let mut response_renderer = Renderer::new(
         TuiRenderOptions::default()
             .syntax_set(settings.syntax_set)
             .theme(settings.theme.clone())
             .syntax_theme(settings.syntax_theme.clone())
-            .environment(environment.clone())
+            .environment(document.environment.clone())
             .resource_handler(resources),
     );
     let mut terminal = ratatui::try_init()?;
@@ -76,21 +53,65 @@ pub fn run(
         let mut rendered_width = None;
         let mut scroll = 0usize;
         let mut dragging_scrollbar = false;
+        let mut links = Vec::<pulldown_cmark_mdcat::ratatui::LinkRegion>::new();
+        let mut selected: Option<String> = None;
+        let mut mouse_position = None;
+        let mut link_picker: Option<LinkPicker> = None;
+        let mut titles = Vec::new();
+        let mut history: Vec<(crate::navigation::Document, usize, Option<String>)> = Vec::new();
+        let mut status = String::new();
+        let mut pending_anchor: Option<String> = None;
+
         let animation_started = std::time::Instant::now();
         loop {
             query.poll();
+            if link_picker.as_ref().is_some_and(LinkPicker::expired) {
+                link_picker = None;
+            }
             let size = terminal.size()?;
-            let area = ratatui::layout::Rect::new(0, 0, size.width, size.height);
-            let width = area.width.saturating_sub(4).max(1);
+            let bounds = ratatui::layout::Rect::new(0, 0, size.width, size.height);
+            let (first_parent, area) = document_stack_layout(bounds, history.len());
+            let width = area
+                .width
+                .saturating_sub(if document.diff.is_some() { 5 } else { 4 })
+                .max(1);
             let height = usize::from(area.height.saturating_sub(2));
             let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let tick = (animation_started.elapsed().as_millis() / 100) % spinner.len() as u128;
+            if rendered_width.is_none() {
+                let paths = history
+                    .iter()
+                    .map(|(parent, _, _)| parent.path.as_path())
+                    .chain(std::iter::once(document.path.as_path()))
+                    .collect::<Vec<_>>();
+                titles = document_titles(&paths);
+                for (index, doc) in history
+                    .iter()
+                    .map(|(doc, _, _)| doc)
+                    .chain(std::iter::once(&document))
+                    .enumerate()
+                {
+                    if let Some(title) = &doc.title {
+                        titles[index].clone_from(title);
+                    }
+                }
+                response_renderer = Renderer::new(
+                    response_renderer
+                        .options()
+                        .clone()
+                        .environment(document.environment.clone()),
+                );
+            }
             response.refresh(area, &query, spinner[tick as usize], &response_renderer);
             response.advance_resize();
-            let width = match columns {
-                Some(0) => u16::MAX,
-                Some(limit) => width.min(limit),
-                None => width.min(80),
+            let width = if document.diff.is_some() {
+                width
+            } else {
+                match columns {
+                    Some(0) => u16::MAX,
+                    Some(limit) => width.min(limit),
+                    None => width.min(80),
+                }
             };
             if rendered_width != Some(width) {
                 let settings = Settings {
@@ -104,30 +125,8 @@ pub fn run(
                     theme: settings.theme.clone(),
                     syntax_theme: settings.syntax_theme.clone(),
                 };
-                let parse_options = markdown_options(options.smart_punctuation);
-                let toc = if options.toc {
-                    mdcat::toc::build_toc_events(&input, parse_options, None)
-                } else {
-                    Vec::new()
-                };
-                let events = toc
-                    .into_iter()
-                    .chain(Parser::new_ext(&input, parse_options));
-                text = if options.emoji {
-                    pulldown_cmark_mdcat::ratatui::push_text(
-                        &settings,
-                        &environment,
-                        resources,
-                        substitute_emoji(events),
-                    )?
-                } else {
-                    pulldown_cmark_mdcat::ratatui::push_text(
-                        &settings,
-                        &environment,
-                        resources,
-                        events,
-                    )?
-                };
+                (text, links) =
+                    render_document(&document, &document.input, &settings, resources, options)?;
                 if no_colour {
                     for line in &mut text.lines {
                         line.style = Style::default();
@@ -136,11 +135,55 @@ pub fn run(
                         }
                     }
                 }
+                if let Some(anchor) = pending_anchor.take() {
+                    if let Some(line) =
+                        anchor_line(&document, &anchor, &settings, resources, options)?
+                    {
+                        scroll = line;
+                        if let Some(source_line) = crate::navigation::source_line(&anchor) {
+                            let actual = source_line.min(document.source.lines().count().max(1));
+                            status = if actual == source_line {
+                                format!(" Source line {actual} ")
+                            } else {
+                                format!(" Source line {actual} (requested {source_line}) ")
+                            };
+                        }
+                    } else {
+                        status = format!("Heading not found: #{anchor}");
+                    }
+                }
                 rendered_width = Some(width);
             }
             let max_scroll = text.lines.len().saturating_sub(height.max(1));
             scroll = scroll.min(max_scroll);
+            let hovered = mouse_position
+                .filter(|_| {
+                    !query.open && !response.visible && !dragging_scrollbar && link_picker.is_none()
+                })
+                .and_then(|(column, row)| link_at(&links, area, scroll, column, row))
+                .filter(|link| document.can_open(&link.target))
+                .map(|link| link.target.as_str());
             terminal.draw(|frame| {
+                // Each fixed child covers its parent's body, leaving its title bar visible.
+                for (index, (_, position, _)) in history.iter().skip(first_parent).enumerate() {
+                    let parent_area = ratatui::layout::Rect::new(
+                        bounds.x,
+                        bounds.y + index as u16,
+                        bounds.width,
+                        bounds.height - index as u16,
+                    );
+                    frame.render_widget(
+                        document_block(
+                            &titles[first_parent + index],
+                            *position + 1,
+                            0,
+                            no_colour,
+                            false,
+                        ),
+                        parent_area,
+                    );
+                }
+                frame.render_widget(Clear, area);
                 // Slice with usize so documents beyond 65,535 lines remain navigable.
                 let visible = Text::from(
                     text.lines
@@ -152,14 +195,94 @@ pub fn run(
                 );
                 frame.render_widget(
                     Paragraph::new(visible).block(document_block(
-                        filename,
+                        &titles[history.len()],
                         (scroll + 1).min(text.lines.len()),
                         text.lines.len(),
                         no_colour,
+                        true,
                     )),
                     area,
                 );
 
+                let picker_target = link_picker.as_ref().and_then(LinkPicker::selected_target);
+                let picker_link = picker_target.as_deref().and_then(|target| {
+                    links
+                        .iter()
+                        .find(|link| same_local_link(&document, &link.target, target))
+                });
+                draw_link_highlights(
+                    frame,
+                    &links,
+                    area,
+                    scroll,
+                    None,
+                    picker_link.map(|link| link.target.as_str()).or(hovered),
+                    if no_colour {
+                        None
+                    } else {
+                        settings
+                            .theme
+                            .link_style
+                            .get_fg_color()
+                            .map(|color| match color {
+                                anstyle::Color::Rgb(anstyle::RgbColor(r, g, b)) => {
+                                    Color::Rgb(r, g, b)
+                                }
+                                anstyle::Color::Ansi256(anstyle::Ansi256Color(index)) => {
+                                    Color::Indexed(index)
+                                }
+                                anstyle::Color::Ansi(color) => Color::Indexed(color as u8),
+                            })
+                    },
+                );
+                if let Some(json) = document.json.as_ref() {
+                    if json.cursor >= scroll && json.cursor < scroll + height {
+                        let column = json.focus_column();
+                        let available = usize::from(area.width.saturating_sub(4));
+                        if column < available {
+                            frame.buffer_mut().set_style(
+                                ratatui::layout::Rect::new(
+                                    area.x + 2 + column as u16,
+                                    area.y + 1 + (json.cursor - scroll) as u16,
+                                    1,
+                                    1,
+                                ),
+                                Style::default().add_modifier(ratatui::style::Modifier::REVERSED),
+                            );
+                        }
+                    }
+                }
+                let hovered_path =
+                    hovered.and_then(|target| hover_path(&document, target, &working_directory));
+                let hint = if let Some(path) = hovered_path.as_deref() {
+                    path
+                } else if status.is_empty() {
+                    if document.json.is_some() {
+                        " Enter: fold · c/e: fold/expand all · Tab: links "
+                    } else {
+                        ""
+                    }
+                } else {
+                    &status
+                };
+                if area.width > 4 {
+                    frame.render_widget(
+                        Line::raw(hint),
+                        ratatui::layout::Rect::new(
+                            area.x + 2,
+                            area.bottom().saturating_sub(1),
+                            area.width.saturating_sub(
+                                4 + format!(
+                                    " {} / {} ──",
+                                    (scroll + 1).min(text.lines.len()),
+                                    text.lines.len()
+                                )
+                                .len() as u16,
+                            ),
+                            1,
+                        ),
+                    );
+                }
                 if max_scroll > 0 && area.width >= 5 && area.height > 2 {
                     let track = ratatui::layout::Rect::new(
                         area.right() - 2,
@@ -193,11 +316,27 @@ pub fn run(
                 if query.open {
                     draw_prompt(frame, area, &query, no_colour);
                 }
+                if let Some(picker) = &mut link_picker {
+                    let background = settings
+                        .syntax_theme
+                        .as_ref()
+                        .and_then(|theme| theme.settings.background)
+                        .map(|color| (color.r, color.g, color.b))
+                        .unwrap_or(if settings.theme.is_dark {
+                            (28, 28, 28)
+                        } else {
+                            (255, 255, 255)
+                        });
+                    picker.draw(frame, bounds, no_colour, background);
+                }
             })?;
-            let refresh_ms = if response.visible
-                && (response.animating_caption()
-                    || response.resize_started.is_some()
-                    || response.animating_answer())
+            let refresh_ms = if link_picker
+                .as_ref()
+                .is_some_and(|picker| picker.targets.is_empty())
+                || response.visible
+                    && (response.animating_caption()
+                        || response.resize_started.is_some()
+                        || response.animating_answer())
             {
                 15
             } else {
@@ -206,7 +345,87 @@ pub fn run(
             if !event::poll(std::time::Duration::from_millis(refresh_ms))? {
                 continue;
             }
-            match event::read()? {
+            let mut open_target = None;
+            let mut go_back = false;
+            let event = event::read()?;
+            if let Event::Mouse(mouse) = &event {
+                mouse_position = Some((mouse.column, mouse.row));
+            }
+            let is_mouse = matches!(event, Event::Mouse(_));
+            match event {
+                Event::Key(key) if key.kind != KeyEventKind::Release && link_picker.is_some() => {
+                    let picker = link_picker.as_mut().unwrap();
+                    let navigate = matches!(
+                        key.code,
+                        KeyCode::Up
+                            | KeyCode::Down
+                            | KeyCode::Char('j' | 'k')
+                            | KeyCode::Tab
+                            | KeyCode::BackTab
+                            | KeyCode::PageUp
+                            | KeyCode::PageDown
+                            | KeyCode::Home
+                            | KeyCode::End
+                    );
+                    let mut close = false;
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
+                        KeyCode::Esc | KeyCode::Char('q' | 'Q') => close = true,
+                        KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
+                        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            picker.move_by(-1)
+                        }
+                        KeyCode::Tab => picker.move_by(1),
+                        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => picker.move_by(-1),
+                        KeyCode::PageDown => picker.move_by(
+                            isize::try_from(picker.area.height.saturating_sub(2).max(1)).unwrap(),
+                        ),
+                        KeyCode::PageUp => picker.move_by(
+                            -isize::try_from(picker.area.height.saturating_sub(2).max(1)).unwrap(),
+                        ),
+                        KeyCode::Home => picker.select_edge(false),
+                        KeyCode::End => picker.select_edge(true),
+                        KeyCode::Enter if !picker.targets.is_empty() => {
+                            open_target = picker.selected_target();
+                            selected.clone_from(&open_target);
+                            close = true;
+                        }
+                        _ => {}
+                    }
+                    if navigate {
+                        if let Some(line) = picker.document_line(&links, &document, scroll) {
+                            scroll = line.saturating_sub(1).min(max_scroll);
+                        }
+                    }
+                    if close {
+                        link_picker = None;
+                    }
+                }
+                Event::Mouse(mouse) if link_picker.is_some() => {
+                    let picker = link_picker.as_mut().unwrap();
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => picker.move_by(1),
+                        MouseEventKind::ScrollUp => picker.move_by(-1),
+                        MouseEventKind::Moved => {
+                            if let Some(index) = picker.item_at(mouse.column, mouse.row) {
+                                picker.state.select(Some(index));
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(index) = picker.item_at(mouse.column, mouse.row) {
+                                picker.state.select(Some(index));
+                                open_target = picker.selected_target();
+                                selected.clone_from(&open_target);
+                                link_picker = None;
+                            } else if !picker.area.contains((mouse.column, mouse.row).into()) {
+                                link_picker = None;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 Event::Key(key) if key.kind != KeyEventKind::Release && query.open => {
                     match key.code {
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -214,7 +433,7 @@ pub fn run(
                         }
                         KeyCode::Esc | KeyCode::Tab => query.open = false,
                         KeyCode::Enter if !query.busy() && !query.input.trim().is_empty() => {
-                            query.submit(&document);
+                            query.submit(&document.source);
                             query.open = false;
                             response.visible = true;
                             response.initialized = false;
@@ -247,7 +466,7 @@ pub fn run(
                             response.visible = false;
                             response.drag = None;
                         }
-                        KeyCode::Char('?') => query.open = true,
+                        KeyCode::Char('?') => query.open_prompt(),
                         KeyCode::Char('l')
                             if key.modifiers.contains(KeyModifiers::CONTROL) && !query.busy() =>
                         {
@@ -265,11 +484,110 @@ pub fn run(
                         _ => {}
                     }
                 }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && document.diff.is_some()
+                        && matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Char(' ' | 'c' | 'e' | 'n' | 'p')
+                        ) =>
+                {
+                    let diff = document.diff.as_mut().unwrap();
+                    match key.code {
+                        KeyCode::Enter | KeyCode::Char(' ') => {
+                            if let Some(header) = diff.toggle(scroll, false) {
+                                scroll = header;
+                                rendered_width = None;
+                            }
+                        }
+                        KeyCode::Char('c' | 'e') => {
+                            scroll = diff.fold_all(key.code == KeyCode::Char('c'));
+                            rendered_width = None;
+                        }
+                        KeyCode::Char('n' | 'p') => {
+                            scroll = diff.next_file(scroll, key.code == KeyCode::Char('n'))
+                        }
+                        _ => {}
+                    }
+                    status.clear();
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && document.json.is_some()
+                        && matches!(
+                            key.code,
+                            KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::PageUp
+                                | KeyCode::PageDown
+                                | KeyCode::Home
+                                | KeyCode::End
+                                | KeyCode::Enter
+                                | KeyCode::Char(' ')
+                                | KeyCode::Char('j')
+                                | KeyCode::Char('k')
+                                | KeyCode::Char('c')
+                                | KeyCode::Char('e')
+                                | KeyCode::Char('g')
+                                | KeyCode::Char('G')
+                                | KeyCode::Char('b')
+                        ) =>
+                {
+                    let json = document.json.as_mut().unwrap();
+                    let mut changed = false;
+                    match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => json.move_by(-1),
+                        KeyCode::Down | KeyCode::Char('j') => json.move_by(1),
+                        KeyCode::PageUp | KeyCode::Char('b') => {
+                            json.move_by(-(height.max(1) as isize))
+                        }
+                        KeyCode::PageDown => json.move_by(height.max(1) as isize),
+                        KeyCode::Home | KeyCode::Char('g') => json.cursor = 0,
+                        KeyCode::End | KeyCode::Char('G') => json.end(),
+                        KeyCode::Enter | KeyCode::Char(' ') => changed = json.toggle(json.cursor),
+                        KeyCode::Left => changed = json.collapse(),
+                        KeyCode::Right => changed = json.expand(),
+                        KeyCode::Char('c') => {
+                            json.fold_all(true);
+                            changed = true;
+                        }
+                        KeyCode::Char('e') => {
+                            json.fold_all(false);
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                    scroll = cursor_scroll(json.cursor, scroll, height);
+                    if changed {
+                        rendered_width = None;
+                    }
+                    status.clear();
+                }
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        if history.is_empty() {
+                            break;
+                        }
+                        go_back = true;
+                    }
+                    KeyCode::Backspace | KeyCode::Left => go_back = true,
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let targets = available_links(&document, options);
+                        link_picker =
+                            Some(LinkPicker::new(targets, &document, selected.as_deref()));
+                        dragging_scrollbar = false;
+                    }
                     KeyCode::Char('?') => {
-                        query.open = true;
+                        query.open_prompt();
                     }
                     KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
                     KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
@@ -318,6 +636,39 @@ pub fn run(
                         dragging_scrollbar = true;
                         scroll = scrollbar_position(mouse.row, area, max_scroll);
                     }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if mouse.column >= area.x + 2
+                            && mouse.column < area.right().saturating_sub(2)
+                            && mouse.row > area.y
+                            && mouse.row < area.bottom().saturating_sub(1) =>
+                    {
+                        let row = scroll + usize::from(mouse.row - area.y - 1);
+                        let folded = document
+                            .diff
+                            .as_mut()
+                            .and_then(|diff| diff.toggle(row, true));
+                        if folded.is_some() {
+                            rendered_width = None;
+                        } else {
+                            open_target = link_at(&links, area, scroll, mouse.column, mouse.row)
+                                .map(|link| link.target.clone());
+                        }
+                        if open_target.is_none() {
+                            if let Some(json) = document.json.as_mut() {
+                                let row = scroll + usize::from(mouse.row - area.y - 1);
+                                // Clamp to real rows rather than a click below the document.
+                                let old = json.cursor;
+                                json.cursor = row;
+                                if row < text.lines.len() {
+                                    if json.toggle(row) {
+                                        rendered_width = None;
+                                    }
+                                } else {
+                                    json.cursor = old;
+                                }
+                            }
+                        }
+                    }
                     MouseEventKind::Drag(MouseButton::Left) if dragging_scrollbar => {
                         scroll = scrollbar_position(mouse.row, area, max_scroll);
                     }
@@ -328,6 +679,90 @@ pub fn run(
                 },
                 _ => {}
             }
+            if is_mouse && rendered_width.is_some() {
+                if let Some(json) = document.json.as_mut() {
+                    if json.cursor < scroll {
+                        json.cursor = scroll;
+                    }
+                    if json.cursor >= scroll + height.max(1) {
+                        json.cursor = scroll + height.max(1) - 1;
+                    }
+                    json.select_row(json.cursor);
+                }
+            }
+            if go_back {
+                if let Some((previous, position, selection)) = history.pop() {
+                    document = previous;
+                    scroll = position;
+                    selected = selection;
+                    rendered_width = None;
+                    pending_anchor = None;
+                    status.clear();
+                    dragging_scrollbar = false;
+                    query = crate::query::Query::default();
+                    response.visible = false;
+                }
+            }
+            if let Some(target) = open_target {
+                if is_current_document_link(&document, &target) {
+                    let url = document.environment.base_url.join(&target)?;
+                    pending_anchor = url
+                        .fragment()
+                        .filter(|fragment| !fragment.is_empty())
+                        .map(str::to_owned);
+                    if pending_anchor
+                        .as_deref()
+                        .and_then(crate::navigation::source_line)
+                        .is_some()
+                    {
+                        document.show_source(options);
+                    }
+                    if pending_anchor.is_none() {
+                        scroll = 0;
+                    }
+                    rendered_width = None;
+                    dragging_scrollbar = false;
+                    status.clear();
+                    continue;
+                }
+                let result = (|| -> Result<_> {
+                    let mut next = if crate::git_links::commit_id(&target).is_some() {
+                        document.open_commit(&target)?
+                    } else {
+                        let path = document.destination(&target)?;
+                        crate::navigation::Document::load(path, options)?
+                    };
+                    let anchor = url::Url::parse(&target)?
+                        .fragment()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    if anchor
+                        .as_deref()
+                        .and_then(crate::navigation::source_line)
+                        .is_some()
+                    {
+                        next.show_source(options);
+                    }
+                    Ok((next, anchor))
+                })();
+                match result {
+                    Ok((next, anchor)) => {
+                        history.push((
+                            std::mem::replace(&mut document, next),
+                            scroll,
+                            selected.take(),
+                        ));
+                        scroll = 0;
+                        pending_anchor = anchor;
+                        rendered_width = None;
+                        dragging_scrollbar = false;
+                        status.clear();
+                        query = crate::query::Query::default();
+                        response.visible = false;
+                    }
+                    Err(error) => status = format!(" {error:#} "),
+                }
+            }
         }
         Ok(())
     })();
@@ -337,6 +772,901 @@ pub fn run(
     mouse_restore?;
     restore?;
     Ok(())
+}
+
+fn cursor_scroll(cursor: usize, scroll: usize, height: usize) -> usize {
+    if cursor < scroll {
+        cursor
+    } else if cursor >= scroll + height.max(1) {
+        cursor + 1 - height.max(1)
+    } else {
+        scroll
+    }
+}
+
+struct LinkPicker {
+    targets: Vec<String>,
+    rows: Vec<crate::link_tree::PickerRow>,
+    file_rows: Vec<usize>,
+    state: ListState,
+    area: ratatui::layout::Rect,
+    opened: std::time::Instant,
+    preview_line: Option<usize>,
+}
+
+impl LinkPicker {
+    fn new(
+        targets: Vec<String>,
+        document: &crate::navigation::Document,
+        selected: Option<&str>,
+    ) -> Self {
+        let labels: Vec<String> = targets
+            .iter()
+            .map(|target| {
+                document
+                    .link_label(target)
+                    .expect("picker targets can be opened locally")
+            })
+            .collect();
+        let rows = crate::link_tree::grouped_rows(&labels);
+        let file_rows = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.target.map(|_| index))
+            .collect::<Vec<_>>();
+        let selected_target =
+            selected.and_then(|target| targets.iter().position(|item| item == target));
+        let index = selected_target
+            .and_then(|target| rows.iter().position(|row| row.target == Some(target)))
+            .or_else(|| file_rows.first().copied());
+        Self {
+            targets,
+            rows,
+            file_rows,
+            state: ListState::default().with_selected(index),
+            area: Default::default(),
+            opened: std::time::Instant::now(),
+            preview_line: None,
+        }
+    }
+
+    fn document_line(
+        &mut self,
+        links: &[pulldown_cmark_mdcat::ratatui::LinkRegion],
+        document: &crate::navigation::Document,
+        scroll: usize,
+    ) -> Option<usize> {
+        // The renderer includes the local hostname; picker URLs may omit it.
+        // Keep fragments in the identity so distinct source-line links stay distinct.
+        let identity = |target: &str| {
+            if crate::git_links::commit_id(target).is_some() {
+                return Some((std::path::PathBuf::from(target), None));
+            }
+            let path = document.destination(target).ok()?;
+            let url = document.environment.base_url.join(target).ok()?;
+            Some((path, url.fragment().map(str::to_owned)))
+        };
+        let rendered = links
+            .iter()
+            .filter_map(|link| identity(&link.target).map(|key| (key, link.line)))
+            .collect::<Vec<_>>();
+        let occurrences = self
+            .targets
+            .iter()
+            .map(|target| {
+                let key = identity(target);
+                rendered
+                    .iter()
+                    .filter_map(|(other, line)| (key.as_ref() == Some(other)).then_some(*line))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let selected_row = self.state.selected()?;
+        let target = self.rows.get(selected_row)?.target?;
+        let selected = occurrences.get(target)?;
+        // Use the closest available neighbor on each side in the displayed list.
+        // Repeated destinations prefer the occurrence near those surrounding links,
+        // with the last preview (or current viewport) breaking ambiguous ties.
+        let neighbors = [
+            self.rows[..selected_row].iter().rev().find_map(|row| {
+                row.target.and_then(|index| {
+                    (!occurrences[index].is_empty()).then_some(&occurrences[index])
+                })
+            }),
+            self.rows[selected_row + 1..].iter().find_map(|row| {
+                row.target.and_then(|index| {
+                    (!occurrences[index].is_empty()).then_some(&occurrences[index])
+                })
+            }),
+        ];
+        let anchor = self.preview_line.unwrap_or(scroll);
+        let line = selected.iter().copied().min_by_key(|line| {
+            let context = neighbors
+                .iter()
+                .flatten()
+                .map(|positions| {
+                    positions
+                        .iter()
+                        .map(|other| line.abs_diff(*other))
+                        .min()
+                        .unwrap_or(0)
+                })
+                .sum::<usize>();
+            (context, line.abs_diff(anchor), *line)
+        })?;
+        self.preview_line = Some(line);
+        Some(line)
+    }
+
+    fn expired(&self) -> bool {
+        self.targets.is_empty() && self.opened.elapsed() >= std::time::Duration::from_millis(850)
+    }
+
+    fn move_by(&mut self, amount: isize) {
+        if !self.file_rows.is_empty() {
+            let current = self
+                .state
+                .selected()
+                .and_then(|selected| self.file_rows.iter().position(|row| *row == selected))
+                .unwrap_or(0);
+            let next =
+                (current as isize + amount).rem_euclid(self.file_rows.len() as isize) as usize;
+            self.state.select(Some(self.file_rows[next]));
+        }
+    }
+
+    fn select_edge(&mut self, last: bool) {
+        self.state.select(
+            if last {
+                self.file_rows.last()
+            } else {
+                self.file_rows.first()
+            }
+            .copied(),
+        );
+    }
+
+    fn selected_target(&self) -> Option<String> {
+        self.state
+            .selected()
+            .and_then(|index| self.rows.get(index))
+            .and_then(|row| row.target)
+            .and_then(|index| self.targets.get(index))
+            .cloned()
+    }
+
+    fn item_at(&self, column: u16, row: u16) -> Option<usize> {
+        if column <= self.area.x
+            || column >= self.area.right().saturating_sub(2)
+            || row <= self.area.y
+            || row >= self.area.bottom().saturating_sub(1)
+        {
+            return None;
+        }
+        let index = self.state.offset() + usize::from(row - self.area.y - 1);
+        self.rows
+            .get(index)
+            .filter(|row| row.target.is_some())
+            .map(|_| index)
+    }
+
+    fn draw(
+        &mut self,
+        frame: &mut ratatui::Frame<'_>,
+        bounds: ratatui::layout::Rect,
+        no_colour: bool,
+        background: (u8, u8, u8),
+    ) {
+        let max_width = (u32::from(bounds.width) * 60 / 100).max(1) as u16;
+        let max_height = (u32::from(bounds.height) * 60 / 100).max(1) as u16;
+        if self.targets.is_empty() {
+            const MESSAGE: &str = "No local file links in this document.";
+            self.area = centered(
+                bounds,
+                (MESSAGE.len() as u16 + 4).min(max_width),
+                3.min(max_height),
+            );
+            frame.render_widget(Clear, self.area);
+            let remaining = (1.0 - self.opened.elapsed().as_secs_f32() / 0.850).clamp(0.0, 1.0);
+            let blend = |foreground: (u8, u8, u8)| {
+                let channel = |fg: u8, bg: u8| {
+                    (f32::from(bg) + (f32::from(fg) - f32::from(bg)) * remaining).round() as u8
+                };
+                Color::Rgb(
+                    channel(foreground.0, background.0),
+                    channel(foreground.1, background.1),
+                    channel(foreground.2, background.2),
+                )
+            };
+            let mut block = popup_block(no_colour).padding(Padding::horizontal(1));
+            let mut style = Style::default();
+            if no_colour {
+                if remaining < 0.5 {
+                    style = style.add_modifier(ratatui::style::Modifier::DIM);
+                    block = block.border_style(style);
+                }
+            } else {
+                let foreground =
+                    if u16::from(background.0) + u16::from(background.1) + u16::from(background.2)
+                        > 384
+                    {
+                        (40, 40, 40)
+                    } else {
+                        (220, 220, 220)
+                    };
+                style = style.fg(blend(foreground));
+                block = block.border_style(Style::default().fg(blend((180, 167, 235))));
+            }
+            frame.render_widget(Paragraph::new(MESSAGE).style(style).block(block), self.area);
+            return;
+        }
+        let width = self
+            .rows
+            .iter()
+            .map(|row| Line::raw(&row.label).width())
+            .max()
+            .unwrap_or(38)
+            .saturating_add(5)
+            .max(52)
+            .min(usize::from(max_width));
+        let height = self
+            .rows
+            .len()
+            .max(1)
+            .saturating_add(2)
+            .min(usize::from(max_height));
+        self.area = centered(bounds, width as u16, height as u16);
+        frame.render_widget(Clear, self.area);
+        let block = popup_block(no_colour)
+            .padding(Padding::new(0, 1, 0, 0))
+            .title(format!(" Links ({}) ", self.targets.len()));
+        let items = self.rows.iter().map(|row| {
+            let item = ListItem::new(row.label.as_str());
+            if row.target.is_none() {
+                item.style(Style::default().add_modifier(ratatui::style::Modifier::BOLD))
+            } else {
+                item
+            }
+        });
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block)
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().add_modifier(ratatui::style::Modifier::REVERSED)),
+            self.area,
+            &mut self.state,
+        );
+        let visible = usize::from(self.area.height.saturating_sub(2));
+        if self.rows.len() > visible && self.area.width >= 4 && visible > 0 {
+            let track = ratatui::layout::Rect::new(
+                self.area.right() - 2,
+                self.area.y + 1,
+                1,
+                visible as u16,
+            );
+            let mut state = ScrollbarState::new(self.rows.len().saturating_sub(visible) + 1)
+                .position(self.state.offset())
+                .viewport_content_length(visible);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(if no_colour {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Rgb(80, 80, 80))
+                })
+                .thumb_style(if no_colour {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Rgb(180, 180, 180))
+                });
+            frame.render_stateful_widget(scrollbar, track, &mut state);
+        }
+    }
+}
+
+/// Use filenames until a collision requires paths relative to the shared parent directory.
+fn document_titles(paths: &[&std::path::Path]) -> Vec<String> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let peers = paths
+                .iter()
+                .filter(|other| other.file_name() == path.file_name())
+                .collect::<Vec<_>>();
+            if peers.len() == 1 {
+                return path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy()
+                    .into_owned();
+            }
+            let mut common = path.parent().unwrap_or(path);
+            for other in &peers {
+                while !other.starts_with(common) {
+                    let Some(parent) = common.parent() else {
+                        break;
+                    };
+                    common = parent;
+                }
+            }
+            let relative = path.strip_prefix(common).unwrap_or(path);
+            let mut title = format!("./{}", relative.display());
+            // Reopening the very same path (for example at another heading) has no unique path.
+            if paths.iter().filter(|other| **other == *path).count() > 1 {
+                let occurrence = paths[..=index]
+                    .iter()
+                    .filter(|other| **other == *path)
+                    .count();
+                title.push_str(&format!(" [{occurrence}]"));
+            }
+            title
+        })
+        .collect()
+}
+
+fn is_current_document_link(document: &crate::navigation::Document, target: &str) -> bool {
+    if target.starts_with('#') {
+        return true;
+    }
+    let Ok(path) = document.destination(target) else {
+        return false;
+    };
+    path == document.path
+        || path
+            .canonicalize()
+            .ok()
+            .zip(document.path.canonicalize().ok())
+            .is_some_and(|(left, right)| left == right)
+}
+
+fn hover_path(
+    document: &crate::navigation::Document,
+    target: &str,
+    cwd: &std::path::Path,
+) -> Option<String> {
+    if let Some(id) = crate::git_links::commit_id(target) {
+        return Some(format!(" Git commit {id} "));
+    }
+    let path = document.destination(target).ok()?;
+    // Resolve macOS directory aliases (for example /tmp -> /private/tmp)
+    // together, so a sibling file does not get an artificial ../../tmp prefix.
+    let (path, cwd) = match (path.canonicalize(), cwd.canonicalize()) {
+        (Ok(path), Ok(cwd)) => (path, cwd),
+        _ => (path, cwd.to_owned()),
+    };
+    let base = cwd.components().collect::<Vec<_>>();
+    let components = path.components().collect::<Vec<_>>();
+    let shared = base
+        .iter()
+        .zip(&components)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let mut relative = std::path::PathBuf::new();
+    for _ in shared..base.len() {
+        relative.push("..");
+    }
+    for component in &components[shared..] {
+        relative.push(component.as_os_str());
+    }
+    let mut label = if shared == base.len() {
+        format!("./{}", relative.display())
+    } else {
+        relative.display().to_string()
+    };
+    if let Some(fragment) = document.environment.base_url.join(target).ok()?.fragment() {
+        if let Some(line) = crate::navigation::source_line(fragment) {
+            label.push_str(&format!(":{line}"));
+        } else {
+            label.push('#');
+            label.push_str(&percent_encoding::percent_decode_str(fragment).decode_utf8_lossy());
+        }
+    }
+    Some(format!(" {label} "))
+}
+
+fn same_local_link(document: &crate::navigation::Document, left: &str, right: &str) -> bool {
+    if crate::git_links::commit_id(left).is_some() || crate::git_links::commit_id(right).is_some() {
+        return left == right;
+    }
+    let identity = |target: &str| {
+        Some((
+            document.destination(target).ok()?,
+            document
+                .environment
+                .base_url
+                .join(target)
+                .ok()?
+                .fragment()
+                .map(str::to_owned),
+        ))
+    };
+    identity(left).is_some_and(|left| Some(left) == identity(right))
+}
+
+/// Hide heading fragments in path labels, preserving explicit source-line numbers.
+fn section_path_label(label: &str, document: &crate::navigation::Document) -> Option<String> {
+    let (path, fragment) = label.rsplit_once('#')?;
+    if fragment.is_empty() || crate::navigation::source_line(fragment).is_some() {
+        return None;
+    }
+    let destination = document.destination(label).ok()?;
+    let extension = destination.extension()?.to_str()?.to_ascii_lowercase();
+    ["md", "markdown", "mdown", "mkd", "mkdn"]
+        .contains(&extension.as_str())
+        .then(|| path.to_owned())
+}
+
+fn link_at(
+    links: &[pulldown_cmark_mdcat::ratatui::LinkRegion],
+    area: ratatui::layout::Rect,
+    scroll: usize,
+    column: u16,
+    row: u16,
+) -> Option<&pulldown_cmark_mdcat::ratatui::LinkRegion> {
+    if column < area.x + 2
+        || column >= area.right().saturating_sub(2)
+        || row <= area.y
+        || row >= area.bottom().saturating_sub(1)
+    {
+        return None;
+    }
+    let line = scroll + usize::from(row - area.y - 1);
+    let column = usize::from(column - area.x - 2);
+    links
+        .iter()
+        .find(|link| link.line == line && column >= link.start && column < link.end)
+}
+
+fn draw_link_highlights(
+    frame: &mut ratatui::Frame<'_>,
+    links: &[pulldown_cmark_mdcat::ratatui::LinkRegion],
+    area: ratatui::layout::Rect,
+    scroll: usize,
+    selected: Option<&str>,
+    hovered: Option<&str>,
+    commit_colour: Option<Color>,
+) {
+    use ratatui::style::Modifier;
+    let height = usize::from(area.height.saturating_sub(2));
+    for link in links {
+        let mut modifiers = Modifier::empty();
+        if selected == Some(&link.target) {
+            modifiers |= Modifier::REVERSED;
+        }
+        if hovered == Some(&link.target) {
+            modifiers |= Modifier::UNDERLINED;
+        }
+        let color = commit_colour.filter(|_| crate::git_links::commit_id(&link.target).is_some());
+        if (!modifiers.is_empty() || color.is_some())
+            && link.line >= scroll
+            && link.line < scroll + height
+        {
+            let start = link.start.min(usize::from(area.width.saturating_sub(4)));
+            let end = link.end.min(usize::from(area.width.saturating_sub(4)));
+            if end > start {
+                frame.buffer_mut().set_style(
+                    ratatui::layout::Rect::new(
+                        area.x + 2 + start as u16,
+                        area.y + 1 + (link.line - scroll) as u16,
+                        (end - start) as u16,
+                        1,
+                    ),
+                    Style {
+                        fg: color,
+                        ..Style::default().add_modifier(modifiers)
+                    },
+                );
+            }
+        }
+    }
+}
+
+/// Keep one title row per ancestor, reserving a usable frame for the active document.
+/// When the terminal is too short, show only the nearest ancestors.
+fn document_stack_layout(
+    bounds: ratatui::layout::Rect,
+    ancestors: usize,
+) -> (usize, ratatui::layout::Rect) {
+    let visible = ancestors.min(usize::from(bounds.height.saturating_sub(3)));
+    let offset = visible as u16;
+    (
+        ancestors - visible,
+        ratatui::layout::Rect::new(
+            bounds.x,
+            bounds.y + offset,
+            bounds.width,
+            bounds.height - offset,
+        ),
+    )
+}
+
+fn render_document(
+    document: &crate::navigation::Document,
+    input: &str,
+    settings: &Settings<'_>,
+    resources: &dyn ResourceUrlHandler,
+    options: mdcat::RenderOptions,
+) -> Result<(
+    Text<'static>,
+    Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
+)> {
+    if let Some(diff) = document.diff.as_ref() {
+        return Ok(discover_file_links(
+            document,
+            diff.render(
+                usize::from(settings.terminal_size.columns),
+                settings.theme.is_dark,
+            ),
+            Vec::new(),
+        ));
+    }
+    if let Some(json) = document.json.as_ref() {
+        return Ok(discover_file_links(
+            document,
+            json.render(&document.source, settings.theme.is_dark),
+            Vec::new(),
+        ));
+    }
+    if let Some(language) = &document.language {
+        let events = vec![
+            MarkdownEvent::Start(Tag::CodeBlock(CodeBlockKind::Fenced(
+                language.clone().into(),
+            ))),
+            MarkdownEvent::Text(input.into()),
+            MarkdownEvent::End(TagEnd::CodeBlock),
+        ];
+        let (text, links) = pulldown_cmark_mdcat::ratatui::push_linked_text(
+            settings,
+            &document.environment,
+            resources,
+            events.into_iter(),
+        )?;
+        return Ok(discover_file_links(document, text, links));
+    }
+    let parse_options = markdown_options(options.smart_punctuation);
+    let toc = if options.toc {
+        mdcat::toc::build_toc_events(
+            &document.input,
+            parse_options,
+            Some(document.file_url()?.as_str()),
+        )
+    } else {
+        Vec::new()
+    };
+    let mut link_depth = 0usize;
+    let mut link_target = None;
+    let events = toc
+        .into_iter()
+        .chain(Parser::new_ext(input, parse_options))
+        .flat_map(|event| {
+            match &event {
+                MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
+                    link_depth += 1;
+                    link_target = Some(dest_url.to_string());
+                }
+                MarkdownEvent::End(TagEnd::Link) => {
+                    link_depth = link_depth.saturating_sub(1);
+                    link_target = None;
+                }
+                MarkdownEvent::Text(label) | MarkdownEvent::Code(label) if link_depth > 0 => {
+                    if let Some(short) = section_path_label(label, document).filter(|_| {
+                        link_target
+                            .as_deref()
+                            .is_some_and(|target| same_local_link(document, label, target))
+                    }) {
+                        return vec![match event {
+                            MarkdownEvent::Code(_) => MarkdownEvent::Code(short.into()),
+                            _ => MarkdownEvent::Text(short.into()),
+                        }];
+                    }
+                }
+                MarkdownEvent::Code(reference) if link_depth == 0 => {
+                    if let Some(target) = document
+                        .code_link(reference)
+                        .or_else(|| document.commit_link(reference))
+                    {
+                        return vec![
+                            MarkdownEvent::Start(Tag::Link {
+                                link_type: LinkType::Inline,
+                                dest_url: target.to_string().into(),
+                                title: "".into(),
+                                id: "".into(),
+                            }),
+                            MarkdownEvent::Code(
+                                section_path_label(reference, document)
+                                    .map(Into::into)
+                                    .unwrap_or_else(|| reference.clone()),
+                            ),
+                            MarkdownEvent::End(TagEnd::Link),
+                        ];
+                    }
+                }
+                _ => {}
+            }
+            vec![event]
+        })
+        .map(|event| resolve_fragment(event, document));
+    let (text, links) = if options.emoji {
+        pulldown_cmark_mdcat::ratatui::push_linked_text(
+            settings,
+            &document.environment,
+            resources,
+            substitute_emoji(events),
+        )?
+    } else {
+        pulldown_cmark_mdcat::ratatui::push_linked_text(
+            settings,
+            &document.environment,
+            resources,
+            events,
+        )?
+    };
+    Ok(discover_file_links(document, text, links))
+}
+
+fn discover_file_links(
+    document: &crate::navigation::Document,
+    text: Text<'static>,
+    mut links: Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
+) -> (
+    Text<'static>,
+    Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
+) {
+    for (line_number, line) in text.lines.iter().enumerate() {
+        let content = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        for (range, mut url) in document
+            .file_references(&content)
+            .into_iter()
+            .chain(document.commits.references(&content))
+        {
+            // Match the terminal renderer's local file URL form.
+            if url.scheme() == "file" {
+                url.set_host(Some(&document.environment.hostname))
+                    .expect("local hostname is valid");
+            }
+            let start = Line::raw(&content[..range.start]).width();
+            let end = Line::raw(&content[..range.end]).width();
+            // Explicit Markdown links retain their destination, even when their label is a path.
+            if !links
+                .iter()
+                .any(|link| link.line == line_number && link.start < end && link.end > start)
+            {
+                links.push(pulldown_cmark_mdcat::ratatui::LinkRegion {
+                    line: line_number,
+                    start,
+                    end,
+                    target: url.to_string(),
+                });
+            }
+        }
+    }
+    links.sort_by_key(|link| (link.line, link.start));
+    (text, links)
+}
+
+fn anchor_line(
+    document: &crate::navigation::Document,
+    anchor: &str,
+    settings: &Settings<'_>,
+    resources: &dyn ResourceUrlHandler,
+    options: mdcat::RenderOptions,
+) -> Result<Option<usize>> {
+    if document.language.is_some() {
+        if let Some(line) = crate::navigation::source_line(anchor) {
+            // Code blocks preserve one rendered row per source line. Determine the
+            // theme's leading border/spacing separately from its source contents.
+            let marker = "MDCAT_SOURCE_LINE_POSITION";
+            let (probe, _) = render_document(
+                document,
+                &format!("{marker}\n"),
+                settings,
+                resources,
+                options,
+            )?;
+            let offset = probe
+                .lines
+                .iter()
+                .position(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                        .contains(marker)
+                })
+                .unwrap_or(0);
+            let line = line.min(document.source.lines().count().max(1));
+            return Ok(Some(offset + line - 1));
+        }
+    }
+    let anchor = percent_encoding::percent_decode_str(anchor).decode_utf8_lossy();
+    let Some(offset) = mdcat::toc::heading_offset(
+        &document.input,
+        markdown_options(options.smart_punctuation),
+        &anchor,
+    ) else {
+        return Ok(None);
+    };
+    let (prefix, _) = render_document(
+        document,
+        &document.input[..offset],
+        settings,
+        resources,
+        options,
+    )?;
+    Ok(Some(
+        prefix
+            .lines
+            .iter()
+            .rposition(|line| line.width() > 0)
+            .map_or(0, |line| line + 2),
+    ))
+}
+
+fn resolve_fragment<'a>(
+    event: pulldown_cmark::Event<'a>,
+    document: &crate::navigation::Document,
+) -> pulldown_cmark::Event<'a> {
+    match event {
+        pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) if dest_url.starts_with('#')
+            || crate::navigation::split_line_reference(&dest_url).is_some() =>
+        {
+            let target = if let Some(url) = document.line_link(&dest_url) {
+                url.to_string()
+            } else {
+                document
+                    .file_url()
+                    .and_then(|url| Ok(url.join(&dest_url)?))
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|_| dest_url.to_string())
+            };
+            pulldown_cmark::Event::Start(pulldown_cmark::Tag::Link {
+                link_type,
+                dest_url: target.into(),
+                title,
+                id,
+            })
+        }
+        other => other,
+    }
+}
+
+fn available_links(
+    document: &crate::navigation::Document,
+    options: mdcat::RenderOptions,
+) -> Vec<String> {
+    let mut links = available_file_links(document, options);
+    for (_, url) in document.commits.references(&document.source) {
+        let target = url.to_string();
+        if !links.contains(&target) {
+            links.push(target);
+        }
+    }
+    links
+}
+
+fn available_file_links(
+    document: &crate::navigation::Document,
+    options: mdcat::RenderOptions,
+) -> Vec<String> {
+    if let Some(json) = &document.json {
+        let mut targets = Vec::new();
+        for string in json.strings(&document.source) {
+            let urls = if let Some(url) = document.code_link(&string) {
+                vec![url]
+            } else {
+                document
+                    .file_references(&string)
+                    .into_iter()
+                    .map(|(_, url)| url)
+                    .collect()
+            };
+            for url in urls {
+                let target = url.to_string();
+                if !targets.contains(&target) {
+                    targets.push(target);
+                }
+            }
+        }
+        return targets;
+    }
+    if document.language.is_some() {
+        let mut targets = Vec::new();
+        for (_, url) in document.file_references(&document.input) {
+            let target = url.to_string();
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        return targets;
+    }
+    let parse_options = markdown_options(options.smart_punctuation);
+    let file_url = document.file_url().ok();
+    let toc = if options.toc {
+        mdcat::toc::build_toc_events(
+            &document.input,
+            parse_options,
+            file_url.as_ref().map(url::Url::as_str),
+        )
+    } else {
+        Vec::new()
+    };
+    let mut targets = Vec::new();
+    let mut depth = 0usize;
+    for event in toc
+        .into_iter()
+        .chain(Parser::new_ext(&document.input, parse_options))
+        .map(|event| resolve_fragment(event, document))
+    {
+        let url = match event {
+            MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
+                depth += 1;
+                url::Url::parse(&dest_url)
+                    .or_else(|_| document.environment.base_url.join(&dest_url))
+                    .ok()
+            }
+            MarkdownEvent::End(TagEnd::Link) => {
+                depth = depth.saturating_sub(1);
+                None
+            }
+            MarkdownEvent::Code(reference) if depth == 0 => {
+                if let Some(url) = document.code_link(&reference) {
+                    Some(url)
+                } else {
+                    for (_, url) in document.file_references(&reference) {
+                        let target = url.to_string();
+                        if !targets.contains(&target) {
+                            targets.push(target);
+                        }
+                    }
+                    None
+                }
+            }
+            MarkdownEvent::Text(text) if depth == 0 => {
+                for (_, url) in document.file_references(&text) {
+                    let target = url.to_string();
+                    if !targets.contains(&target) {
+                        targets.push(target);
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(url) = url {
+            let target = url.to_string();
+            if document.can_open(&target) && !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+#[cfg(test)]
+fn link_targets(
+    links: &[pulldown_cmark_mdcat::ratatui::LinkRegion],
+    document: &crate::navigation::Document,
+) -> Vec<String> {
+    let mut targets = Vec::new();
+    for link in links {
+        if document.can_open(&link.target) && !targets.contains(&link.target) {
+            targets.push(link.target.clone());
+        }
+    }
+    targets
 }
 
 fn centered(area: ratatui::layout::Rect, width: u16, height: u16) -> ratatui::layout::Rect {
@@ -382,22 +1712,29 @@ fn scrollbar_position(row: u16, area: ratatui::layout::Rect, max_scroll: usize) 
     offset.saturating_mul(max_scroll) / height.saturating_sub(1).max(1)
 }
 
-fn document_block(filename: &str, current: usize, total: usize, no_colour: bool) -> Block<'static> {
-    let filename = std::path::Path::new(filename)
-        .file_name()
-        .unwrap_or_else(|| std::ffi::OsStr::new(filename))
-        .to_string_lossy();
+fn document_block(
+    title: &str,
+    current: usize,
+    total: usize,
+    no_colour: bool,
+    active: bool,
+) -> Block<'static> {
     let style = if no_colour {
-        Style::default()
+        if active {
+            Style::default()
+        } else {
+            Style::default().add_modifier(ratatui::style::Modifier::DIM)
+        }
     } else {
-        Style::default().fg(Color::Rgb(180, 180, 180))
+        let brightness = if active { 180 } else { 90 };
+        Style::default().fg(Color::Rgb(brightness, brightness, brightness))
     };
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(style)
         .title_style(style)
         .padding(Padding::new(1, 1, 0, 0))
-        .title(format!(" {filename} "))
+        .title(format!(" {title} "))
         .title_bottom(Line::raw(format!(" {current} / {total} ──")).right_aligned())
 }
 
@@ -745,6 +2082,1002 @@ fn resize_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_click_destinations_match_all_nineteen_picker_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("README.md");
+        let mut source =
+            "| Dispatch | Baseline | Candidate | Diffs |\n|---|---|---|---|\n".to_owned();
+        for dispatch in ["adaptive-qef", "sparse-bricks", "spiral-524288"] {
+            source.push_str(&format!("| {dispatch} | [emitted]({dispatch}/baseline/emitted.glsl), [optimized]({dispatch}/baseline/optimized.glsl) | [emitted]({dispatch}/candidate/emitted.glsl), [optimized]({dispatch}/candidate/optimized.glsl) | [emitted]({dispatch}/emitted.diff), [optimized]({dispatch}/optimized.diff) |\n"));
+        }
+        source.push_str("\n[receipt.json](receipt.json)\n");
+        std::fs::write(&path, source).unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: pulldown_cmark_mdcat::TerminalSize {
+                columns: 148,
+                ..Default::default()
+            },
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let (_, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(links.len(), 19);
+        let clicked = links
+            .iter()
+            .map(|link| document.destination(&link.target).unwrap())
+            .collect::<Vec<_>>();
+        let picked = available_links(&document, Default::default())
+            .iter()
+            .map(|target| document.destination(target).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(clicked, picked);
+    }
+
+    #[test]
+    fn structured_json_keeps_links_in_folded_sections_and_line_links_use_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let code = dir.path().join("example.py");
+        std::fs::write(&code, "print(42)\n").unwrap();
+        let path = dir.path().join("data.json");
+        let source = "{\n  \"nested\": {\n    \"file\": \"example.py\"\n  }\n}\n";
+        std::fs::write(&path, source).unwrap();
+        let mut document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+        let (_, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(links.len(), 1);
+        document.json.as_mut().unwrap().fold_all(true);
+        let (_, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(links.is_empty());
+        assert_eq!(available_links(&document, Default::default()).len(), 1);
+        // String extraction also works when the entire JSON document is one token.
+        let minified = r#"{"nested":{"file":"example.py"}}"#;
+        let view = crate::json_view::JsonView::parse(minified).unwrap();
+        assert!(view.strings(minified).contains(&"example.py".to_owned()));
+        document.show_source(Default::default());
+        assert!(document.json.is_none());
+        let row = anchor_line(&document, "L3", &settings, &resources, Default::default())
+            .unwrap()
+            .unwrap();
+        let (text, _) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        let content = text.lines[row]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(content.contains("\"file\": \"example.py\""));
+    }
+
+    #[test]
+    fn grouped_picker_skips_headers_and_keeps_mouse_and_keyboard_targets_correct() {
+        use ratatui::{backend::TestBackend, layout::Rect, style::Modifier, Terminal};
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.md");
+        std::fs::write(&report, "report").unwrap();
+        let document = crate::navigation::Document::load(report, Default::default()).unwrap();
+        let targets = [
+            "group/one.glsl:172",
+            "other.txt",
+            "group/two.glsl",
+            "group/three.glsl",
+        ]
+        .iter()
+        .map(|path| {
+            document
+                .line_link(path)
+                .unwrap_or_else(|| document.environment.base_url.join(path).unwrap())
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+        let mut picker = LinkPicker::new(targets.clone(), &document, None);
+        assert_eq!(picker.rows[0].label, "./group/");
+        assert!(picker.rows[0].target.is_none());
+        assert_eq!(picker.selected_target(), Some(targets[0].clone()));
+        picker.move_by(1);
+        assert_eq!(picker.selected_target(), Some(targets[2].clone()));
+        picker.move_by(-1);
+        assert_eq!(picker.selected_target(), Some(targets[0].clone()));
+        picker.select_edge(true);
+        assert_eq!(picker.selected_target(), Some(targets[1].clone()));
+        picker.select_edge(false);
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        terminal
+            .draw(|frame| picker.draw(frame, Rect::new(0, 0, 80, 18), true, (28, 28, 28)))
+            .unwrap();
+        assert!(picker
+            .item_at(picker.area.x + 3, picker.area.y + 1)
+            .is_none());
+        let row = picker
+            .item_at(picker.area.x + 3, picker.area.y + 3)
+            .unwrap();
+        picker.state.select(Some(row));
+        assert_eq!(picker.selected_target(), Some(targets[2].clone()));
+        assert!(
+            terminal.backend().buffer()[(picker.area.x + 3, picker.area.y + 1)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+
+    #[test]
+    fn source_line_links_jump_to_the_exact_rendered_source_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.md");
+        std::fs::write(&report, "`emitted.glsl:172` [Jump](emitted.glsl:172)\n").unwrap();
+        let path = dir.path().join("emitted.glsl");
+        let source = (1..=200)
+            .map(|line| format!("// SOURCE_{line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, source).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+        let document = crate::navigation::Document::load(report, Default::default()).unwrap();
+        let (_, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links
+            .iter()
+            .all(|link| link.target.ends_with("emitted.glsl#L172")));
+        let targets = available_links(&document, Default::default());
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].ends_with("emitted.glsl#L172"));
+        let code = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let (text, _) = render_document(
+            &code,
+            &code.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        for requested in [1, 172, 200, 999] {
+            let row = anchor_line(
+                &code,
+                &format!("L{requested}"),
+                &settings,
+                &resources,
+                Default::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let content = text.lines[row]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(content.trim(), format!("// SOURCE_{}", requested.min(200)));
+        }
+    }
+
+    #[test]
+    fn markdown_line_links_preserve_frontmatter_and_show_literal_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        let source = "---\nkey: value\n---\n# Heading\n";
+        std::fs::write(&path, source).unwrap();
+        let mut document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        document.show_source(Default::default());
+        assert_eq!(document.input, source);
+        assert_eq!(document.language.as_deref(), Some("md"));
+    }
+
+    #[test]
+    fn shader_files_are_discovered_and_render_with_syntax_colors() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.md");
+        std::fs::write(&report, "`shader.glsl` `shader.metal`").unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let themes = two_face::theme::extra();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: Some(
+                themes
+                    .get(two_face::theme::EmbeddedThemeName::Dracula)
+                    .clone(),
+            ),
+        };
+        for (extension, source) in [
+            ("glsl", "#version 450\nvoid main() { vec4 value = vec4(1.0); }\n"),
+            ("metal", "#include <metal_stdlib>\nusing namespace metal;\nkernel void compute(device float *out [[buffer(0)]]) { out[0] = 1.0; }\n"),
+        ] {
+            let path = dir.path().join(format!("shader.{extension}"));
+            std::fs::write(&path, source).unwrap();
+            let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+            assert!(syntax.find_syntax_by_token(document.language.as_deref().unwrap()).is_some(), "{extension}");
+            let (text, _) = render_document(&document, &document.input, &settings, &pulldown_cmark_mdcat::resources::NoopResourceHandler, Default::default()).unwrap();
+            let colors = text.lines.iter().flat_map(|line| &line.spans).filter_map(|span| span.style.fg).collect::<std::collections::HashSet<_>>();
+            assert!(colors.len() > 1, "{extension}");
+        }
+        let document = crate::navigation::Document::load(report, Default::default()).unwrap();
+        assert_eq!(available_links(&document, Default::default()).len(), 2);
+    }
+
+    #[test]
+    fn command_paths_in_fenced_inline_and_plain_text_are_clickable_and_listed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scratch/ada")).unwrap();
+        std::fs::write(dir.path().join("scratch/ada/measure.py"), "print(42)").unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "```sh\npython3 -B scratch/ada/measure.py\n```\n\n`python3 -B scratch/ada/measure.py`\n\npython3 -B scratch/ada/measure.py\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let (text, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(links.len(), 3);
+        for link in &links {
+            let line = text.lines[link.line]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert_eq!(&line[link.start..link.end], "scratch/ada/measure.py");
+        }
+        let targets = available_links(&document, Default::default());
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].ends_with("/scratch/ada/measure.py"));
+    }
+
+    #[test]
+    fn gruvbox_browse_distinguishes_inline_code_from_linked_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(dir.path().join("file.py"), "print(42)\n").unwrap();
+        std::fs::write(&path, "`plain_code` [`linked_code`](file.py) `file.py`\n\n| Code | Link |\n| --- | --- |\n| `table_code` | [`table_link`](file.py) |\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: pulldown_cmark_mdcat::Theme::gruvbox_browse(),
+            syntax_theme: None,
+        };
+        let (text, _) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+        )
+        .unwrap();
+        for (label, expected) in [
+            ("plain_code", Color::Rgb(250, 189, 47)),
+            ("table_code", Color::Rgb(250, 189, 47)),
+            ("linked_code", Color::Rgb(145, 172, 238)),
+            ("table_link", Color::Rgb(145, 172, 238)),
+            ("file.py", Color::Rgb(145, 172, 238)),
+        ] {
+            let span = text
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains(label))
+                .unwrap();
+            assert_eq!(span.style.fg, Some(expected), "{label}");
+        }
+    }
+
+    #[test]
+    fn commit_links_render_in_markdown_and_open_as_nested_highlighted_diffs() {
+        let (dir, id) = crate::git_links::tests::repository();
+        let path = dir.path().join("report.md");
+        std::fs::write(
+            &path,
+            format!(
+                "Commit `{}`\n\nPlain {id}\n\n```text\n{id}\n```\n",
+                &id[..7]
+            ),
+        )
+        .unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: pulldown_cmark_mdcat::Theme::gruvbox_browse(),
+            syntax_theme: None,
+        };
+        let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+        let (_, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(links.len(), 3);
+        assert!(links
+            .iter()
+            .all(|link| crate::git_links::commit_id(&link.target) == Some(id.as_str())));
+        let targets = available_links(&document, Default::default());
+        assert_eq!(targets.len(), 1);
+        assert!(document.can_open(&targets[0]));
+        assert!(same_local_link(&document, &links[0].target, &targets[0]));
+        let mut picker = LinkPicker::new(targets.clone(), &document, None);
+        assert!(picker.document_line(&links, &document, 0).is_some());
+        let mut commit = document.open_commit(&targets[0]).unwrap();
+        commit.diff.as_mut().unwrap().fold_all(false);
+        assert_eq!(commit.language.as_deref(), Some("diff"));
+        assert_eq!(
+            commit.path.file_name().unwrap().to_string_lossy(),
+            format!("commit {}", &id[..12])
+        );
+        assert!(commit
+            .title
+            .as_deref()
+            .unwrap()
+            .starts_with(&format!("commit {} by Viewer Test - ", &id[..12])));
+        assert!(!commit.title.as_deref().unwrap().contains("@"));
+        assert_eq!(commit.commits.root.as_deref(), Some(dir.path()));
+        assert!(commit.source.contains("Change example"));
+        let (text, _) = render_document(
+            &commit,
+            &commit.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        assert_eq!(text.lines.first().unwrap().width(), 0);
+        assert!(!text.lines.iter().any(|line| {
+            let text = line.to_string();
+            text.contains(&format!("commit {id}"))
+                || text.starts_with("Author:")
+                || text.starts_with("Date:")
+        }));
+        let colors = text
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(colors.len() > 1);
+    }
+
+    #[test]
+    fn same_document_links_stay_local_and_hover_paths_are_relative_to_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "# Review\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        for target in ["#review", "report.md#review", "./report.md#review"] {
+            assert!(is_current_document_link(&document, target));
+        }
+        assert!(!is_current_document_link(&document, "other.md#review"));
+        assert!(!is_current_document_link(
+            &document,
+            "https://example.com/report.md#review"
+        ));
+        assert_eq!(
+            hover_path(&document, "report.md#review", dir.path()).unwrap(),
+            " ./report.md#review "
+        );
+        assert_eq!(
+            hover_path(&document, "report.md#L12", &dir.path().join("nested")).unwrap(),
+            " ../report.md:12 "
+        );
+    }
+
+    #[test]
+    fn section_path_labels_hide_fragments_without_changing_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(
+            dir.path().join("plan.md"),
+            "# Review\n\nTarget paragraph.\n",
+        )
+        .unwrap();
+        std::fs::write(&path, "[plan.md#review](plan.md#review)\n\n`plan.md#review`\n\n[Read the review](plan.md#review)\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+        let (text, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        let content = text
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!content.contains("#review"));
+        assert!(content.contains("plan.md"));
+        assert!(content.contains("Read the review"));
+        assert_eq!(links.len(), 3);
+        assert!(links
+            .iter()
+            .all(|link| link.target.ends_with("plan.md#review")));
+        let targets = available_links(&document, Default::default());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(document.link_label(&targets[0]).unwrap(), "./plan.md");
+        let linked = crate::navigation::Document::load(
+            document.destination(&targets[0]).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(
+            anchor_line(&linked, "review", &settings, &resources, Default::default())
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(section_path_label("plan.md#L12", &document), None);
+    }
+
+    #[test]
+    fn picker_includes_table_links_and_deduplicates_repeated_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(
+            &path,
+            "[First](code.cpp)\n\n| File |\n| --- |\n| [Header](code.h) |\n| [Again](code.cpp) |\n",
+        )
+        .unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let targets = available_links(&document, Default::default());
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].ends_with("code.cpp"));
+        assert!(targets[1].ends_with("code.h"));
+    }
+
+    #[test]
+    fn linked_source_files_render_as_highlighted_code_not_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("example.py");
+        std::fs::write(&source_path, "# literal comment\nprint(42)\n").unwrap();
+        let report = dir.path().join("report.md");
+        std::fs::write(&report, "`example.py` [JSON](data.json)").unwrap();
+        let document = crate::navigation::Document::load(report, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let themes = two_face::theme::extra();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: Some(
+                themes
+                    .get(two_face::theme::EmbeddedThemeName::Dracula)
+                    .clone(),
+            ),
+        };
+        let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+        let (_, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        let targets = link_targets(&links, &document);
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].ends_with("example.py"));
+        assert!(targets[1].ends_with("data.json"));
+        let code = crate::navigation::Document::load(source_path, Default::default()).unwrap();
+        let (text, links) = render_document(
+            &code,
+            &code.input,
+            &settings,
+            &resources,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(links.is_empty());
+        let content = text
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(content.contains("# literal comment"));
+        assert!(content.contains("print(42)"));
+        let colors = text
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .filter_map(|span| span.style.fg)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(colors.len() > 1);
+    }
+
+    #[test]
+    fn link_picker_lists_destinations_and_scrolls_selection_into_view() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "report").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let targets = (0..20)
+            .map(|index| {
+                document
+                    .environment
+                    .base_url
+                    .join(&format!("child-{index}.md#heading"))
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        let mut picker = LinkPicker::new(targets.clone(), &document, None);
+        assert_eq!(picker.rows[0].label, "./child-0.md");
+        assert_eq!(picker.selected_target(), Some(targets[0].clone()));
+        picker.move_by(-1);
+        assert_eq!(picker.selected_target(), Some(targets[19].clone()));
+        let mut terminal = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        terminal
+            .draw(|frame| picker.draw(frame, Rect::new(0, 0, 70, 12), true, (28, 28, 28)))
+            .unwrap();
+        assert!(picker.area.width <= 42);
+        assert!(picker.area.height <= 7);
+        assert!(picker.state.offset() > 0);
+        assert_eq!(
+            terminal.backend().buffer()[(picker.area.right() - 2, picker.area.bottom() - 2)]
+                .symbol(),
+            "┃"
+        );
+        let index = picker
+            .item_at(picker.area.x + 2, picker.area.y + 1)
+            .unwrap();
+        assert_eq!(index, picker.state.offset());
+        assert!(picker.item_at(picker.area.x, picker.area.y).is_none());
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("Links (20)"));
+        assert!(!text.contains("Enter open"));
+        picker.opened = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(!picker.expired());
+        assert!(text.contains("child-19.md"));
+        assert!(!text.contains("#heading"));
+        picker.move_by(1);
+        assert_eq!(picker.selected_target(), Some(targets[0].clone()));
+    }
+
+    #[test]
+    fn picker_preview_uses_neighboring_links_to_locate_repeated_destinations() {
+        use pulldown_cmark_mdcat::ratatui::LinkRegion;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "report").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let targets = ["a.md", "b.md#L12", "c.md", "hidden.md"].map(|name| {
+            document
+                .environment
+                .base_url
+                .join(name)
+                .unwrap()
+                .to_string()
+        });
+        let links = [(0, 10), (1, 2), (1, 12), (1, 80), (2, 14)].map(|(index, line)| {
+            let mut url = url::Url::parse(&targets[index]).unwrap();
+            url.set_host(Some(&document.environment.hostname)).unwrap();
+            LinkRegion {
+                line,
+                start: 0,
+                end: 4,
+                target: url.to_string(),
+            }
+        });
+        let mut picker = LinkPicker::new(targets.to_vec(), &document, None);
+        picker.move_by(1);
+        // Even when the viewport is nearer the early duplicate, surrounding links
+        // identify the occurrence in the main group of references.
+        assert_eq!(picker.document_line(&links, &document, 0), Some(12));
+        picker.move_by(1);
+        assert_eq!(picker.document_line(&links, &document, 0), Some(14));
+        picker.move_by(-1);
+        assert_eq!(picker.document_line(&links, &document, 0), Some(12));
+        picker.select_edge(true);
+        // A link hidden inside a folded JSON object has no rendered location.
+        assert_eq!(picker.document_line(&links, &document, 0), None);
+        picker.select_edge(false);
+        assert_eq!(picker.document_line(&links, &document, 0), Some(10));
+    }
+
+    #[test]
+    fn empty_link_picker_remains_safe_in_small_terminals() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "report").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::new(Vec::new(), &document, None);
+        picker.move_by(1);
+        picker.move_by(-1);
+        assert!(picker.selected_target().is_none());
+        for (width, height) in [(70, 12), (8, 3), (1, 1)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    picker.draw(frame, Rect::new(0, 0, width, height), true, (28, 28, 28))
+                })
+                .unwrap();
+            assert!(picker.area.width <= width && picker.area.height <= height);
+            assert!(picker.item_at(0, 0).is_none());
+        }
+    }
+
+    #[test]
+    fn empty_link_notice_is_compact_and_fades_before_expiring() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "report").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::new(Vec::new(), &document, None);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let bounds = Rect::new(0, 0, 80, 20);
+        terminal
+            .draw(|frame| picker.draw(frame, bounds, false, (28, 28, 28)))
+            .unwrap();
+        assert_eq!(picker.area.width, 41);
+        assert_eq!(picker.area.height, 3);
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("│ No local file links in this document. │"));
+        assert!(!text.contains("Links (0)"));
+        assert!(!picker.expired());
+        let initial_border = terminal.backend().buffer()[(picker.area.x, picker.area.y)].fg;
+        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(425);
+        terminal
+            .draw(|frame| picker.draw(frame, bounds, false, (28, 28, 28)))
+            .unwrap();
+        let faded_border = terminal.backend().buffer()[(picker.area.x, picker.area.y)].fg;
+        assert!(
+            matches!((initial_border, faded_border), (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) if r2 < r1 && g2 < g1 && b2 < b1)
+        );
+        assert!(!picker.expired());
+        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(850);
+        assert!(picker.expired());
+    }
+
+    #[test]
+    fn duplicate_titles_use_shared_directory_context_and_shorten_when_closed() {
+        use std::path::Path;
+        let titles =
+            |paths: &[&str]| document_titles(&paths.iter().map(Path::new).collect::<Vec<_>>());
+        assert_eq!(
+            titles(&[
+                "/repo/report.md",
+                "/repo/different/report.md",
+                "/repo/notes.md"
+            ]),
+            ["./report.md", "./different/report.md", "notes.md"]
+        );
+        assert_eq!(
+            titles(&[
+                "/repo/scratch/ada/run/report.md",
+                "/repo/scratch/grace/run/report.md"
+            ]),
+            ["./ada/run/report.md", "./grace/run/report.md"]
+        );
+        assert_eq!(titles(&["/repo/report.md"]), ["report.md"]);
+        assert_eq!(
+            titles(&["/repo/report.md", "/repo/report.md"]),
+            ["./report.md [1]", "./report.md [2]"]
+        );
+    }
+
+    #[test]
+    fn inactive_parent_border_and_title_are_darker_than_the_active_window() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    document_block("./report.md", 1, 1, false, false),
+                    Rect::new(0, 0, 60, 12),
+                );
+                let area = Rect::new(0, 1, 60, 11);
+                frame.render_widget(Clear, area);
+                frame.render_widget(
+                    document_block("./different/report.md", 1, 1, false, true),
+                    area,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for x in [0, 3, 50] {
+            assert_eq!(buffer[(x, 0)].fg, Color::Rgb(90, 90, 90));
+            assert_eq!(buffer[(x, 1)].fg, Color::Rgb(180, 180, 180));
+        }
+    }
+
+    #[test]
+    fn hover_uses_nested_scrolled_coordinates_and_clears_without_losing_selection() {
+        use ratatui::{backend::TestBackend, layout::Rect, style::Modifier, Terminal};
+        let area = Rect::new(0, 2, 40, 8);
+        let links = vec![pulldown_cmark_mdcat::ratatui::LinkRegion {
+            line: 8,
+            start: 2,
+            end: 6,
+            target: "file:///tmp/report.md".into(),
+        }];
+        assert!(link_at(&links, area, 8, 4, 3).is_some());
+        for (x, y) in [(4, 2), (4, 9), (0, 3), (8, 3)] {
+            assert!(link_at(&links, area, 8, x, y).is_none());
+        }
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        for hovered in [Some(links[0].target.as_str()), None] {
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new("  link").block(document_block(
+                            "report.md",
+                            1,
+                            1,
+                            true,
+                            true,
+                        )),
+                        area,
+                    );
+                    draw_link_highlights(
+                        frame,
+                        &links,
+                        area,
+                        8,
+                        Some(&links[0].target),
+                        hovered,
+                        None,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer[(4, 3)].modifier.contains(Modifier::UNDERLINED),
+                hovered.is_some()
+            );
+            assert!(buffer[(4, 3)].modifier.contains(Modifier::REVERSED));
+            assert!(!buffer[(3, 3)].modifier.contains(Modifier::UNDERLINED));
+        }
+    }
+
+    #[test]
+    fn nested_document_frames_leave_title_rows_and_fit_small_terminals() {
+        use ratatui::layout::Rect;
+        let bounds = Rect::new(0, 0, 80, 24);
+        assert_eq!(document_stack_layout(bounds, 0), (0, bounds));
+        assert_eq!(
+            document_stack_layout(bounds, 2),
+            (0, Rect::new(0, 2, 80, 22))
+        );
+        assert_eq!(
+            document_stack_layout(Rect::new(3, 4, 80, 5), 10),
+            (8, Rect::new(3, 6, 80, 3))
+        );
+        for height in 0..4 {
+            let bounds = Rect::new(0, 0, 80, height);
+            let (_, area) = document_stack_layout(bounds, 100_000);
+            assert!(area.y >= bounds.y && area.bottom() <= bounds.bottom());
+            assert!(area.height >= height.min(3));
+        }
+    }
+
+    #[test]
+    fn stacked_document_headers_remain_visible_above_active_content() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let bounds = Rect::new(0, 0, 60, 12);
+        terminal
+            .draw(|frame| {
+                for (index, name) in ["report.md", "linked.md", "one_more_level.md"]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let (_, area) = document_stack_layout(bounds, index);
+                    frame.render_widget(Clear, area);
+                    frame.render_widget(
+                        Paragraph::new("ACTIVE_BODY").block(document_block(name, 1, 1, true, true)),
+                        area,
+                    );
+                }
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).contains("report.md"));
+        assert!(row(1).contains("linked.md"));
+        assert!(row(2).contains("one_more_level.md"));
+        assert!(row(3).contains("ACTIVE_BODY"));
+    }
+
+    #[test]
+    fn inline_code_paths_become_selectable_without_overriding_explicit_links() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scratch/ada")).unwrap();
+        std::fs::create_dir_all(dir.path().join("scratch/grace")).unwrap();
+        let path = dir.path().join("scratch/ada/report.md");
+        std::fs::write(&path, "Report: `scratch/grace/report.md`.\n\n[Explicit `scratch/grace/report.md`](elsewhere.md)\n\n```\nscratch/grace/report.md\n```\n").unwrap();
+        std::fs::write(dir.path().join("scratch/grace/report.md"), "# Grace").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let (_, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+        )
+        .unwrap();
+        let targets = link_targets(&links, &document);
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].ends_with("/scratch/grace/report.md"));
+        assert!(targets[1].ends_with("/scratch/ada/elsewhere.md"));
+        assert_eq!(
+            links
+                .iter()
+                .filter(|link| link.target.ends_with("/scratch/grace/report.md"))
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn heading_navigation_matches_rendered_rows_with_links_and_toc() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.md");
+        std::fs::write(&path, "# Start\n\nA [long linked paragraph with many words](other.md).\n\n## Héllo\n\nBody.\n\n## Héllo\n\nLast.\n").unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: pulldown_cmark_mdcat::TerminalSize {
+                columns: 25,
+                ..Default::default()
+            },
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        for toc in [false, true] {
+            let options = mdcat::RenderOptions {
+                toc,
+                ..Default::default()
+            };
+            let document = crate::navigation::Document::load(path.clone(), options).unwrap();
+            let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+            let (text, _) =
+                render_document(&document, &document.input, &settings, &resources, options)
+                    .unwrap();
+            for (anchor, occurrence) in [("h%C3%A9llo", 0), ("héllo-1", 1)] {
+                let row = anchor_line(&document, anchor, &settings, &resources, options)
+                    .unwrap()
+                    .unwrap();
+                let actual = text
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        let content = line
+                            .spans
+                            .iter()
+                            .map(|span| span.content.as_ref())
+                            .collect::<String>();
+                        content.contains("Héllo")
+                            && !content.contains("1.")
+                            && !content.contains("2.")
+                    })
+                    .nth(occurrence)
+                    .unwrap()
+                    .0;
+                assert_eq!(
+                    row, actual,
+                    "anchor={anchor}, toc={toc}, lines={:?}",
+                    text.lines
+                );
+            }
+            assert!(
+                anchor_line(&document, "missing", &settings, &resources, options)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn width_expands_in_two_timed_phases() {

@@ -473,6 +473,15 @@ impl Theme {
         }
     }
 
+    /// Gruvbox Dark with distinct colors for links and inline code.
+    pub fn gruvbox_browse() -> Self {
+        Self {
+            link_style: Style::new().fg_color(Some(rgb(145, 172, 238))),
+            code_style: Style::new().fg_color(Some(rgb(250, 189, 47))),
+            ..Self::gruvbox_dark()
+        }
+    }
+
     /// Gruvbox Light.
     pub fn gruvbox_light() -> Self {
         let (h1_prefix_style, h1_text_style) = h1(rgb(181, 118, 20), rgb(251, 241, 199));

@@ -16,12 +16,14 @@ rust-version.workspace = true
 [dependencies]
 anstyle = { version = "1.0.7", default-features = false }
 anyhow = { version = "1.0.89", default-features = false, features = ["std"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.5.17", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "env"] }
 clap_complete = "4.5.28"
 curl = "0.4.47"
 ignore = "0.4.31"
 mime = { workspace = true}
 notify = "8.2.0"
+percent-encoding = "2.3"
 pulldown-cmark = { workspace = true, features = ['simd'] }
 pulldown-cmark-mdcat = { workspace = true, default-features = true, features = ["ratatui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }

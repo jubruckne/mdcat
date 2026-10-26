@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 use anstyle::Style;
 use pulldown_cmark::{Alignment, CowStr, LinkType};
+use url::Url;
 
 /// A pending link.
 #[derive(Debug, PartialEq)]
@@ -52,6 +53,9 @@ impl CurrentLine {
     }
 }
 
+/// A styled table fragment with its optional hyperlink destination.
+pub(super) type TableFragment<'a> = (Style, CowStr<'a>, Option<Url>);
+
 /// A cell in the table.
 ///
 /// A cell consists of one or more explicit lines, split apart by `<br>`
@@ -60,7 +64,7 @@ impl CurrentLine {
 #[derive(Debug)]
 pub struct TableCell<'a> {
     /// Explicit lines of the cell, as introduced by `<br>`.
-    pub(super) lines: Vec<Vec<(Style, CowStr<'a>)>>,
+    pub(super) lines: Vec<Vec<TableFragment<'a>>>,
 }
 
 impl TableCell<'_> {
@@ -78,7 +82,7 @@ impl TableCell<'_> {
             .iter()
             .map(|line| {
                 line.iter()
-                    .map(|(_, t)| textwrap::core::display_width(t.as_ref()))
+                    .map(|(_, t, _)| textwrap::core::display_width(t.as_ref()))
                     .sum()
             })
             .max()
@@ -126,6 +130,10 @@ pub struct CurrentTable<'a> {
     pub(super) strikethrough_depth: u32,
     /// Override style for link/image/code spans; replaces the normal text style.
     pub(super) span_style: Option<Style>,
+    /// Link destination active in the current span.
+    pub(super) span_link: Option<Url>,
+    /// Parent spans, including links surrounding images.
+    pub(super) span_stack: Vec<(Option<Style>, Option<Url>)>,
 }
 
 impl<'a> CurrentTable<'a> {
@@ -141,6 +149,8 @@ impl<'a> CurrentTable<'a> {
             emphasis_depth: 0,
             strikethrough_depth: 0,
             span_style: None,
+            span_link: None,
+            span_stack: Vec::new(),
         }
     }
 
@@ -162,14 +172,16 @@ impl<'a> CurrentTable<'a> {
     /// Push a plain text fragment using the current inline markup state.
     pub(super) fn push_text(mut self, text: CowStr<'a>) -> Self {
         let style = self.effective_style(Style::new());
-        self.current_line_mut().push((style, text));
+        let link = self.span_link.clone();
+        self.current_line_mut().push((style, text, link));
         self
     }
 
     /// Push a text fragment with a specific base style (e.g. code or inline HTML).
     pub(super) fn push_styled_text(mut self, text: CowStr<'a>, base: Style) -> Self {
         let style = self.effective_style(base);
-        self.current_line_mut().push((style, text));
+        let link = self.span_link.clone();
+        self.current_line_mut().push((style, text, link));
         self
     }
 
@@ -179,7 +191,7 @@ impl<'a> CurrentTable<'a> {
         self
     }
 
-    fn current_line_mut(&mut self) -> &mut Vec<(Style, CowStr<'a>)> {
+    fn current_line_mut(&mut self) -> &mut Vec<TableFragment<'a>> {
         self.current_row
             .current_cell
             .lines
@@ -218,14 +230,19 @@ impl<'a> CurrentTable<'a> {
     }
 
     /// Enter a link or image span with a given style.
-    pub(super) fn enter_span(mut self, style: Style) -> Self {
+    pub(super) fn enter_span(mut self, style: Style, link: Option<Url>) -> Self {
+        self.span_stack
+            .push((self.span_style, self.span_link.clone()));
         self.span_style = Some(style);
+        self.span_link = self.span_link.or(link);
         self
     }
 
     /// Exit a link or image span.
     pub(super) fn exit_span(mut self) -> Self {
-        self.span_style = None;
+        let (style, link) = self.span_stack.pop().unwrap_or_default();
+        self.span_style = style;
+        self.span_link = link;
         self
     }
 

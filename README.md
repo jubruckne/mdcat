@@ -6,12 +6,69 @@ Fancy `cat` for Markdown (that is, [CommonMark][]):
 $ mdcat sample.md
 ```
 
-Use `mdcat --analyzer sample.md` for the built-in Ratatui/Crossterm viewer.
+Use `mdcat --browse sample.md` (also available as `--analyzer`) for the built-in Ratatui/Crossterm viewer.
 Scroll with the arrow keys or j/k, use Page Up/Down and Home/End to navigate,
-and press q to exit. Mouse-wheel scrolling and terminal resizing are supported.
+and press q to close the current document. Mouse-wheel scrolling and terminal resizing are supported.
 Images appear as text fallbacks in this mode.
 
+Click a local file link to open it in a fixed window above the current document.
+Internal section links jump within the current document.
+Press Tab to open a popup listing all local file destinations in the document.
+The popup uses at most 60% of the screen width and height.
+Select with arrow keys, j/k, or Tab/Shift+Tab, then press Enter; clicking an entry also
+opens it. Directory prefixes shared by at least three links appear once as bold
+tree headers; only file rows are selectable. Page Up/Down, Home/End, and the mouse
+wheel navigate longer lists; a scrollbar appears only when the list overflows.
+An empty list shows a compact notice that fades out over 850 ms; Escape/q dismisses it immediately.
+Keyboard selection scrolls the document to the link;
+repeated links use neighboring entries to choose the occurrence. The selected link
+is underlined in the document. Heading fragments are hidden in displayed Markdown
+paths while remaining part of the destination.
+Escape or q dismisses the picker without closing the document. Each nested window leaves
+its parent's title bar visible, with inactive borders and captions dimmed. Duplicate
+filenames include enough directory context to distinguish the open documents.
+Git commit hashes (7 or more hex characters) become clickable when they resolve
+unambiguously to a commit in the document's repository. Clicking one opens
+a side-by-side diff in a nested window. Its title shows the short commit hash,
+author name, and local date/time, including the year only when it differs from the current year.
+A blank line precedes the commit message. Old/new line numbers and red/green changes make replacements easy to compare. Click a file header
+to expand or collapse it; files start collapsed, with dividers between sections.
+Each file header shows its change count and a green/red additions/deletions bar.
+`n`/`p` selects files, Enter/Space toggles the selected file, and
+`c`/`e` collapses/expands all files. Git `.diff` and `.patch` files use this view too.
+Long lines wrap within each pane; very narrow terminals use a stacked diff. Commit links
+also appear in the Tab picker; Escape/q returns to the document.
+Hover over a local file link to underline it and show its full path relative to the
+working directory in the footer. Escape or q closes only the deepest document window;
+at the original document, it exits the viewer. Backspace or Left also returns to the
+parent document and its previous scroll position. Relative paths resolve against the current
+document; heading fragments and table-of-contents links are supported. Existing
+file paths written as inline code are navigable too, resolving first against
+the document directory and then the nearest Git repository root. Existing path
+arguments in command examples (including fenced code blocks) are clickable and
+appear in the link picker too. Opening one displays the file in a nested viewer.
+Attach `:172` (or `#L172`) to a path to jump to source line 172; this works with
+clicks and the link picker. Line links to Markdown files show their literal source.
+Line numbers beyond the file's end jump to its last line.
+Missing
+files and unsupported destinations show an error in the viewer. Local UTF-8 text files open here, including JSON, C/C++, headers, Python, GLSL, and Metal.
+Source files use syntax highlighting (C++ rules for Metal); plain text retains its literal content.
+Web links are not launched.
+Use an ordinary click, without Command, so Ghostty passes it to mdcat.
+The normal less pager keeps its existing behavior.
+
+JSON files use a structured view with distinct colors for keys, strings, numbers,
+and literals. Objects and arrays show compact `(count)` annotations. Select rows with Up/Down
+or j/k; Enter/Space or a click folds a container, Left collapses or selects its parent,
+and Right expands. `c` folds nested containers; `e` expands all. Page Up/Down and
+Home/End navigate the tree. File links still open in nested windows, and Tab lists
+links even inside folded sections. Backspace returns to the parent document.
+Field order, duplicate keys, and original value tokens are preserved. Invalid JSON
+falls back to syntax-highlighted text. Source-line links open the original source.
+
 Press `?` to open a prompt popup and ask about the document using Apple's on-device Foundation Models.
+Opening the prompt starts background prewarming of both the title and answer sessions,
+including their instructions and shared prompt prefixes. Submission reuses those sessions.
 Type a question and press Enter. A small floating window appears immediately with a spinner.
 When the model generates a title, it types into the caption character by character;
 the window expands from 5 to 64 columns over 100 ms once the title is ready.
@@ -52,8 +109,9 @@ Then it
 - renders [GFM alerts][gfm-alerts] (`[!NOTE]`, `[!TIP]`, `[!WARNING]`, etc.) with coloured borders and icons,
 - shows [links][osc8], and also images inline in supported terminals (see above, where "Rust" is a clickable link!),
 - adds jump marks for headings in [iTerm2] (jump forwards and backwards with <key>⇧⌘↓</key> and <key>⇧⌘↑</key>),
-- ships eight built-in colour themes (`catppuccin-mocha`, `catppuccin-latte`, `gruvbox-dark`, `gruvbox-light`,
+- ships nine built-in colour themes (`catppuccin-mocha`, `catppuccin-latte`, `gruvbox-dark`, `gruvbox-browse`, `gruvbox-light`,
   `dracula`, `nord`, `solarized-dark`, `solarized-light`) plus auto dark/light detection,
+  (`gruvbox-browse` separates periwinkle-blue links from yellow inline code),
   and lets you fully customise colours, heading markers, and GFM alert icons/labels via
   `~/.config/mdcat/config.toml` (see [config.toml.example](./config.toml.example)),
 - can render typographic punctuation (curly quotes, en/em dashes, an ellipsis) with `--smart-punctuation`,

@@ -112,16 +112,63 @@ In this case remote images render as hyperlinks.
 
 == Options
 
---analyzer::
+--analyzer, --browse::
     Open exactly one FILE in the built-in Ratatui/Crossterm Markdown viewer.
     Requires interactive standard input and output; stdin documents are not supported.
     Overrides configured pagination and cannot be combined with `--paginate`, `--no-pager`,
     or `--watch`. Images use text fallbacks. The viewer has its own border and status bar.
     Arrow keys or j/k scroll, Page Up/Page Down or b/Space move by a page,
-    Home/End or g/G jump to the start/end, and q, Escape, or Ctrl+C exit.
+    Home/End or g/G jump to the start/end. q or Escape closes the deepest document
+    window, or exits at the original document. Ctrl+C exits the viewer.
     Mouse-wheel scrolling and reflow on terminal resize are supported.
+    Click local file links without terminal modifier keys to open them in fixed nested
+    windows, keeping dimmed parent title bars visible above the active document.
+    Duplicate filenames include directory context in their titles. Hovering over a local
+    file link underlines it and shows its path relative to the working directory in
+    the footer. Internal section links navigate within the current document.
+    Tab opens a popup listing all local file destinations, capped at 60% of the
+    screen width and height. Arrow keys, j/k, or
+    Tab/Shift+Tab selects an entry; Enter or a mouse click opens it. Page Up/Down,
+    Home/End, and the mouse wheel navigate the list. A scrollbar appears only when
+    the list overflows. Directory prefixes shared by at
+    least three links appear as bold tree headers; only file rows are selectable.
+    Keyboard selection scrolls the document to the link, using neighboring entries
+    to choose between repeated occurrences. The selected link is underlined in the
+    document. Markdown path labels hide section fragments without changing the jump
+    target. Escape or q dismisses the popup.
+    Backspace or Left returns
+    to the previous document and scroll position. Relative paths and heading fragments
+    are supported. Existing file paths in inline code also become links, resolved
+    against the document directory first, then the nearest Git repository root.
+    Git commit hashes of at least seven hex characters are linked when they resolve
+    unambiguously in the document's repository. They open a side-by-side diff in a
+    nested window and appear in the Tab picker. The title contains the short commit
+    hash, author name without email, and local date/time. The year appears only when
+    it differs from the current year. A blank line precedes the commit message.
+    File headers show change counts and additions/deletions bars.
+    Files start collapsed, with dividers between sections. Click a file header to
+    toggle it. n/p selects files; Enter or Space toggles the
+    selected file. c/e collapses/expands all files. Git .diff/.patch files use the same
+    view. Long lines wrap within each pane; narrow terminals use a stacked diff.
+    Existing file path arguments in command examples, including fenced code blocks,
+    are clickable and included in the link picker. Opening a path displays its file.
+    An attached `:LINE` or `#LLINE` jumps to the one-based source line (for example,
+    `emitted.glsl:172` or `emitted.glsl#L172`). Line links to Markdown show literal
+    source; out-of-range line numbers jump to the last line.
+    Missing files and unsupported links display an error without leaving
+    the viewer. Local UTF-8 text and source files are supported, with syntax highlighting
+    for recognized source languages. Web links are not launched.
++
+    Valid JSON files use a structured view with distinct key and value colors and
+    compact object/array `(count)` annotations. Up/Down or j/k selects rows; Enter/Space or clicking a
+    container toggles folding. Left collapses or selects a parent; Right expands.
+    c folds nested containers; e expands all. Backspace returns to the parent document.
+    Field order, duplicate keys, and value tokens are preserved. Tab includes links
+    inside folded sections. Invalid JSON and source-line links use source text.
 +
     Press `?` to open a prompt popup for a plain-text question about the open document.
+    Opening the prompt starts background prewarming for both title and answer sessions
+    with their instructions and shared prompt prefixes; submission reuses these sessions.
     Enter submits and immediately opens a small floating window with a spinner.
     The generated title types into its caption character by character; the window
     expands from 5 to 64 columns over 100 ms once the title is ready, then to 84
@@ -186,7 +233,7 @@ This is the default when run as `mdcat`.
 
 [[theme-option]]--theme=_THEME_::
     Colour theme to use.
-    _THEME_ is one of `auto`, `dark`, `light`, `catppuccin-mocha`, `catppuccin-latte`, `gruvbox-dark`, `gruvbox-light`, `dracula`, `nord`, `solarized-dark`, or `solarized-light`.
+    _THEME_ is one of `auto`, `dark`, `light`, `catppuccin-mocha`, `catppuccin-latte`, `gruvbox-dark`, `gruvbox-browse`, `gruvbox-light`, `dracula`, `nord`, `solarized-dark`, or `solarized-light`.
 +
 Defaults to `auto`, which detects dark or light mode from the terminal, unless `~/.config/mdcat/config.toml` sets a `base` theme (see <<Configuration file>>).
 
