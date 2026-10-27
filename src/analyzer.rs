@@ -28,10 +28,11 @@ pub fn run(
     options: mdcat::RenderOptions,
     columns: Option<u16>,
     no_colour: bool,
+    model: Option<mdcat::args::QueryModel>,
 ) -> Result<()> {
     let working_directory = std::env::current_dir()?;
     let mut document = crate::navigation::Document::load(filename.into(), options)?;
-    let mut query = crate::query::Query::default();
+    let mut query = crate::query::Query::new(model);
     let mut response = ResponseWindow {
         no_colour,
         animate_resize: true,
@@ -60,11 +61,26 @@ pub fn run(
         let mut titles = Vec::new();
         let mut history: Vec<(crate::navigation::Document, usize, Option<String>)> = Vec::new();
         let mut status = String::new();
+        let mut zero_match_notice: Option<(std::time::Instant, String)> = None;
         let mut pending_anchor: Option<String> = None;
+        let mut search = Search::default();
+        let mut image_picker: Option<ratatui_image::picker::Picker> = None;
+        let mut image_state: Option<(
+            std::path::PathBuf,
+            ratatui_image::protocol::StatefulProtocol,
+        )> = None;
 
         let animation_started = std::time::Instant::now();
         loop {
             query.poll();
+            if let Some((started, message)) = &zero_match_notice {
+                if status != *message {
+                    zero_match_notice = None;
+                } else if started.elapsed() >= std::time::Duration::from_millis(1500) {
+                    status.clear();
+                    zero_match_notice = None;
+                }
+            }
             if link_picker.as_ref().is_some_and(LinkPicker::expired) {
                 link_picker = None;
             }
@@ -75,7 +91,28 @@ pub fn run(
                 .width
                 .saturating_sub(if document.diff.is_some() { 5 } else { 4 })
                 .max(1);
+            let table_width = width;
             let height = usize::from(area.height.saturating_sub(2));
+            if let Some(image) = &document.image {
+                if image_state
+                    .as_ref()
+                    .is_none_or(|(path, _)| path != &document.path)
+                {
+                    let picker = image_picker.get_or_insert_with(|| {
+                        pulldown_cmark_mdcat::ratatui::detect_image_picker()
+                            .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
+                    });
+                    image_state = Some((
+                        document.path.clone(),
+                        picker.new_resize_protocol(image.clone()),
+                    ));
+                }
+            } else {
+                image_state = None;
+            }
+            if let Some(json) = document.json.as_mut() {
+                json.prepare_for_height(height);
+            }
             let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let tick = (animation_started.elapsed().as_millis() / 100) % spinner.len() as u128;
             if rendered_width.is_none() {
@@ -93,6 +130,8 @@ pub fn run(
                 {
                     if let Some(title) = &doc.title {
                         titles[index].clone_from(title);
+                    } else if doc.is_directory {
+                        titles[index] = directory_title(&doc.path, &working_directory);
                     }
                 }
                 response_renderer = Renderer::new(
@@ -113,7 +152,7 @@ pub fn run(
                     None => width.min(80),
                 }
             };
-            if rendered_width != Some(width) {
+            if rendered_width != Some((width, table_width)) {
                 let settings = Settings {
                     terminal_size: pulldown_cmark_mdcat::TerminalSize {
                         columns: width,
@@ -125,8 +164,24 @@ pub fn run(
                     theme: settings.theme.clone(),
                     syntax_theme: settings.syntax_theme.clone(),
                 };
-                (text, links) =
-                    render_document(&document, &document.input, &settings, resources, options)?;
+                (text, links) = render_document_with_table_width(
+                    &document,
+                    &document.input,
+                    &settings,
+                    resources,
+                    options,
+                    table_width,
+                )?;
+                if document.is_directory
+                    && selected
+                        .as_ref()
+                        .is_none_or(|target| !links.iter().any(|link| &link.target == target))
+                {
+                    selected = links.first().map(|link| link.target.clone());
+                }
+                if search.pending_until.is_none() {
+                    search.rebuild(&text);
+                }
                 if no_colour {
                     for line in &mut text.lines {
                         line.style = Style::default();
@@ -136,9 +191,14 @@ pub fn run(
                     }
                 }
                 if let Some(anchor) = pending_anchor.take() {
-                    if let Some(line) =
-                        anchor_line(&document, &anchor, &settings, resources, options)?
-                    {
+                    if let Some(line) = anchor_line_with_table_width(
+                        &document,
+                        &anchor,
+                        &settings,
+                        resources,
+                        options,
+                        table_width,
+                    )? {
                         scroll = line;
                         if let Some(source_line) = crate::navigation::source_line(&anchor) {
                             let actual = source_line.min(document.source.lines().count().max(1));
@@ -152,9 +212,20 @@ pub fn run(
                         status = format!("Heading not found: #{anchor}");
                     }
                 }
-                rendered_width = Some(width);
+                rendered_width = Some((width, table_width));
             }
             let max_scroll = text.lines.len().saturating_sub(height.max(1));
+            if search
+                .pending_until
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                if let Some(line) = search.finish_pending(&text) {
+                    scroll = line.min(max_scroll);
+                    if let Some(json) = document.json.as_mut() {
+                        json.select_row(line);
+                    }
+                }
+            }
             scroll = scroll.min(max_scroll);
             let hovered = mouse_position
                 .filter(|_| {
@@ -204,7 +275,26 @@ pub fn run(
                     area,
                 );
 
+                if let Some((_, protocol)) = image_state.as_mut() {
+                    let image_area = ratatui::layout::Rect::new(
+                        area.x.saturating_add(2),
+                        area.y.saturating_add(1),
+                        area.width.saturating_sub(4),
+                        area.height.saturating_sub(2),
+                    );
+                    if image_area.width > 0 && image_area.height > 0 {
+                        frame.render_stateful_widget(
+                            ratatui_image::StatefulImage::default(),
+                            image_area,
+                            protocol,
+                        );
+                    }
+                }
+
                 let picker_target = link_picker.as_ref().and_then(LinkPicker::selected_target);
+                if document.is_directory && !no_colour {
+                    draw_directory_changes(frame, &document, &links, area, scroll);
+                }
                 let picker_link = picker_target.as_deref().and_then(|target| {
                     links
                         .iter()
@@ -215,7 +305,11 @@ pub fn run(
                     &links,
                     area,
                     scroll,
-                    None,
+                    if document.is_directory {
+                        selected.as_deref()
+                    } else {
+                        None
+                    },
                     picker_link.map(|link| link.target.as_str()).or(hovered),
                     if no_colour {
                         None
@@ -252,9 +346,30 @@ pub fn run(
                         }
                     }
                 }
+                search.highlight(
+                    frame,
+                    area,
+                    scroll,
+                    no_colour || crossterm::style::Colored::ansi_color_disabled(),
+                );
                 let hovered_path =
                     hovered.and_then(|target| hover_path(&document, target, &working_directory));
-                let hint = if let Some(path) = hovered_path.as_deref() {
+                let hint_width = area.width.saturating_sub(
+                    4 + format!(
+                        " {} / {} ──",
+                        (scroll + 1).min(text.lines.len()),
+                        text.lines.len()
+                    )
+                    .len() as u16,
+                );
+                let search_footer = if search.open {
+                    Some(search.footer(usize::from(hint_width)))
+                } else {
+                    None
+                };
+                let hint = if let Some((hint, _)) = search_footer.as_ref() {
+                    hint.as_str()
+                } else if let Some(path) = hovered_path.as_deref() {
                     path
                 } else if status.is_empty() {
                     if document.json.is_some() {
@@ -266,22 +381,45 @@ pub fn run(
                     &status
                 };
                 if area.width > 4 {
+                    let hint_style = if let Some((started, _)) = zero_match_notice
+                        .as_ref()
+                        .filter(|_| search_footer.is_none() && hovered_path.is_none())
+                    {
+                        let background = settings
+                            .syntax_theme
+                            .as_ref()
+                            .and_then(|theme| theme.settings.background)
+                            .map(|color| (color.r, color.g, color.b))
+                            .unwrap_or(if settings.theme.is_dark {
+                                (28, 28, 28)
+                            } else {
+                                (255, 255, 255)
+                            });
+                        zero_match_notice_style(
+                            started.elapsed(),
+                            background,
+                            no_colour || crossterm::style::Colored::ansi_color_disabled(),
+                        )
+                    } else {
+                        Style::default()
+                    };
                     frame.render_widget(
-                        Line::raw(hint),
+                        Line::styled(hint, hint_style),
                         ratatui::layout::Rect::new(
                             area.x + 2,
                             area.bottom().saturating_sub(1),
-                            area.width.saturating_sub(
-                                4 + format!(
-                                    " {} / {} ──",
-                                    (scroll + 1).min(text.lines.len()),
-                                    text.lines.len()
-                                )
-                                .len() as u16,
-                            ),
+                            hint_width,
                             1,
                         ),
                     );
+                    if let Some((_, cursor)) = search_footer {
+                        if cursor < usize::from(hint_width) {
+                            frame.set_cursor_position((
+                                area.x + 2 + cursor as u16,
+                                area.bottom().saturating_sub(1),
+                            ));
+                        }
+                    }
                 }
                 if max_scroll > 0 && area.width >= 5 && area.height > 2 {
                     let track = ratatui::layout::Rect::new(
@@ -333,6 +471,7 @@ pub fn run(
             let refresh_ms = if link_picker
                 .as_ref()
                 .is_some_and(|picker| picker.targets.is_empty())
+                || zero_match_notice.is_some()
                 || response.visible
                     && (response.animating_caption()
                         || response.resize_started.is_some()
@@ -466,11 +605,11 @@ pub fn run(
                             response.visible = false;
                             response.drag = None;
                         }
-                        KeyCode::Char('?') => query.open_prompt(),
+                        KeyCode::Char('?') => query.open_prompt(&document.source),
                         KeyCode::Char('l')
                             if key.modifiers.contains(KeyModifiers::CONTROL) && !query.busy() =>
                         {
-                            query = crate::query::Query::default();
+                            query = crate::query::Query::new(model);
                             response.visible = false;
                         }
                         KeyCode::Left | KeyCode::Char('h') => response.move_by(-2, 0, area),
@@ -482,6 +621,208 @@ pub fn run(
                         KeyCode::Home => response.scroll = 0,
                         KeyCode::End => response.scroll = usize::MAX,
                         _ => {}
+                    }
+                }
+                Event::Key(key) if key.kind != KeyEventKind::Release && search.open => {
+                    let old_input = search.input.clone();
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
+                        KeyCode::Esc => {
+                            search.open = false;
+                            search.pending_until = None;
+                            search.query.clone_from(&search.original_query);
+                            search.rebuild(&text);
+                            search.current = search
+                                .original_current
+                                .filter(|index| *index < search.matches.len());
+                            scroll = search.original_scroll.min(max_scroll);
+                            status.clone_from(&search.original_status);
+                            if let (Some(json), Some(cursor)) =
+                                (document.json.as_mut(), search.original_json_cursor)
+                            {
+                                json.select_row(cursor);
+                            }
+                        }
+                        KeyCode::Enter => {
+                            search.open = false;
+                            if search.pending_until.is_some() {
+                                if let Some(line) = search.finish_pending(&text) {
+                                    scroll = line.min(max_scroll);
+                                    if let Some(json) = document.json.as_mut() {
+                                        json.select_row(line);
+                                    }
+                                }
+                            }
+                            status = if search.query.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {} matches for '{}' ", search.matches.len(), search.query)
+                            };
+                            if search.matches.is_empty() {
+                                if !search.query.is_empty() {
+                                    zero_match_notice =
+                                        Some((std::time::Instant::now(), status.clone()));
+                                }
+                                search = Search::default();
+                            }
+                        }
+                        KeyCode::Left => search.move_cursor(false),
+                        KeyCode::Right => search.move_cursor(true),
+                        KeyCode::Home => search.cursor = 0,
+                        KeyCode::End => search.cursor = search.input.len(),
+                        KeyCode::Backspace if search.cursor > 0 => {
+                            let end = search.cursor;
+                            search.move_cursor(false);
+                            search.input.drain(search.cursor..end);
+                        }
+                        KeyCode::Delete if search.cursor < search.input.len() => {
+                            let start = search.cursor;
+                            search.move_cursor(true);
+                            search.input.drain(start..search.cursor);
+                            search.cursor = start;
+                        }
+                        KeyCode::Char(c)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                                && !c.is_control() =>
+                        {
+                            search.input.insert(search.cursor, c);
+                            search.cursor += c.len_utf8();
+                        }
+                        _ => {}
+                    }
+                    if search.open && search.input != old_input {
+                        search.query.clone_from(&search.input);
+                        if let Some(line) = search.schedule(&text) {
+                            scroll = line.min(max_scroll);
+                            if let Some(json) = document.json.as_mut() {
+                                json.select_row(line);
+                            }
+                        }
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('f')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    search.open = true;
+                    search.input.clone_from(&search.query);
+                    search.cursor = search.input.len();
+                    search.original_query.clone_from(&search.query);
+                    search.original_scroll = scroll;
+                    search.original_current = search.current;
+                    search.original_status.clone_from(&status);
+                    search.original_json_cursor = document.json.as_ref().map(|json| json.cursor);
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('n')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if document.is_directory || document.image.is_some() || !document.path.is_file()
+                    {
+                        status = " No editable file in this window ".into();
+                    } else {
+                        let was_json_cursor = document.json.as_ref().map(|json| json.cursor);
+                        let result = edit_in_nano(&mut terminal, &document.path);
+                        match crate::navigation::Document::load(document.path.clone(), options) {
+                            Ok(mut reloaded) => {
+                                if let (Some(json), Some(cursor)) =
+                                    (reloaded.json.as_mut(), was_json_cursor)
+                                {
+                                    json.select_row(cursor);
+                                }
+                                document = reloaded;
+                                rendered_width = None;
+                                selected = None;
+                                query = crate::query::Query::new(model);
+                                response.visible = false;
+                            }
+                            Err(error) => status = format!(" Failed to reload: {error:#} "),
+                        }
+                        match result {
+                            Ok(exit) if exit.success() => {}
+                            Ok(exit) => status = format!(" nano exited with {exit} "),
+                            Err(error) => status = format!(" Could not open nano: {error:#} "),
+                        }
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && !search.query.is_empty()
+                        && matches!(key.code, KeyCode::Esc | KeyCode::Left | KeyCode::Right) =>
+                {
+                    if key.code == KeyCode::Esc {
+                        search = Search::default();
+                        status.clear();
+                    } else if let Some(line) = search.next(key.code == KeyCode::Right) {
+                        scroll = line.min(max_scroll);
+                        if let Some(json) = document.json.as_mut() {
+                            json.select_row(line);
+                        }
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && matches!(key.code, KeyCode::Char('n' | 'N'))
+                        && !search.matches.is_empty() =>
+                {
+                    if let Some(line) = search.next(key.code == KeyCode::Char('n')) {
+                        scroll = line.min(max_scroll);
+                        if let Some(json) = document.json.as_mut() {
+                            json.select_row(line);
+                        }
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && document.is_directory
+                        && matches!(
+                            key.code,
+                            KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::PageUp
+                                | KeyCode::PageDown
+                                | KeyCode::Char('j' | 'k')
+                                | KeyCode::Enter
+                        ) =>
+                {
+                    if key.code == KeyCode::Enter {
+                        open_target = selected.clone();
+                    } else if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+                        let forward = key.code == KeyCode::PageDown;
+                        if let Some(link) =
+                            directory_page_selection(&links, selected.as_deref(), forward, height)
+                        {
+                            selected = Some(link.target.clone());
+                            scroll = if forward {
+                                scroll.saturating_add(height.max(1))
+                            } else {
+                                scroll.saturating_sub(height.max(1))
+                            };
+                            scroll = cursor_scroll(link.line, scroll.min(max_scroll), height)
+                                .min(max_scroll);
+                        }
+                    } else if let Some(link) = directory_move_selection(
+                        &links,
+                        selected.as_deref(),
+                        matches!(key.code, KeyCode::Down | KeyCode::Char('j')),
+                    ) {
+                        selected = Some(link.target.clone());
+                        scroll = cursor_scroll(link.line, scroll, height).min(max_scroll);
                     }
                 }
                 Event::Key(key)
@@ -553,7 +894,9 @@ pub fn run(
                         KeyCode::Home | KeyCode::Char('g') => json.cursor = 0,
                         KeyCode::End | KeyCode::Char('G') => json.end(),
                         KeyCode::Enter | KeyCode::Char(' ') => changed = json.toggle(json.cursor),
-                        KeyCode::Left => changed = json.collapse(),
+                        KeyCode::Left => {
+                            (go_back, changed) = json_left(json, !history.is_empty());
+                        }
                         KeyCode::Right => changed = json.expand(),
                         KeyCode::Char('c') => {
                             json.fold_all(true);
@@ -587,7 +930,7 @@ pub fn run(
                         dragging_scrollbar = false;
                     }
                     KeyCode::Char('?') => {
-                        query.open_prompt();
+                        query.open_prompt(&document.source);
                     }
                     KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
                     KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
@@ -693,14 +1036,19 @@ pub fn run(
             if go_back {
                 if let Some((previous, position, selection)) = history.pop() {
                     document = previous;
+                    if document.is_directory {
+                        document.directory_changes =
+                            crate::git_directory::changed_entries(&document.path);
+                    }
                     scroll = position;
                     selected = selection;
                     rendered_width = None;
                     pending_anchor = None;
                     status.clear();
                     dragging_scrollbar = false;
-                    query = crate::query::Query::default();
+                    query = crate::query::Query::new(model);
                     response.visible = false;
+                    search = Search::default();
                 }
             }
             if let Some(target) = open_target {
@@ -757,8 +1105,9 @@ pub fn run(
                         rendered_width = None;
                         dragging_scrollbar = false;
                         status.clear();
-                        query = crate::query::Query::default();
+                        query = crate::query::Query::new(model);
                         response.visible = false;
+                        search = Search::default();
                     }
                     Err(error) => status = format!(" {error:#} "),
                 }
@@ -774,6 +1123,220 @@ pub fn run(
     Ok(())
 }
 
+fn edit_in_nano(
+    terminal: &mut ratatui::DefaultTerminal,
+    path: &std::path::Path,
+) -> Result<std::process::ExitStatus> {
+    execute!(std::io::stdout(), DisableMouseCapture)?;
+    ratatui::try_restore()?;
+    let shell = std::env::var_os("SHELL").map(std::path::PathBuf::from);
+    let shell_name = shell
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str());
+    let result = match (shell.as_deref(), shell_name) {
+        (Some(shell), Some("zsh" | "bash")) => std::process::Command::new(shell)
+            .arg("-ic")
+            .arg("nano -- \"$1\"")
+            .arg("mdcat-nano")
+            .arg(path)
+            .status(),
+        (Some(shell), Some("fish")) => std::process::Command::new(shell)
+            .arg("-ic")
+            .arg("nano -- $argv[1]")
+            .arg(path)
+            .status(),
+        _ => std::process::Command::new("nano")
+            .arg("--")
+            .arg(path)
+            .status(),
+    };
+    *terminal = ratatui::try_init()?;
+    execute!(std::io::stdout(), EnableMouseCapture)?;
+    Ok(result?)
+}
+
+fn zero_match_notice_style(
+    elapsed: std::time::Duration,
+    background: (u8, u8, u8),
+    no_colour: bool,
+) -> Style {
+    let fade = elapsed
+        .saturating_sub(std::time::Duration::from_millis(500))
+        .as_secs_f32()
+        .clamp(0.0, 1.0);
+    if fade == 0.0 {
+        return Style::default();
+    }
+    if no_colour {
+        return if fade >= 0.5 {
+            Style::default().add_modifier(ratatui::style::Modifier::DIM)
+        } else {
+            Style::default()
+        };
+    }
+    let foreground =
+        if u16::from(background.0) + u16::from(background.1) + u16::from(background.2) > 384 {
+            (40, 40, 40)
+        } else {
+            (220, 220, 220)
+        };
+    let blend =
+        |fg: u8, bg: u8| (f32::from(fg) + (f32::from(bg) - f32::from(fg)) * fade).round() as u8;
+    Style::default().fg(Color::Rgb(
+        blend(foreground.0, background.0),
+        blend(foreground.1, background.1),
+        blend(foreground.2, background.2),
+    ))
+}
+
+#[derive(Default)]
+struct Search {
+    open: bool,
+    input: String,
+    cursor: usize,
+    query: String,
+    matches: Vec<(usize, usize, usize)>,
+    current: Option<usize>,
+    original_query: String,
+    original_scroll: usize,
+    original_current: Option<usize>,
+    original_status: String,
+    original_json_cursor: Option<usize>,
+    pending_until: Option<std::time::Instant>,
+}
+
+impl Search {
+    fn schedule(&mut self, text: &Text<'_>) -> Option<usize> {
+        let length = self.query.chars().count();
+        if (1..3).contains(&length) {
+            self.matches.clear();
+            self.current = None;
+            self.pending_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
+            None
+        } else {
+            self.finish_pending(text)
+        }
+    }
+
+    fn finish_pending(&mut self, text: &Text<'_>) -> Option<usize> {
+        self.pending_until = None;
+        self.rebuild(text);
+        self.first_at_or_after(self.original_scroll)
+    }
+
+    fn footer(&self, width: usize) -> (String, usize) {
+        let prefix = " Find: ";
+        let mut start = 0;
+        while start < self.cursor
+            && prefix.len() + Line::raw(&self.input[start..self.cursor]).width() >= width
+        {
+            start += self.input[start..].chars().next().unwrap().len_utf8();
+        }
+        let cursor = (prefix.len() + Line::raw(&self.input[start..self.cursor]).width())
+            .min(width.saturating_sub(1));
+        (format!("{prefix}{} ", &self.input[start..]), cursor)
+    }
+
+    fn move_cursor(&mut self, forward: bool) {
+        if forward {
+            if let Some(c) = self.input[self.cursor..].chars().next() {
+                self.cursor += c.len_utf8();
+            }
+        } else if let Some(c) = self.input[..self.cursor].chars().next_back() {
+            self.cursor -= c.len_utf8();
+        }
+    }
+
+    fn rebuild(&mut self, text: &Text<'_>) {
+        self.matches.clear();
+        self.current = None;
+        if self.query.is_empty() {
+            return;
+        }
+        let Ok(pattern) = regex::RegexBuilder::new(&regex::escape(&self.query))
+            .case_insensitive(true)
+            .build()
+        else {
+            return;
+        };
+        for (line, text) in text.lines.iter().enumerate() {
+            let content = text
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            for found in pattern.find_iter(&content) {
+                let start = Line::raw(&content[..found.start()]).width();
+                let end = start + Line::raw(found.as_str()).width();
+                if end > start {
+                    self.matches.push((line, start, end));
+                }
+            }
+        }
+    }
+
+    fn first_at_or_after(&mut self, line: usize) -> Option<usize> {
+        if self.matches.is_empty() {
+            return None;
+        }
+        let index = self
+            .matches
+            .iter()
+            .position(|entry| entry.0 >= line)
+            .unwrap_or(0);
+        self.current = Some(index);
+        Some(self.matches[index].0)
+    }
+
+    fn next(&mut self, forward: bool) -> Option<usize> {
+        let count = self.matches.len();
+        if count == 0 {
+            return None;
+        }
+        let index = match self.current {
+            Some(index) if forward => (index + 1) % count,
+            Some(index) => (index + count - 1) % count,
+            None if forward => 0,
+            None => count - 1,
+        };
+        self.current = Some(index);
+        Some(self.matches[index].0)
+    }
+
+    fn highlight(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: ratatui::layout::Rect,
+        scroll: usize,
+        no_colour: bool,
+    ) {
+        let height = usize::from(area.height.saturating_sub(2));
+        let width = usize::from(area.width.saturating_sub(4));
+        let style = if no_colour {
+            Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Black).bg(Color::Yellow)
+        };
+        for &(line, start, end) in &self.matches {
+            if line < scroll || line >= scroll + height || start >= width {
+                continue;
+            }
+            let end = end.min(width);
+            frame.buffer_mut().set_style(
+                ratatui::layout::Rect::new(
+                    area.x + 2 + start as u16,
+                    area.y + 1 + (line - scroll) as u16,
+                    (end - start) as u16,
+                    1,
+                ),
+                style,
+            );
+        }
+    }
+}
+
 fn cursor_scroll(cursor: usize, scroll: usize, height: usize) -> usize {
     if cursor < scroll {
         cursor
@@ -783,6 +1346,79 @@ fn cursor_scroll(cursor: usize, scroll: usize, height: usize) -> usize {
         scroll
     }
 }
+
+fn directory_move_selection<'a>(
+    links: &'a [pulldown_cmark_mdcat::ratatui::LinkRegion],
+    selected: Option<&str>,
+    forward: bool,
+) -> Option<&'a pulldown_cmark_mdcat::ratatui::LinkRegion> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for link in links {
+        if seen.insert(link.target.as_str()) {
+            entries.push(link);
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let index = selected.and_then(|target| entries.iter().position(|link| link.target == target));
+    let index = match (index, forward) {
+        (Some(index), true) => (index + 1).min(entries.len() - 1),
+        (Some(index), false) => index.saturating_sub(1),
+        (None, _) => 0,
+    };
+    Some(entries[index])
+}
+
+fn directory_page_selection<'a>(
+    links: &'a [pulldown_cmark_mdcat::ratatui::LinkRegion],
+    selected: Option<&str>,
+    forward: bool,
+    height: usize,
+) -> Option<&'a pulldown_cmark_mdcat::ratatui::LinkRegion> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for link in links {
+        if seen.insert(link.target.as_str()) {
+            entries.push(link);
+        }
+    }
+    let current = selected
+        .and_then(|target| entries.iter().find(|link| link.target == target))
+        .copied()
+        .or_else(|| entries.first().copied())?;
+    let destination = if forward {
+        current.line.saturating_add(height.max(1))
+    } else {
+        current.line.saturating_sub(height.max(1))
+    };
+    if forward {
+        entries
+            .iter()
+            .find(|link| link.line >= destination)
+            .copied()
+            .or_else(|| entries.last().copied())
+    } else {
+        entries
+            .iter()
+            .rev()
+            .find(|link| link.line <= destination)
+            .copied()
+            .or_else(|| entries.first().copied())
+    }
+}
+
+fn json_left(json: &mut crate::json_view::JsonView, has_parent: bool) -> (bool, bool) {
+    if has_parent && json.cursor == 0 {
+        (true, false)
+    } else {
+        (false, json.collapse())
+    }
+}
+
+const EMPTY_LINK_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const EMPTY_LINK_NOTICE_FADE: std::time::Duration = std::time::Duration::from_millis(500);
 
 struct LinkPicker {
     targets: Vec<String>,
@@ -899,7 +1535,12 @@ impl LinkPicker {
     }
 
     fn expired(&self) -> bool {
-        self.targets.is_empty() && self.opened.elapsed() >= std::time::Duration::from_millis(850)
+        self.targets.is_empty()
+            && self
+                .opened
+                .elapsed()
+                .saturating_sub(EMPTY_LINK_NOTICE_DELAY)
+                >= EMPTY_LINK_NOTICE_FADE
     }
 
     fn move_by(&mut self, amount: isize) {
@@ -967,7 +1608,14 @@ impl LinkPicker {
                 3.min(max_height),
             );
             frame.render_widget(Clear, self.area);
-            let remaining = (1.0 - self.opened.elapsed().as_secs_f32() / 0.850).clamp(0.0, 1.0);
+            let remaining = (1.0
+                - self
+                    .opened
+                    .elapsed()
+                    .saturating_sub(EMPTY_LINK_NOTICE_DELAY)
+                    .as_secs_f32()
+                    / EMPTY_LINK_NOTICE_FADE.as_secs_f32())
+            .clamp(0.0, 1.0);
             let blend = |foreground: (u8, u8, u8)| {
                 let channel = |fg: u8, bg: u8| {
                     (f32::from(bg) + (f32::from(fg) - f32::from(bg)) * remaining).round() as u8
@@ -1132,11 +1780,24 @@ fn hover_path(
         return Some(format!(" Git commit {id} "));
     }
     let path = document.destination(target).ok()?;
+    let mut label = relative_path_label(&path, cwd);
+    if let Some(fragment) = document.environment.base_url.join(target).ok()?.fragment() {
+        if let Some(line) = crate::navigation::source_line(fragment) {
+            label.push_str(&format!(":{line}"));
+        } else {
+            label.push('#');
+            label.push_str(&percent_encoding::percent_decode_str(fragment).decode_utf8_lossy());
+        }
+    }
+    Some(format!(" {label} "))
+}
+
+fn relative_path_label(path: &std::path::Path, cwd: &std::path::Path) -> String {
     // Resolve macOS directory aliases (for example /tmp -> /private/tmp)
     // together, so a sibling file does not get an artificial ../../tmp prefix.
     let (path, cwd) = match (path.canonicalize(), cwd.canonicalize()) {
         (Ok(path), Ok(cwd)) => (path, cwd),
-        _ => (path, cwd.to_owned()),
+        _ => (path.to_owned(), cwd.to_owned()),
     };
     let base = cwd.components().collect::<Vec<_>>();
     let components = path.components().collect::<Vec<_>>();
@@ -1152,20 +1813,20 @@ fn hover_path(
     for component in &components[shared..] {
         relative.push(component.as_os_str());
     }
-    let mut label = if shared == base.len() {
+    if shared == base.len() {
         format!("./{}", relative.display())
     } else {
         relative.display().to_string()
-    };
-    if let Some(fragment) = document.environment.base_url.join(target).ok()?.fragment() {
-        if let Some(line) = crate::navigation::source_line(fragment) {
-            label.push_str(&format!(":{line}"));
-        } else {
-            label.push('#');
-            label.push_str(&percent_encoding::percent_decode_str(fragment).decode_utf8_lossy());
-        }
     }
-    Some(format!(" {label} "))
+}
+
+fn directory_title(path: &std::path::Path, cwd: &std::path::Path) -> String {
+    let path = relative_path_label(path, cwd);
+    if path.ends_with('/') {
+        path
+    } else {
+        format!("{path}/")
+    }
 }
 
 fn same_local_link(document: &crate::navigation::Document, left: &str, right: &str) -> bool {
@@ -1219,6 +1880,47 @@ fn link_at(
     links
         .iter()
         .find(|link| link.line == line && column >= link.start && column < link.end)
+}
+
+fn draw_directory_changes(
+    frame: &mut ratatui::Frame<'_>,
+    document: &crate::navigation::Document,
+    links: &[pulldown_cmark_mdcat::ratatui::LinkRegion],
+    area: ratatui::layout::Rect,
+    scroll: usize,
+) {
+    let height = usize::from(area.height.saturating_sub(2));
+    let width = usize::from(area.width.saturating_sub(4));
+    let directory = document
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| document.path.clone());
+    for link in links {
+        if link.line < scroll || link.line >= scroll + height || link.start >= width {
+            continue;
+        }
+        let Ok(path) = document.destination(&link.target) else {
+            continue;
+        };
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        if !document.directory_changes.contains(&directory.join(name)) {
+            continue;
+        }
+        let end = link.end.min(width);
+        if end > link.start {
+            frame.buffer_mut().set_style(
+                ratatui::layout::Rect::new(
+                    area.x + 2 + link.start as u16,
+                    area.y + 1 + (link.line - scroll) as u16,
+                    (end - link.start) as u16,
+                    1,
+                ),
+                Style::default().fg(Color::Yellow),
+            );
+        }
+    }
 }
 
 fn draw_link_highlights(
@@ -1284,6 +1986,7 @@ fn document_stack_layout(
     )
 }
 
+#[cfg(test)]
 fn render_document(
     document: &crate::navigation::Document,
     input: &str,
@@ -1294,6 +1997,30 @@ fn render_document(
     Text<'static>,
     Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
 )> {
+    render_document_with_table_width(
+        document,
+        input,
+        settings,
+        resources,
+        options,
+        settings.terminal_size.columns,
+    )
+}
+
+fn render_document_with_table_width(
+    document: &crate::navigation::Document,
+    input: &str,
+    settings: &Settings<'_>,
+    resources: &dyn ResourceUrlHandler,
+    options: mdcat::RenderOptions,
+    table_width: u16,
+) -> Result<(
+    Text<'static>,
+    Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
+)> {
+    if document.image.is_some() {
+        return Ok((Text::default(), Vec::new()));
+    }
     if let Some(diff) = document.diff.as_ref() {
         return Ok(discover_file_links(
             document,
@@ -1391,18 +2118,20 @@ fn render_document(
         })
         .map(|event| resolve_fragment(event, document));
     let (text, links) = if options.emoji {
-        pulldown_cmark_mdcat::ratatui::push_linked_text(
+        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_width(
             settings,
             &document.environment,
             resources,
             substitute_emoji(events),
+            table_width,
         )?
     } else {
-        pulldown_cmark_mdcat::ratatui::push_linked_text(
+        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_width(
             settings,
             &document.environment,
             resources,
             events,
+            table_width,
         )?
     };
     Ok(discover_file_links(document, text, links))
@@ -1452,6 +2181,7 @@ fn discover_file_links(
     (text, links)
 }
 
+#[cfg(test)]
 fn anchor_line(
     document: &crate::navigation::Document,
     anchor: &str,
@@ -1459,17 +2189,36 @@ fn anchor_line(
     resources: &dyn ResourceUrlHandler,
     options: mdcat::RenderOptions,
 ) -> Result<Option<usize>> {
+    anchor_line_with_table_width(
+        document,
+        anchor,
+        settings,
+        resources,
+        options,
+        settings.terminal_size.columns,
+    )
+}
+
+fn anchor_line_with_table_width(
+    document: &crate::navigation::Document,
+    anchor: &str,
+    settings: &Settings<'_>,
+    resources: &dyn ResourceUrlHandler,
+    options: mdcat::RenderOptions,
+    table_width: u16,
+) -> Result<Option<usize>> {
     if document.language.is_some() {
         if let Some(line) = crate::navigation::source_line(anchor) {
             // Code blocks preserve one rendered row per source line. Determine the
             // theme's leading border/spacing separately from its source contents.
             let marker = "MDCAT_SOURCE_LINE_POSITION";
-            let (probe, _) = render_document(
+            let (probe, _) = render_document_with_table_width(
                 document,
                 &format!("{marker}\n"),
                 settings,
                 resources,
                 options,
+                table_width,
             )?;
             let offset = probe
                 .lines
@@ -1494,12 +2243,13 @@ fn anchor_line(
     ) else {
         return Ok(None);
     };
-    let (prefix, _) = render_document(
+    let (prefix, _) = render_document_with_table_width(
         document,
         &document.input[..offset],
         settings,
         resources,
         options,
+        table_width,
     )?;
     Ok(Some(
         prefix
@@ -2084,6 +2834,365 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_left_closes_nested_document_only_at_first_line() {
+        let source = r#"{"child":{"value":1}}"#;
+        let mut json = crate::json_view::JsonView::parse(source).unwrap();
+        let original = json.render(source, true);
+        assert_eq!(json_left(&mut json, true), (true, false));
+        assert_eq!(json.render(source, true), original);
+
+        json.cursor = 1;
+        assert_eq!(json_left(&mut json, true), (false, true));
+        assert_eq!(json.cursor, 1);
+        assert_ne!(json.render(source, true), original);
+
+        let mut root = crate::json_view::JsonView::parse(source).unwrap();
+        assert_eq!(json_left(&mut root, false), (false, true));
+        assert_ne!(root.render(source, true), original);
+    }
+
+    #[test]
+    fn search_matches_across_styles_and_highlights_unicode_columns() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let text = Text::from(vec![
+            Line::from(vec![
+                ratatui::text::Span::raw("界 "),
+                ratatui::text::Span::styled(
+                    "AL",
+                    Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+                ),
+                ratatui::text::Span::raw("pha alpha"),
+            ]),
+            Line::raw("another ALPHA"),
+        ]);
+        let mut search = Search {
+            query: "alpha".into(),
+            ..Default::default()
+        };
+        search.rebuild(&text);
+        assert_eq!(search.matches, vec![(0, 3, 8), (0, 9, 14), (1, 8, 13)]);
+        assert_eq!(search.first_at_or_after(1), Some(1));
+        assert_eq!(search.next(true), Some(0));
+        assert_eq!(search.next(false), Some(1));
+        let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(text.clone()), Rect::new(2, 1, 26, 3));
+                search.highlight(frame, Rect::new(0, 0, 30, 5), 0, false);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(5, 1)].bg, Color::Yellow);
+        assert_eq!(buffer[(11, 1)].bg, Color::Yellow);
+        assert_eq!(buffer[(10, 2)].bg, Color::Yellow);
+        assert_ne!(buffer[(4, 1)].bg, Color::Yellow);
+    }
+
+    #[test]
+    fn search_cursor_moves_on_unicode_character_boundaries() {
+        let mut search = Search {
+            input: "a界b".into(),
+            cursor: 5,
+            ..Default::default()
+        };
+        search.move_cursor(false);
+        assert_eq!(search.cursor, 4);
+        search.move_cursor(false);
+        assert_eq!(search.cursor, 1);
+        search.move_cursor(true);
+        assert_eq!(search.cursor, 4);
+    }
+
+    #[test]
+    fn zero_match_notice_waits_then_fades_for_one_second() {
+        use std::time::Duration;
+        let style = |ms| zero_match_notice_style(Duration::from_millis(ms), (20, 20, 20), false);
+        assert_eq!(style(0), Style::default());
+        assert_eq!(style(500), Style::default());
+        assert_eq!(style(1000).fg, Some(Color::Rgb(120, 120, 120)));
+        assert_eq!(style(1500).fg, Some(Color::Rgb(20, 20, 20)));
+        assert!(
+            !zero_match_notice_style(Duration::from_millis(999), (20, 20, 20), true)
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        assert!(
+            zero_match_notice_style(Duration::from_millis(1000), (20, 20, 20), true)
+                .add_modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+    }
+
+    #[test]
+    fn short_searches_are_delayed_but_longer_ones_run_immediately() {
+        let text = Text::raw("ab abc 界界界");
+        let mut search = Search {
+            query: "ab".into(),
+            ..Default::default()
+        };
+        assert_eq!(search.schedule(&text), None);
+        assert!(search.pending_until.is_some());
+        assert!(search.matches.is_empty());
+        assert_eq!(search.finish_pending(&text), Some(0));
+        assert_eq!(search.matches.len(), 2);
+        search.query = "abc".into();
+        assert_eq!(search.schedule(&text), Some(0));
+        assert!(search.pending_until.is_none());
+        assert_eq!(search.matches.len(), 1);
+        search.query = "界界".into();
+        assert_eq!(search.schedule(&text), None);
+        assert!(search.pending_until.is_some());
+        search.query.clear();
+        assert_eq!(search.schedule(&text), None);
+        assert!(search.pending_until.is_none());
+        assert!(search.matches.is_empty());
+        assert!(search.footer(20).0.starts_with(" Find: "));
+        search.input = "his".into();
+        search.cursor = search.input.len();
+        let (footer, cursor) = search.footer(20);
+        assert_eq!(footer.chars().nth(cursor), Some(' '));
+    }
+
+    #[test]
+    fn image_document_decodes_and_renders_in_viewer() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("sample/rust-logo-128x128.png");
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let image = document.image.expect("image document");
+        assert_eq!((image.width(), image.height()), (128, 128));
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        let mut protocol = picker.new_resize_protocol(image);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(30, 15)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_stateful_widget(
+                    ratatui_image::StatefulImage::default(),
+                    frame.area(),
+                    &mut protocol,
+                );
+            })
+            .unwrap();
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() != " "));
+    }
+
+    #[test]
+    fn directory_links_open_as_nested_browsable_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = dir.path().join("report.md");
+        let folder = dir.path().join("formal results");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(folder.join("nested")).unwrap();
+        std::fs::write(folder.join("a [report].md"), "# Report").unwrap();
+        std::fs::write(&report, "[formal results](formal%20results/)").unwrap();
+        let parent = crate::navigation::Document::load(report, Default::default()).unwrap();
+        let target = available_links(&parent, Default::default()).pop().unwrap();
+        let listing = crate::navigation::Document::load(
+            parent.destination(&target).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        let targets = available_links(&listing, Default::default());
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            listing.destination(&targets[0]).unwrap(),
+            folder.join("nested")
+        );
+        assert_eq!(
+            listing.destination(&targets[1]).unwrap(),
+            folder.join("a [report].md")
+        );
+        let nested = crate::navigation::Document::load(
+            listing.destination(&targets[0]).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(nested.input.contains("Empty directory"));
+        let child = crate::navigation::Document::load(
+            listing.destination(&targets[1]).unwrap(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(child.source.contains("# Report"));
+    }
+
+    #[test]
+    fn directory_selection_skips_duplicate_link_fragments_and_stays_in_bounds() {
+        let link = |line, target: &str| pulldown_cmark_mdcat::ratatui::LinkRegion {
+            line,
+            start: 0,
+            end: 4,
+            target: target.to_owned(),
+        };
+        let links = vec![link(0, "a"), link(1, "a"), link(2, "b")];
+        assert_eq!(
+            directory_move_selection(&links, None, true).unwrap().target,
+            "a"
+        );
+        assert_eq!(
+            directory_move_selection(&links, Some("a"), true)
+                .unwrap()
+                .target,
+            "b"
+        );
+        assert_eq!(
+            directory_move_selection(&links, Some("b"), true)
+                .unwrap()
+                .target,
+            "b"
+        );
+        assert_eq!(
+            directory_move_selection(&links, Some("b"), false)
+                .unwrap()
+                .target,
+            "a"
+        );
+        assert!(directory_move_selection(&[], None, true).is_none());
+        let pages = vec![
+            link(0, "a"),
+            link(1, "a"),
+            link(3, "b"),
+            link(6, "c"),
+            link(9, "d"),
+        ];
+        assert_eq!(
+            directory_page_selection(&pages, Some("a"), true, 5)
+                .unwrap()
+                .target,
+            "c"
+        );
+        assert_eq!(
+            directory_page_selection(&pages, Some("c"), false, 5)
+                .unwrap()
+                .target,
+            "a"
+        );
+        assert_eq!(
+            directory_page_selection(&pages, Some("c"), true, 50)
+                .unwrap()
+                .target,
+            "d"
+        );
+    }
+
+    #[test]
+    fn directory_git_changes_color_only_the_changed_entry() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        std::fs::write(path.join("changed.md"), "changed").unwrap();
+        std::fs::write(path.join("clean.md"), "clean").unwrap();
+        let mut document =
+            crate::navigation::Document::load(path.clone(), Default::default()).unwrap();
+        document.directory_changes.insert(path.join("changed.md"));
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let (text, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+        )
+        .unwrap();
+        let changed = links
+            .iter()
+            .find(|link| link.target.ends_with("changed.md"))
+            .unwrap();
+        let clean = links
+            .iter()
+            .find(|link| link.target.ends_with("clean.md"))
+            .unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(Paragraph::new(text.clone()), Rect::new(2, 1, 76, 18));
+                draw_directory_changes(frame, &document, &links, Rect::new(0, 0, 80, 20), 0);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(
+            buffer[(2 + changed.start as u16, 1 + changed.line as u16)].fg,
+            Color::Yellow
+        );
+        assert_ne!(
+            buffer[(2 + clean.start as u16, 1 + clean.line as u16)].fg,
+            Color::Yellow
+        );
+    }
+
+    #[test]
+    fn tables_use_window_width_while_text_keeps_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(dir.path().join("target.md"), "target").unwrap();
+        std::fs::write(&path, "A paragraph with many short words that should wrap at the configured text width.\n\n| Description | Destination |\n|---|---|\n| A long description that uses extra horizontal space for a table | [target](target.md) |\n\n## Later\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: pulldown_cmark_mdcat::TerminalSize {
+                columns: 40,
+                ..Default::default()
+            },
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+        let (wide, links) = render_document_with_table_width(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+            100,
+        )
+        .unwrap();
+        let (narrow, _) = render_document_with_table_width(
+            &document,
+            &document.input,
+            &settings,
+            &resources,
+            Default::default(),
+            40,
+        )
+        .unwrap();
+        assert!(wide.lines.iter().any(|line| line.width() > 40));
+        assert!(narrow.lines.iter().all(|line| line.width() <= 40));
+        assert!(wide
+            .lines
+            .iter()
+            .filter(|line| line.to_string().contains("paragraph"))
+            .all(|line| line.width() <= 40));
+        assert!(links
+            .iter()
+            .any(|link| link.target.ends_with("target.md") && link.start > 40));
+        let heading = anchor_line_with_table_width(
+            &document,
+            "later",
+            &settings,
+            &resources,
+            Default::default(),
+            100,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(wide.lines[heading].to_string().contains("Later"));
+    }
+
+    #[test]
     fn table_click_destinations_match_all_nineteen_picker_entries() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("README.md");
@@ -2162,7 +3271,8 @@ mod tests {
             Default::default(),
         )
         .unwrap();
-        assert!(links.is_empty());
+        // The folded object previews its first string, making this link visible.
+        assert_eq!(links.len(), 1);
         assert_eq!(available_links(&document, Default::default()).len(), 1);
         // String extraction also works when the entire JSON document is one token.
         let minified = r#"{"nested":{"file":"example.py"}}"#;
@@ -2816,7 +3926,15 @@ mod tests {
         assert!(!text.contains("Links (0)"));
         assert!(!picker.expired());
         let initial_border = terminal.backend().buffer()[(picker.area.x, picker.area.y)].fg;
-        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(425);
+        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(100);
+        terminal
+            .draw(|frame| picker.draw(frame, bounds, false, (28, 28, 28)))
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(picker.area.x, picker.area.y)].fg,
+            initial_border
+        );
+        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(500);
         terminal
             .draw(|frame| picker.draw(frame, bounds, false, (28, 28, 28)))
             .unwrap();
@@ -2825,7 +3943,9 @@ mod tests {
             matches!((initial_border, faded_border), (Color::Rgb(r1, g1, b1), Color::Rgb(r2, g2, b2)) if r2 < r1 && g2 < g1 && b2 < b1)
         );
         assert!(!picker.expired());
-        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(850);
+        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(650);
+        assert!(!picker.expired());
+        picker.opened = std::time::Instant::now() - std::time::Duration::from_millis(750);
         assert!(picker.expired());
     }
 
@@ -2854,6 +3974,19 @@ mod tests {
             titles(&["/repo/report.md", "/repo/report.md"]),
             ["./report.md [1]", "./report.md [2]"]
         );
+    }
+
+    #[test]
+    fn directory_caption_uses_path_relative_to_working_directory() {
+        let cwd = tempfile::tempdir().unwrap();
+        let path = cwd.path().join("scratch/edsger/phase-b-to-d-formal-r2");
+        std::fs::create_dir_all(&path).unwrap();
+        assert_eq!(
+            directory_title(&path, cwd.path()),
+            "./scratch/edsger/phase-b-to-d-formal-r2/"
+        );
+        assert_eq!(directory_title(cwd.path(), cwd.path()), "./");
+        assert_eq!(directory_title(cwd.path(), &path), "../../../");
     }
 
     #[test]

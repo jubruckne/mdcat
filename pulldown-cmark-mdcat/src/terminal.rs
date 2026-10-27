@@ -18,5 +18,5 @@ pub mod sixel_probe;
 
 pub use self::detect::TerminalProgram;
 #[cfg(any(test, feature = "ratatui"))]
-pub(crate) use self::size::PixelSize;
+pub use self::size::PixelSize;
 pub use self::size::TerminalSize;

@@ -35,6 +35,7 @@ use mdcat::output::{resolved_pager_basename, Output};
 
 mod analyzer;
 mod diff_view;
+mod git_directory;
 mod git_links;
 mod json_view;
 mod link_tree;
@@ -534,6 +535,7 @@ fn main() {
                     render_options,
                     columns.or(full_width.then_some(u16::MAX)),
                     args.no_colour,
+                    args.model,
                 )
             });
             if let Err(error) = result {

@@ -216,6 +216,9 @@ pub fn should_auto_paginate(filenames: &[String], rows: u16) -> bool {
     let threshold = usize::from(rows.max(1)) * 5 / 2;
     let mut lines = 0;
     for filename in filenames {
+        if crate::is_image_path(std::path::Path::new(filename)) {
+            continue;
+        }
         if filename == "-" || !std::fs::metadata(filename).is_ok_and(|m| m.is_file()) {
             continue;
         }

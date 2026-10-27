@@ -15,6 +15,9 @@ pub struct Document {
     pub language: Option<String>,
     pub json: Option<crate::json_view::JsonView>,
     pub diff: Option<crate::diff_view::DiffView>,
+    pub image: Option<image::DynamicImage>,
+    pub is_directory: bool,
+    pub directory_changes: std::collections::HashSet<PathBuf>,
     project_root: Option<PathBuf>,
     pub commits: crate::git_links::GitLinks,
 }
@@ -45,8 +48,41 @@ impl Document {
     pub fn load(path: PathBuf, options: mdcat::RenderOptions) -> Result<Self> {
         // Resolve relative links from the displayed path, including symlink paths.
         let path = std::env::current_dir()?.join(path);
-        if !std::fs::metadata(&path)?.is_file() {
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_dir() {
+            return Self::load_directory(path);
+        }
+        if !metadata.is_file() {
             bail!("{} is not a regular file", path.display());
+        }
+        if mdcat::is_image_path(&path) {
+            let image = image::ImageReader::open(&path)
+                .with_context(|| format!("Failed to open {}", path.display()))?
+                .with_guessed_format()?
+                .decode()
+                .with_context(|| format!("Failed to decode image {}", path.display()))?;
+            let environment =
+                Environment::for_local_directory(&path.parent().context("Missing image parent")?)?;
+            let project_root = path
+                .ancestors()
+                .skip(1)
+                .find(|dir| dir.join(".git").exists())
+                .map(PathBuf::from);
+            return Ok(Self {
+                path,
+                title: None,
+                source: String::new(),
+                input: String::new(),
+                environment,
+                language: None,
+                json: None,
+                diff: None,
+                image: Some(image),
+                is_directory: false,
+                directory_changes: Default::default(),
+                commits: crate::git_links::GitLinks::new(project_root.clone()),
+                project_root,
+            });
         }
         let source = std::fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -116,6 +152,9 @@ impl Document {
         Ok(Self {
             commits,
             diff,
+            image: None,
+            is_directory: false,
+            directory_changes: Default::default(),
             title,
             project_root,
             language,
@@ -124,6 +163,70 @@ impl Document {
             source,
             input,
             environment,
+        })
+    }
+
+    fn load_directory(path: PathBuf) -> Result<Self> {
+        let mut entries = std::fs::read_dir(&path)
+            .with_context(|| format!("Failed to read directory {}", path.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by(|a, b| {
+            let a_dir = a.path().is_dir();
+            let b_dir = b.path().is_dir();
+            b_dir
+                .cmp(&a_dir)
+                .then_with(|| a.file_name().cmp(&b.file_name()))
+        });
+        let mut input = String::new();
+        for entry in entries {
+            let entry_path = entry.path();
+            let is_dir = entry_path.is_dir();
+            let url = if is_dir {
+                Url::from_directory_path(&entry_path)
+            } else {
+                Url::from_file_path(&entry_path)
+            };
+            let Ok(url) = url else { continue };
+            let label = entry
+                .file_name()
+                .to_string_lossy()
+                .chars()
+                .map(|c| match c {
+                    '\n' | '\r' | '\t' => " ".to_owned(),
+                    '\\' | '[' | ']' => format!("\\{c}"),
+                    c if c.is_control() => "�".to_owned(),
+                    c => c.to_string(),
+                })
+                .collect::<String>();
+            input.push_str(&format!(
+                "- [{label}{}]({url})\n",
+                if is_dir { "/" } else { "" }
+            ));
+        }
+        if input.is_empty() {
+            input.push_str("Empty directory.\n");
+        }
+        let environment = Environment::for_local_directory(&path)?;
+        let project_root = path
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .map(PathBuf::from);
+        let commits = crate::git_links::GitLinks::new(project_root.clone());
+        let directory_changes = crate::git_directory::changed_entries(&path);
+        Ok(Self {
+            path,
+            title: None,
+            source: input.clone(),
+            input,
+            environment,
+            language: None,
+            json: None,
+            diff: None,
+            image: None,
+            is_directory: true,
+            directory_changes,
+            project_root,
+            commits,
         })
     }
 
@@ -148,6 +251,9 @@ impl Document {
             title: crate::git_links::commit_title(&source),
             input: source.clone(),
             diff: Some(crate::diff_view::DiffView::parse(&source)),
+            image: None,
+            is_directory: false,
+            directory_changes: Default::default(),
             source,
             environment: Environment::for_local_directory(&root)?,
             language: Some("diff".into()),

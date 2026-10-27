@@ -7,6 +7,19 @@
 use clap::{ValueEnum, ValueHint};
 use clap_complete::Shell;
 
+/// Model for questions about documents in the built-in viewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum QueryModel {
+    /// Apple Foundation Models, running on device.
+    Apple,
+    /// OpenAI GPT-6 Luna.
+    Luna,
+    /// OpenAI GPT-6.1 Terra.
+    Terra,
+    /// OpenAI GPT-6.1 Sol.
+    Sol,
+}
+
 /// Which colour theme to use for rendering.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum ThemeChoice {
@@ -195,6 +208,9 @@ pub struct CommonArgs {
     /// Render one file in the built-in Ratatui analyzer (requires a terminal).
     #[arg(long, visible_alias = "browse", conflicts_with_all = ["watch", "paginate", "no_pager"])]
     pub analyzer: bool,
+    /// Model for questions in browse mode (default: apple).
+    #[arg(short = 'm', long, value_enum)]
+    pub model: Option<QueryModel>,
     /// Files to read.  If - read from standard input instead.
     #[arg(default_value="-", value_hint = ValueHint::FilePath)]
     pub filenames: Vec<String>,
@@ -301,7 +317,7 @@ impl CommonArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{Args, QueryModel};
     use clap::{CommandFactory, Parser};
 
     #[test]
@@ -338,5 +354,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn query_model_accepts_each_short_and_long_option() {
+        for (name, expected) in [
+            ("apple", QueryModel::Apple),
+            ("luna", QueryModel::Luna),
+            ("terra", QueryModel::Terra),
+            ("sol", QueryModel::Sol),
+        ] {
+            for flag in ["-m", "--model"] {
+                let args =
+                    Args::try_parse_from(["mdcat", "--browse", flag, name, "doc.md"]).unwrap();
+                assert_eq!(args.command.model, Some(expected));
+            }
+        }
+        assert!(Args::try_parse_from(["mdcat", "--model", "unknown"]).is_err());
     }
 }

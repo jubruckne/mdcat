@@ -829,6 +829,26 @@ pub fn push_linked_text<'e, I>(
 where
     I: Iterator<Item = Event<'e>>,
 {
+    push_linked_text_with_table_width(
+        settings,
+        environment,
+        resource_handler,
+        events,
+        settings.terminal_size.columns,
+    )
+}
+
+/// Render linked text with a separate column limit for tables.
+pub fn push_linked_text_with_table_width<'e, I>(
+    settings: &Settings,
+    environment: &Environment,
+    resource_handler: &dyn ResourceUrlHandler,
+    events: I,
+    table_columns: u16,
+) -> Result<(Text<'static>, Vec<LinkRegion>)>
+where
+    I: Iterator<Item = Event<'e>>,
+{
     let tty_settings = Settings {
         terminal_capabilities: TerminalProgram::Ansi.capabilities(),
         terminal_size: settings.terminal_size,
@@ -837,12 +857,13 @@ where
         syntax_theme: settings.syntax_theme.clone(),
     };
     let mut output = Vec::new();
-    crate::push_tty(
+    crate::push_tty_with_table_width(
         &tty_settings,
         environment,
         resource_handler,
         &mut output,
         events,
+        table_columns,
     )?;
     let output =
         String::from_utf8(output).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;

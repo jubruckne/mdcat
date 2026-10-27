@@ -272,6 +272,22 @@ mod cli {
     }
 
     #[test]
+    fn image_file_argument_renders_using_terminal_image_protocol() {
+        let output = run_cargo_mdcat([
+            "--ansi",
+            "--image-protocol=kitty",
+            "--no-pager",
+            "sample/rust-logo-128x128.png",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.windows(3).any(|bytes| bytes == b"\x1b_G"));
+    }
+
+    #[test]
     fn image_protocol_env_var_forces_iterm2_escape_sequence() {
         let mut child = cargo_mdcat()
             .args(["--ansi", "-"])

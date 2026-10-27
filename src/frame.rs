@@ -101,7 +101,11 @@ pub(crate) fn write_frame(
         .split('\n')
         .filter(|_| !body.trim_matches('\n').is_empty())
     {
-        for wrapped in textwrap::wrap(line, width) {
+        // HyphenSplitter also sees hyphens inside OSC hyperlink targets and can
+        // split the escape sequence, exposing the rest of the URL as text.
+        let options =
+            textwrap::Options::new(width).word_splitter(textwrap::WordSplitter::NoHyphenation);
+        for wrapped in textwrap::wrap(line, options) {
             write_row(writer, &wrapped, width, ansi)?;
         }
     }
@@ -135,6 +139,49 @@ mod tests {
             })
             .collect();
         assert_eq!(text, "QuotedBodyLater");
+    }
+
+    #[test]
+    fn framing_preserves_hyperlink_escape_sequences() {
+        let markdown = "Every declared material observation is retained and interpreted in \
+            [material-observation-dispositions.json](material-observation-dispositions.json), \
+            including improvements and negative";
+        let env =
+            pulldown_cmark_mdcat::Environment::for_local_directory(&"/tmp/hyphenated-directory")
+                .unwrap();
+        let syntax_set = SyntaxSet::default();
+        for width in [36, 76, 96, 144] {
+            let settings = Settings {
+                terminal_capabilities: TerminalProgram::Ansi.capabilities(),
+                terminal_size: TerminalSize::default().with_max_columns(width),
+                syntax_set: &syntax_set,
+                theme: Theme::default(),
+                syntax_theme: None,
+            };
+            let mut rendered = Vec::new();
+            pulldown_cmark_mdcat::push_tty(
+                &settings,
+                &env,
+                &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+                &mut rendered,
+                Parser::new(markdown),
+            )
+            .unwrap();
+            let mut output = Vec::new();
+            write_frame(&mut output, "", &rendered, &settings).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            let rendered = String::from_utf8(rendered).unwrap();
+            // The hidden target must stay intact, even when the visible label wraps.
+            for osc in rendered.split_inclusive("\x1b\\") {
+                if let Some(start) = osc.find("\x1b]") {
+                    let sequence = &osc[start..];
+                    assert!(output.contains(sequence), "width {width}: {output:?}");
+                }
+            }
+            for line in output.lines() {
+                assert_eq!(display_width(line), usize::from(width) + 4, "{line:?}");
+            }
+        }
     }
 
     #[test]

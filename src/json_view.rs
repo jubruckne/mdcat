@@ -1,6 +1,6 @@
 //! A foldable JSON view that retains source tokens, field order, and duplicate keys.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use ratatui::{
@@ -37,6 +37,7 @@ pub struct JsonView {
     rows: Vec<Row>,
     collapsed: HashSet<usize>,
     pub cursor: usize,
+    initial_layout_pending: bool,
 }
 
 impl JsonView {
@@ -79,6 +80,7 @@ impl JsonView {
             rows: Vec::new(),
             collapsed: HashSet::new(),
             cursor: 0,
+            initial_layout_pending: true,
         };
         view.rebuild(0);
         Some(view)
@@ -213,6 +215,32 @@ impl JsonView {
         self.rebuild(selected);
     }
 
+    /// Apply the initial fold policy once, after the viewer knows its available height.
+    pub fn prepare_for_height(&mut self, height: usize) {
+        if !self.initial_layout_pending || height == 0 {
+            return;
+        }
+        self.initial_layout_pending = false;
+        if self.rows.len() <= height {
+            return;
+        }
+        for node in 1..self.nodes.len() {
+            let mut depth = 0;
+            let mut parent = self.nodes[node].parent;
+            while let Some(index) = parent {
+                depth += 1;
+                parent = self.nodes[index].parent;
+            }
+            if self
+                .count(node)
+                .is_some_and(|count| count > 0 && (depth >= 2 || (depth == 1 && count > 8)))
+            {
+                self.collapsed.insert(node);
+            }
+        }
+        self.rebuild(0);
+    }
+
     pub fn focus_column(&self) -> usize {
         self.rows[self.cursor].depth * 2
     }
@@ -235,6 +263,58 @@ impl JsonView {
             }
         }
         strings
+    }
+
+    // Choose one varying string field per array, based on its first four items.
+    // Using a shared field keeps previews consistent across all rows in the array.
+    fn varying_string_fields(&self, source: &str) -> HashMap<usize, String> {
+        let mut fields = HashMap::new();
+        for (array_id, node) in self.nodes.iter().enumerate() {
+            let Kind::Array(items) = &node.kind else {
+                continue;
+            };
+            let sample = &items[..items.len().min(4)];
+            if sample.len() < 2 {
+                continue;
+            }
+            let Kind::Object(first) = &self.nodes[sample[0]].kind else {
+                continue;
+            };
+            for (range, value) in first {
+                if !matches!(self.nodes[*value].kind, Kind::String) {
+                    continue;
+                }
+                let Ok(name) = serde_json::from_str::<String>(&source[range.clone()]) else {
+                    continue;
+                };
+                let Ok(first_value) =
+                    serde_json::from_str::<String>(&source[self.nodes[*value].range.clone()])
+                else {
+                    continue;
+                };
+                let differs = sample.iter().skip(1).any(|id| {
+                    let Kind::Object(members) = &self.nodes[*id].kind else {
+                        return true;
+                    };
+                    let matching = members.iter().find(|(key, _)| {
+                        serde_json::from_str::<String>(&source[key.clone()])
+                            .is_ok_and(|key| key == name)
+                    });
+                    matching.is_none_or(|(_, other)| {
+                        !matches!(self.nodes[*other].kind, Kind::String)
+                            || serde_json::from_str::<String>(
+                                &source[self.nodes[*other].range.clone()],
+                            )
+                            .map_or(true, |value| value != first_value)
+                    })
+                });
+                if differs {
+                    fields.insert(array_id, name);
+                    break;
+                }
+            }
+        }
+        fields
     }
 
     pub fn render(&self, source: &str, dark: bool) -> Text<'static> {
@@ -265,6 +345,7 @@ impl JsonView {
         } else {
             Color::Rgb(100, 100, 100)
         });
+        let varying_fields = self.varying_string_fields(source);
         Text::from(
             self.rows
                 .iter()
@@ -286,18 +367,81 @@ impl JsonView {
                         }
                         if let Some(count) = count {
                             let object = matches!(node.kind, Kind::Object(_));
-                            spans.push(Span::raw(match (object, count == 0, folded) {
-                                (true, true, _) => "{}",
-                                (false, true, _) => "[]",
-                                (true, false, true) => "{…}",
-                                (false, false, true) => "[…]",
-                                (true, false, false) => "{",
-                                (false, false, false) => "[",
-                            }));
+                            if folded {
+                                if let Kind::Object(members) = &node.kind {
+                                    let scalar = |id: usize| {
+                                        !matches!(
+                                            self.nodes[id].kind,
+                                            Kind::Object(_) | Kind::Array(_)
+                                        )
+                                    };
+                                    let preferred =
+                                        ["name", "key", "id", "index"].iter().find_map(|name| {
+                                            members.iter().find(|(range, id)| {
+                                                scalar(*id)
+                                                    && serde_json::from_str::<String>(
+                                                        &source[range.clone()],
+                                                    )
+                                                    .is_ok_and(|key| key.eq_ignore_ascii_case(name))
+                                            })
+                                        });
+                                    let varying = self.nodes[row.node]
+                                        .parent
+                                        .and_then(|parent| varying_fields.get(&parent))
+                                        .and_then(|name| {
+                                            members.iter().find(|(range, id)| {
+                                                matches!(self.nodes[*id].kind, Kind::String)
+                                                    && serde_json::from_str::<String>(
+                                                        &source[range.clone()],
+                                                    )
+                                                    .is_ok_and(|key| key == *name)
+                                            })
+                                        });
+                                    let preview = preferred.or(varying).or_else(|| {
+                                        members.iter().find(|(_, id)| {
+                                            matches!(self.nodes[*id].kind, Kind::String)
+                                        })
+                                    });
+                                    if let Some((range, id)) = preview {
+                                        let value = &self.nodes[*id];
+                                        let value_style = match value.kind {
+                                            Kind::String => string,
+                                            Kind::Number => number,
+                                            _ => literal,
+                                        };
+                                        spans.push(Span::raw("{ "));
+                                        spans.push(Span::styled(
+                                            source[range.clone()].to_owned(),
+                                            key,
+                                        ));
+                                        spans.push(Span::raw(": "));
+                                        spans.push(Span::styled(
+                                            source[value.range.clone()].to_owned(),
+                                            value_style,
+                                        ));
+                                        spans.push(Span::raw(", … }"));
+                                    } else {
+                                        spans.push(Span::raw("{…}"));
+                                    }
+                                } else {
+                                    spans.push(Span::raw("["));
+                                    spans.push(Span::styled(count.to_string(), muted));
+                                    spans.push(Span::raw("]"));
+                                }
+                            } else {
+                                spans.push(Span::raw(match (object, count == 0) {
+                                    (true, true) => "{}",
+                                    (false, true) => "[]",
+                                    (true, false) => "{",
+                                    (false, false) => "[",
+                                }));
+                            }
                             if (folded || count == 0) && row.comma {
                                 spans.push(Span::raw(","));
                             }
-                            spans.push(Span::styled(format!(" ({count})"), muted));
+                            if !object && !folded && count >= 10 {
+                                spans.push(Span::styled(format!(" ({count})"), muted));
+                            }
                         } else {
                             let style = match node.kind {
                                 Kind::String => string,
@@ -443,7 +587,7 @@ mod tests {
         let view = JsonView::parse(source).unwrap();
         assert_eq!(view.count(0), Some(4));
         let rendered = content(&view, source);
-        assert!(rendered.contains("(4)"));
+        assert!(!rendered.contains("(4)"));
         assert!(
             rendered.find("\"z\": \"same\"").unwrap() < rendered.find("\"a\": \"same\"").unwrap()
         );
@@ -488,9 +632,10 @@ mod tests {
             .unwrap();
         assert!(view.toggle(config));
         let folded = content(&view, source);
-        assert!(folded.contains("\"config\": {…}, (2)"));
-        assert!(!folded.contains("\"mode\""));
-        assert!(folded.contains("(0)"));
+        assert!(folded.contains("\"config\": { \"mode\": \"x\", … },"));
+        assert!(!folded.contains("\"items\""));
+        assert!(folded.contains("\"empty\": []"));
+        assert!(!folded.contains("(0)"));
         assert!(view.expand());
         assert_eq!(content(&view, source), expanded);
         view.fold_all(true);
@@ -508,12 +653,73 @@ mod tests {
             .unwrap();
         view.select_row(array);
         assert!(view.collapse());
-        assert!(content(&view, source).contains("[…] (3)"));
+        assert!(content(&view, source).contains("[3]"));
         assert!(!view.collapse()); // Move to the parent container.
         assert_eq!(
             &source[view.rows[view.cursor].key.clone().unwrap()],
             "\"config\""
         );
+    }
+
+    #[test]
+    fn counts_large_open_containers_and_embeds_folded_counts() {
+        let source = r#"{"cases":{"a":0,"b":0,"c":0,"d":0,"e":0,"f":0,"g":0,"h":0,"i":0,"j":0,"k":0},"items":[0,1,2,3,4,5,6,7,8,9],"nine":[0,1,2,3,4,5,6,7,8]}"#;
+        let mut view = JsonView::parse(source).unwrap();
+        let expanded = content(&view, source);
+        assert!(expanded.contains("\"cases\": {\n"));
+        assert!(expanded.contains("\"items\": [ (10)"));
+        assert!(expanded.contains("\"nine\": [\n"));
+        view.fold_all(true);
+        let folded = content(&view, source);
+        assert!(folded.contains("\"cases\": {…},"));
+        assert!(folded.contains("\"items\": [10],"));
+        assert!(folded.contains("\"nine\": [9]"));
+        assert!(!folded.contains("(11)"));
+    }
+
+    #[test]
+    fn initial_folding_depends_on_height_depth_and_container_size() {
+        let source = r#"{"small":{"nested":{"x":1},"values":[1,2]},"large":[1,2,3,4,5,6,7,8,9],"eight":[1,2,3,4,5,6,7,8]}"#;
+        let mut fits = JsonView::parse(source).unwrap();
+        let expanded = content(&fits, source);
+        fits.prepare_for_height(fits.rows.len());
+        assert_eq!(content(&fits, source), expanded);
+
+        let mut overflowing = JsonView::parse(source).unwrap();
+        overflowing.prepare_for_height(5);
+        let folded = content(&overflowing, source);
+        assert!(folded.contains("\"small\": {\n"));
+        assert!(folded.contains("\"nested\": {…},"));
+        assert!(folded.contains("\"values\": [2]"));
+        assert!(folded.contains("\"large\": [9],"));
+        assert!(folded.contains("\"eight\": [\n"));
+        overflowing.fold_all(false);
+        overflowing.prepare_for_height(5);
+        assert_eq!(content(&overflowing, source), expanded);
+    }
+
+    #[test]
+    fn folded_objects_preview_identifier_or_first_string() {
+        let source = r#"[{"sequence":10,"values":{"x":1},"scope":"sample","case":"test"},{"other":1,"id":"abc","name":"example"},{"items":[1],"child":{},"enabled":true},{"only":[1]},{"index":15,"name":{}}]"#;
+        let mut view = JsonView::parse(source).unwrap();
+        view.fold_all(true);
+        let folded = content(&view, source);
+        assert!(folded.contains("{ \"scope\": \"sample\", … },"));
+        assert!(folded.contains("{ \"name\": \"example\", … },"));
+        assert!(folded.contains("{ \"index\": 15, … }"));
+        assert!(folded.contains("{…}"));
+    }
+
+    #[test]
+    fn array_object_previews_prefer_a_string_that_varies_in_first_four_items() {
+        let source = r#"[{"scope":"same","case":"first","mode":"before"},{"scope":"same","case":"first","mode":"after"},{"scope":"same","case":"second","mode":"before"},{"scope":"same","case":"second","mode":"after"},{"scope":"different","case":"third"}]"#;
+        let mut view = JsonView::parse(source).unwrap();
+        view.fold_all(true);
+        let folded = content(&view, source);
+        assert!(folded.contains("{ \"case\": \"first\", … },"));
+        assert!(folded.contains("{ \"case\": \"second\", … },"));
+        assert!(folded.contains("{ \"case\": \"third\", … }"));
+        assert!(!folded.contains("\"scope\""));
     }
 
     #[test]

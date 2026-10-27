@@ -306,7 +306,44 @@ where
     I: Iterator<Item = Event<'e>>,
     W: Write,
 {
+    push_tty_with_table_width(
+        settings,
+        environment,
+        resource_handler,
+        writer,
+        events,
+        settings.terminal_size.columns,
+    )
+}
+
+/// Render with a separate column limit for tables.
+pub fn push_tty_with_table_width<'a, 'e, W, I>(
+    settings: &Settings,
+    environment: &Environment,
+    resource_handler: &dyn ResourceUrlHandler,
+    writer: &'a mut W,
+    events: I,
+    table_columns: u16,
+) -> Result<()>
+where
+    I: Iterator<Item = Event<'e>>,
+    W: Write,
+{
     use render::*;
+    let table_settings = Settings {
+        terminal_capabilities: terminal::capabilities::TerminalCapabilities {
+            style: settings.terminal_capabilities.style,
+            image: settings.terminal_capabilities.image,
+            marks: settings.terminal_capabilities.marks,
+        },
+        terminal_size: TerminalSize {
+            columns: table_columns,
+            ..settings.terminal_size
+        },
+        syntax_set: settings.syntax_set,
+        theme: settings.theme.clone(),
+        syntax_theme: settings.syntax_theme.clone(),
+    };
     let mut events = h1_rules(
         events,
         settings.theme.h1_rule,
@@ -315,9 +352,14 @@ where
     let StateAndData(final_state, final_data) = events.try_fold(
         StateAndData(State::default(), StateData::default()),
         |StateAndData(state, data), event| {
+            let event_settings = if matches!(&event, Event::End(TagEnd::Table)) {
+                &table_settings
+            } else {
+                settings
+            };
             write_event(
                 writer,
-                settings,
+                event_settings,
                 environment,
                 &resource_handler,
                 state,

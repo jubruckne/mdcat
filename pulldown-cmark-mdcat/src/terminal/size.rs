@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 pub struct PixelSize {
     /// The width of the window, in pixels.
     pub x: u32,
-    // The height of the window, in pixels.
+    /// The height of the window, in pixels.
     pub y: u32,
 }
 

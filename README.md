@@ -19,7 +19,8 @@ Select with arrow keys, j/k, or Tab/Shift+Tab, then press Enter; clicking an ent
 opens it. Directory prefixes shared by at least three links appear once as bold
 tree headers; only file rows are selectable. Page Up/Down, Home/End, and the mouse
 wheel navigate longer lists; a scrollbar appears only when the list overflows.
-An empty list shows a compact notice that fades out over 850 ms; Escape/q dismisses it immediately.
+An empty list shows a compact notice that waits 250 ms and fades out over 500 ms; Escape/q
+dismisses it immediately.
 Keyboard selection scrolls the document to the link;
 repeated links use neighboring entries to choose the occurrence. The selected link
 is underlined in the document. Heading fragments are hidden in displayed Markdown
@@ -42,11 +43,21 @@ Hover over a local file link to underline it and show its full path relative to 
 working directory in the footer. Escape or q closes only the deepest document window;
 at the original document, it exits the viewer. Backspace or Left also returns to the
 parent document and its previous scroll position. Relative paths resolve against the current
-document; heading fragments and table-of-contents links are supported. Existing
-file paths written as inline code are navigable too, resolving first against
+document; heading fragments and table-of-contents links are supported. Press Ctrl+F to search
+the rendered document and highlight matches as you type. Press Enter to finish, Left/Right or
+`n`/`N` to move between matches, and Escape to clear the search. Existing file paths written as inline
+code are navigable too, resolving first against
 the document directory and then the nearest Git repository root. Existing path
 arguments in command examples (including fenced code blocks) are clickable and
 appear in the link picker too. Opening one displays the file in a nested viewer.
+Press Ctrl+N to open the current file in nano; shell aliases are honored, and the viewer reloads
+the file when nano exits.
+Directory links open a nested listing with links to subdirectories and files. Use Up/Down to
+select an entry and Enter to open it. In a Git repository, changed and untracked entries are
+shown in yellow; directories are yellow when they contain changes.
+Raster image files can be opened directly or from links: browse mode fits them in the window,
+using terminal graphics when available and colored character cells as a fallback. In normal mode,
+image files use the terminal's configured image protocol and fit within half of its width and height.
 Attach `:172` (or `#L172`) to a path to jump to source line 172; this works with
 clicks and the link picker. Line links to Markdown files show their literal source.
 Line numbers beyond the file's end jump to its last line.
@@ -58,7 +69,11 @@ Use an ordinary click, without Command, so Ghostty passes it to mdcat.
 The normal less pager keeps its existing behavior.
 
 JSON files use a structured view with distinct colors for keys, strings, numbers,
-and literals. Objects and arrays show compact `(count)` annotations. Select rows with Up/Down
+and literals. Collapsed objects preview an identifying or first string-valued property, while collapsed
+arrays show their element count inside brackets. Open arrays show a count when they have at least
+ten elements. If the expanded tree exceeds
+the window height on opening, deeper containers and large first-level containers start collapsed.
+Select rows with Up/Down
 or j/k; Enter/Space or a click folds a container, Left collapses or selects its parent,
 and Right expands. `c` folds nested containers; `e` expands all. Page Up/Down and
 Home/End navigate the tree. File links still open in nested windows, and Tab lists
@@ -66,9 +81,9 @@ links even inside folded sections. Backspace returns to the parent document.
 Field order, duplicate keys, and original value tokens are preserved. Invalid JSON
 falls back to syntax-highlighted text. Source-line links open the original source.
 
-Press `?` to open a prompt popup and ask about the document using Apple's on-device Foundation Models.
-Opening the prompt starts background prewarming of both the title and answer sessions,
-including their instructions and shared prompt prefixes. Submission reuses those sessions.
+Press `?` to open a prompt popup and ask about the document. By default this uses Apple's on-device Foundation Models.
+With Apple models, opening the prompt starts background prewarming of both the title and answer
+sessions, including their instructions and shared prompt prefixes. Submission reuses those sessions.
 Type a question and press Enter. A small floating window appears immediately with a spinner.
 When the model generates a title, it types into the caption character by character;
 the window expands from 5 to 64 columns over 100 ms once the title is ready.
@@ -79,11 +94,20 @@ and revealed character by character while preserving that formatting.
 Drag its title bar or use arrow keys (h/j/k/l) to move it; Page Up/Down or the mouse wheel
 scroll the answer. Escape or Tab closes the popup/window, and `?` asks a follow-up.
 Ctrl+L in the response window clears the conversation when idle.
-Queries require Apple Silicon, macOS 26+, and Apple Intelligence with its model downloaded;
-building on macOS requires Xcode 26+. No remote LLM is used. Answers use selected,
-line-numbered source excerpts and a bounded recent conversation, so relevant text can be omitted.
-The character budgets are 18,000 for document passages, 1,500 for recent conversation,
-and 500 for the question; these are approximate context budgets rather than token counts.
+The Apple provider requires Apple Silicon, macOS 26+, and Apple Intelligence with its model downloaded;
+building on macOS requires Xcode 26+. Select a query model with `-m`/`--model`: `apple`, `luna`
+(`gpt-6-luna`), `terra` (`gpt-6.1-terra`), or `sol` (`gpt-6.1-sol`). The OpenAI models use low
+reasoning effort and require `OPENAI_API_KEY`. For example, use `mdcat --browse -m luna file.md`.
+Without an explicit model, Apple is the default; `MDCAT_QUERY_PROVIDER=openai` selects Luna by
+default. An explicit model takes precedence. OpenAI requests send the complete line-numbered
+document, question, and recent conversation to OpenAI.
+Opening the prompt also sends the document and instructions in a background OpenAI cache-prewarm
+request; this is billed as a cache write. OpenAI retains the cache remotely, and a failed prewarm
+falls back to a normal answer request.
+The Apple provider uses selected line-numbered excerpts, so relevant text can be omitted.
+Its document passage budget is 18,000 characters; both providers use up to 1,500 characters
+of recent conversation and 500 characters for the question. These are character budgets rather
+than token counts; very large documents can exceed the OpenAI model's context limit.
 
 ![mdcat showcase with different colour themes][sxs]
 
