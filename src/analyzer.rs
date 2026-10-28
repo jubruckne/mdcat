@@ -31,7 +31,8 @@ pub fn run(
     model: Option<mdcat::args::QueryModel>,
 ) -> Result<()> {
     let working_directory = std::env::current_dir()?;
-    let mut document = crate::navigation::Document::load(filename.into(), options)?;
+    let (mut document, initial_line) =
+        crate::navigation::Document::load_argument(filename, options)?;
     let mut query = crate::query::Query::new(model);
     let mut response = ResponseWindow {
         no_colour,
@@ -54,6 +55,7 @@ pub fn run(
         let mut rendered_width = None;
         let mut scroll = 0usize;
         let mut dragging_scrollbar = false;
+        let mut selection = crate::text_selection::Selection::default();
         let mut links = Vec::<pulldown_cmark_mdcat::ratatui::LinkRegion>::new();
         let mut selected: Option<String> = None;
         let mut mouse_position = None;
@@ -62,7 +64,7 @@ pub fn run(
         let mut history: Vec<(crate::navigation::Document, usize, Option<String>)> = Vec::new();
         let mut status = String::new();
         let mut zero_match_notice: Option<(std::time::Instant, String)> = None;
-        let mut pending_anchor: Option<String> = None;
+        let mut pending_anchor = initial_line.map(|line| format!("L{line}"));
         let mut search = Search::default();
         let mut image_picker: Option<ratatui_image::picker::Picker> = None;
         let mut image_state: Option<(
@@ -110,6 +112,18 @@ pub fn run(
             } else {
                 image_state = None;
             }
+            if let Some(view) = document.directory_view.as_mut() {
+                if view.height != height {
+                    view.height = height;
+                    rendered_width = None;
+                }
+            }
+            if let Some(view) = document.file_history.as_mut() {
+                if view.height != height {
+                    view.height = height;
+                    rendered_width = None;
+                }
+            }
             if let Some(json) = document.json.as_mut() {
                 json.prepare_for_height(height);
             }
@@ -143,7 +157,11 @@ pub fn run(
             }
             response.refresh(area, &query, spinner[tick as usize], &response_renderer);
             response.advance_resize();
-            let width = if document.diff.is_some() {
+            let width = if document.diff.is_some()
+                || document.blame.is_some()
+                || document.file_history.is_some()
+                || document.directory_view.is_some()
+            {
                 width
             } else {
                 match columns {
@@ -153,6 +171,7 @@ pub fn run(
                 }
             };
             if rendered_width != Some((width, table_width)) {
+                selection = crate::text_selection::Selection::default();
                 let settings = Settings {
                     terminal_size: pulldown_cmark_mdcat::TerminalSize {
                         columns: width,
@@ -227,9 +246,22 @@ pub fn run(
                 }
             }
             scroll = scroll.min(max_scroll);
+            if !query.open && !response.visible && link_picker.is_none() {
+                scroll = selection.auto_scroll(
+                    mouse_position,
+                    area,
+                    scroll,
+                    max_scroll,
+                    std::time::Instant::now(),
+                );
+            }
             let hovered = mouse_position
                 .filter(|_| {
-                    !query.open && !response.visible && !dragging_scrollbar && link_picker.is_none()
+                    !query.open
+                        && !response.visible
+                        && !dragging_scrollbar
+                        && !selection.dragging
+                        && link_picker.is_none()
                 })
                 .and_then(|(column, row)| link_at(&links, area, scroll, column, row))
                 .filter(|link| document.can_open(&link.target))
@@ -329,6 +361,18 @@ pub fn run(
                             })
                     },
                 );
+                if let Some(blame) = &document.blame {
+                    let style = if no_colour || crossterm::style::Colored::ansi_color_disabled() {
+                        Style::default().add_modifier(ratatui::style::Modifier::BOLD)
+                    } else {
+                        Style::default().bg(if settings.theme.is_dark {
+                            Color::Rgb(48, 58, 76)
+                        } else {
+                            Color::Rgb(224, 234, 250)
+                        })
+                    };
+                    blame.highlight_commit(frame, &text, area, scroll, hovered, style);
+                }
                 if let Some(json) = document.json.as_ref() {
                     if json.cursor >= scroll && json.cursor < scroll + height {
                         let column = json.focus_column();
@@ -352,6 +396,7 @@ pub fn run(
                     scroll,
                     no_colour || crossterm::style::Colored::ansi_color_disabled(),
                 );
+                selection.highlight(frame, &text, area, scroll);
                 let hovered_path =
                     hovered.and_then(|target| hover_path(&document, target, &working_directory));
                 let hint_width = area.width.saturating_sub(
@@ -367,13 +412,26 @@ pub fn run(
                 } else {
                     None
                 };
+                let directory_footer = document.directory_view.as_ref().map(|view| view.footer());
                 let hint = if let Some((hint, _)) = search_footer.as_ref() {
                     hint.as_str()
                 } else if let Some(path) = hovered_path.as_deref() {
                     path
                 } else if status.is_empty() {
-                    if document.json.is_some() {
-                        " Enter: fold · c/e: fold/expand all · Tab: links "
+                    if let Some(footer) = directory_footer.as_deref() {
+                        footer
+                    } else if document.file_history.is_some() {
+                        " Ctrl+H: back · ↑↓: select · Space/right click: base · Enter: diff · Tab: focus · PgUp/Dn: scroll · Ctrl+F: find "
+                    } else if document.blame.is_some() {
+                        " Ctrl+B: back · click commit: diff · Ctrl+F: search "
+                    } else if document.json.is_some() {
+                        " Enter: fold · c/e: fold/expand all · Ctrl+B: blame "
+                    } else if document.is_formatted() {
+                        " Formatted view · Ctrl+O: original · Tab: links "
+                    } else if document.can_format() {
+                        " Ctrl+B: blame · Ctrl+H: history · Ctrl+O: format "
+                    } else if document.path.is_file() && document.image.is_none() {
+                        " Ctrl+B: blame · Ctrl+H: history · Ctrl+F: search "
                     } else {
                         ""
                     }
@@ -481,7 +539,11 @@ pub fn run(
             } else {
                 100
             };
-            if !event::poll(std::time::Duration::from_millis(refresh_ms))? {
+            let mut poll_timeout = std::time::Duration::from_millis(refresh_ms);
+            if !query.open && !response.visible && link_picker.is_none() {
+                poll_timeout = selection.poll_timeout(poll_timeout, std::time::Instant::now());
+            }
+            if !event::poll(poll_timeout)? {
                 continue;
             }
             let mut open_target = None;
@@ -706,6 +768,82 @@ pub fn run(
                 }
                 Event::Key(key)
                     if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Esc
+                        && selection.active() =>
+                {
+                    selection = crate::text_selection::Selection::default();
+                    status.clear();
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && document.directory_view.is_some()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && matches!(
+                            key.code,
+                            KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::Tab
+                                | KeyCode::Enter
+                                | KeyCode::Esc
+                                | KeyCode::Backspace
+                                | KeyCode::Home
+                                | KeyCode::End
+                                | KeyCode::PageUp
+                                | KeyCode::PageDown
+                                | KeyCode::Char('j' | 'k' | 'f' | 'r' | 'd' | 'q' | ' ')
+                        ) =>
+                {
+                    match document.directory_view.as_mut().unwrap().key(key.code) {
+                        Ok(crate::directory_view::Action::Open(path)) => {
+                            open_target = Some(
+                                url::Url::from_file_path(path)
+                                    .map_err(|_| anyhow::anyhow!("Invalid file path"))?
+                                    .to_string(),
+                            )
+                        }
+                        Ok(crate::directory_view::Action::Preview) => {
+                            open_target = Some("mdcat-directory-diff:".into())
+                        }
+                        Ok(crate::directory_view::Action::Close) => {
+                            if history.is_empty() {
+                                break;
+                            }
+                            go_back = true;
+                        }
+                        Ok(crate::directory_view::Action::None) => (),
+                        Err(error) => status = format!(" {error:#} "),
+                    }
+                    rendered_width = None;
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && document.file_history.is_some()
+                        && !(matches!(key.code, KeyCode::Char('b' | 'c'))
+                            && key.modifiers.contains(KeyModifiers::CONTROL)) =>
+                {
+                    match document.file_history.as_mut().unwrap().key(key) {
+                        Ok(crate::history_view::Action::Open) => {
+                            open_target = Some("mdcat-history-diff:".into())
+                        }
+                        Ok(crate::history_view::Action::Close) => go_back = true,
+                        Ok(crate::history_view::Action::None) => (),
+                        Err(error) => status = format!(" {error:#} "),
+                    }
+                    rendered_width = None;
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('h')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    open_target = Some("mdcat-history:".into());
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
                         && key.code == KeyCode::Char('f')
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
@@ -717,6 +855,37 @@ pub fn run(
                     search.original_current = search.current;
                     search.original_status.clone_from(&status);
                     search.original_json_cursor = document.json.as_ref().map(|json| json.cursor);
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('b')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if document.blame.is_some() {
+                        go_back = true;
+                    } else {
+                        open_target = Some("mdcat-blame:".into());
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('o')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    match document.toggle_formatting() {
+                        Ok(formatted) => {
+                            status = if formatted {
+                                " Formatted view · Ctrl+O: original · file unchanged ".into()
+                            } else {
+                                " Original source ".into()
+                            };
+                            rendered_width = None;
+                            scroll = 0;
+                            selected = None;
+                            search = Search::default();
+                        }
+                        Err(error) => status = format!(" {error:#} "),
+                    }
                 }
                 Event::Key(key)
                     if key.kind != KeyEventKind::Release
@@ -917,7 +1086,7 @@ pub fn run(
                 Event::Key(key) if key.kind != KeyEventKind::Release => match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        if history.is_empty() {
+                        if history.is_empty() && document.original_view.is_none() {
                             break;
                         }
                         go_back = true;
@@ -967,6 +1136,32 @@ pub fn run(
                     MouseEventKind::ScrollUp => response.scroll = response.scroll.saturating_sub(3),
                     _ => {}
                 },
+                Event::Mouse(mouse) if document.directory_view.is_some() => {
+                    if !matches!(
+                        mouse.kind,
+                        MouseEventKind::Moved | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
+                    ) {
+                        if let Err(error) =
+                            document.directory_view.as_mut().unwrap().mouse(mouse, area)
+                        {
+                            status = format!(" {error:#} ");
+                        }
+                        rendered_width = None;
+                    }
+                }
+                Event::Mouse(mouse) if document.file_history.is_some() => {
+                    if !matches!(
+                        mouse.kind,
+                        MouseEventKind::Moved | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
+                    ) {
+                        if let Err(error) =
+                            document.file_history.as_mut().unwrap().mouse(mouse, area)
+                        {
+                            status = format!(" {error:#} ");
+                        }
+                        rendered_width = None;
+                    }
+                }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left)
                         if max_scroll > 0
@@ -976,6 +1171,7 @@ pub fn run(
                             && mouse.row > area.y
                             && mouse.row < area.bottom() - 1 =>
                     {
+                        selection = crate::text_selection::Selection::default();
                         dragging_scrollbar = true;
                         scroll = scrollbar_position(mouse.row, area, max_scroll);
                     }
@@ -985,35 +1181,75 @@ pub fn run(
                             && mouse.row > area.y
                             && mouse.row < area.bottom().saturating_sub(1) =>
                     {
-                        let row = scroll + usize::from(mouse.row - area.y - 1);
-                        let folded = document
-                            .diff
-                            .as_mut()
-                            .and_then(|diff| diff.toggle(row, true));
-                        if folded.is_some() {
-                            rendered_width = None;
-                        } else {
-                            open_target = link_at(&links, area, scroll, mouse.column, mouse.row)
-                                .map(|link| link.target.clone());
-                        }
-                        if open_target.is_none() {
-                            if let Some(json) = document.json.as_mut() {
-                                let row = scroll + usize::from(mouse.row - area.y - 1);
-                                // Clamp to real rows rather than a click below the document.
-                                let old = json.cursor;
-                                json.cursor = row;
-                                if row < text.lines.len() {
-                                    if json.toggle(row) {
-                                        rendered_width = None;
+                        selection.start(
+                            crate::text_selection::Point::at(mouse.column, mouse.row, area, scroll),
+                            mouse.modifiers.contains(KeyModifiers::CONTROL),
+                        );
+                        status.clear();
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if selection.dragging => {
+                        selection.extend(crate::text_selection::Point::at(
+                            mouse.column,
+                            mouse.row,
+                            area,
+                            scroll,
+                        ));
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if selection.dragging => {
+                        selection.extend(crate::text_selection::Point::at(
+                            mouse.column,
+                            mouse.row,
+                            area,
+                            scroll,
+                        ));
+                        selection.dragging = false;
+                        if selection.active() {
+                            let contents = selection.contents(&text);
+                            if !contents.is_empty() {
+                                status = match crate::text_selection::copy(&contents) {
+                                    Ok(()) => " Selection copied · Esc: clear ".into(),
+                                    Err(error) => format!(" Could not copy selection: {error:#} "),
+                                };
+                            }
+                        } else if mouse.column >= area.x + 2
+                            && mouse.column < area.right().saturating_sub(2)
+                            && mouse.row > area.y
+                            && mouse.row < area.bottom().saturating_sub(1)
+                        {
+                            let row = scroll + usize::from(mouse.row - area.y - 1);
+                            let folded = document
+                                .diff
+                                .as_mut()
+                                .and_then(|diff| diff.toggle(row, true));
+                            if folded.is_some() {
+                                rendered_width = None;
+                            } else {
+                                open_target =
+                                    link_at(&links, area, scroll, mouse.column, mouse.row)
+                                        .map(|link| link.target.clone());
+                            }
+                            if open_target.is_none() {
+                                if let Some(json) = document.json.as_mut() {
+                                    let row = scroll + usize::from(mouse.row - area.y - 1);
+                                    // Clamp to real rows rather than a click below the document.
+                                    let old = json.cursor;
+                                    json.cursor = row;
+                                    if row < text.lines.len() {
+                                        if json.toggle(row) {
+                                            rendered_width = None;
+                                        }
+                                    } else {
+                                        json.cursor = old;
                                     }
-                                } else {
-                                    json.cursor = old;
                                 }
                             }
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) if dragging_scrollbar => {
                         scroll = scrollbar_position(mouse.row, area, max_scroll);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        selection = crate::text_selection::Selection::default();
                     }
                     MouseEventKind::Up(MouseButton::Left) => dragging_scrollbar = false,
                     MouseEventKind::ScrollDown => scroll = scroll.saturating_add(3),
@@ -1034,11 +1270,21 @@ pub fn run(
                 }
             }
             if go_back {
-                if let Some((previous, position, selection)) = history.pop() {
+                let previous = document
+                    .original_view
+                    .take()
+                    .map(|(doc, position, selection)| (*doc, position, selection))
+                    .or_else(|| history.pop());
+                if let Some((previous, position, selection)) = previous {
                     document = previous;
                     if document.is_directory {
                         document.directory_changes =
                             crate::git_directory::changed_entries(&document.path);
+                    }
+                    if let Some(view) = document.directory_view.as_mut() {
+                        if let Err(error) = view.refresh() {
+                            status = format!(" {error:#} ");
+                        }
                     }
                     scroll = position;
                     selected = selection;
@@ -1052,6 +1298,34 @@ pub fn run(
                 }
             }
             if let Some(target) = open_target {
+                if matches!(target.as_str(), "mdcat-blame:" | "mdcat-history:") {
+                    let source = document
+                        .original_view
+                        .as_ref()
+                        .map_or(&document, |(doc, _, _)| doc.as_ref());
+                    let next = if target == "mdcat-blame:" {
+                        source.open_blame()
+                    } else {
+                        source.open_history()
+                    };
+                    match next {
+                        Ok(next) => {
+                            let mut previous = std::mem::replace(&mut document, next);
+                            document.original_view =
+                                Some(previous.original_view.take().unwrap_or_else(|| {
+                                    (Box::new(previous), scroll, selected.take())
+                                }));
+                            scroll = 0;
+                            rendered_width = None;
+                            selected = None;
+                            dragging_scrollbar = false;
+                            search = Search::default();
+                            status.clear();
+                        }
+                        Err(error) => status = format!(" {error:#} "),
+                    }
+                    continue;
+                }
                 if is_current_document_link(&document, &target) {
                     let url = document.environment.base_url.join(&target)?;
                     pending_anchor = url
@@ -1074,7 +1348,11 @@ pub fn run(
                     continue;
                 }
                 let result = (|| -> Result<_> {
-                    let mut next = if crate::git_links::commit_id(&target).is_some() {
+                    let mut next = if target == "mdcat-directory-diff:" {
+                        document.open_directory_diff()?
+                    } else if target == "mdcat-history-diff:" {
+                        document.open_history_diff()?
+                    } else if crate::git_links::commit_id(&target).is_some() {
                         document.open_commit(&target)?
                     } else {
                         let path = document.destination(&target)?;
@@ -2021,6 +2299,27 @@ fn render_document_with_table_width(
     if document.image.is_some() {
         return Ok((Text::default(), Vec::new()));
     }
+    if let Some(directory) = document.directory_view.as_ref() {
+        return Ok((
+            directory.render(usize::from(table_width), settings.theme.is_dark),
+            Vec::new(),
+        ));
+    }
+    if let Some(history) = document.file_history.as_ref() {
+        return Ok((
+            history.render(usize::from(table_width), settings.theme.is_dark),
+            Vec::new(),
+        ));
+    }
+    if let Some(blame) = document.blame.as_ref() {
+        let (text, links) = blame.render(
+            settings,
+            document.language.as_deref().unwrap_or(""),
+            usize::from(table_width),
+            options.tabs.unwrap_or(4),
+        )?;
+        return Ok(discover_file_links(document, text, links));
+    }
     if let Some(diff) = document.diff.as_ref() {
         return Ok(discover_file_links(
             document,
@@ -2207,6 +2506,10 @@ fn anchor_line_with_table_width(
     options: mdcat::RenderOptions,
     table_width: u16,
 ) -> Result<Option<usize>> {
+    if document.blame.is_some() {
+        return Ok(crate::navigation::source_line(anchor)
+            .map(|line| line.min(document.source.lines().count().max(1)) - 1));
+    }
     if document.language.is_some() {
         if let Some(line) = crate::navigation::source_line(anchor) {
             // Code blocks preserve one rendered row per source line. Determine the
@@ -2298,6 +2601,13 @@ fn available_links(
     options: mdcat::RenderOptions,
 ) -> Vec<String> {
     let mut links = available_file_links(document, options);
+    if let Some(blame) = &document.blame {
+        for target in blame.targets() {
+            if !links.contains(&target) {
+                links.push(target);
+            }
+        }
+    }
     for (_, url) in document.commits.references(&document.source) {
         let target = url.to_string();
         if !links.contains(&target) {
@@ -3236,6 +3546,46 @@ mod tests {
     }
 
     #[test]
+    fn embedded_json_loads_in_logs_and_keeps_context_and_hidden_links() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("example.py"), "print(42)\n").unwrap();
+        for extension in ["txt", "log"] {
+            let path = dir.path().join(format!("output.{extension}"));
+            std::fs::write(
+                &path,
+                "see example.py\nstdout:\n{\"items\":[{\"nested\":{\"file\":\"example.py\"}}]}\nfinished\n",
+            )
+            .unwrap();
+            let mut document = crate::navigation::Document::load(path, Default::default()).unwrap();
+            document.json.as_mut().unwrap().fold_all(true);
+            assert_eq!(available_file_links(&document, Default::default()).len(), 1);
+            let syntax = two_face::syntax::extra_newlines();
+            let settings = Settings {
+                terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+                terminal_size: Default::default(),
+                syntax_set: &syntax,
+                theme: Default::default(),
+                syntax_theme: None,
+            };
+            let (text, links) = render_document(
+                &document,
+                &document.input,
+                &settings,
+                &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+                Default::default(),
+            )
+            .unwrap();
+            assert_eq!(links.len(), 1); // The surrounding text still links to the source.
+            assert_eq!(text.lines.first().unwrap().to_string(), "see example.py");
+            assert_eq!(text.lines.last().unwrap().to_string(), "finished");
+            assert!(text.to_string().contains("\"items\": [1]"));
+            document.show_source(Default::default());
+            assert!(document.json.is_none());
+            assert!(document.input.contains("{\"items\":["));
+        }
+    }
+
+    #[test]
     fn structured_json_keeps_links_in_folded_sections_and_line_links_use_source() {
         let dir = tempfile::tempdir().unwrap();
         let code = dir.path().join("example.py");
@@ -3536,6 +3886,72 @@ mod tests {
                 .unwrap();
             assert_eq!(span.style.fg, Some(expected), "{label}");
         }
+    }
+
+    #[test]
+    fn blame_view_preserves_original_document_and_opens_commits_from_metadata() {
+        let (dir, id) = crate::git_links::tests::repository();
+        let path = dir.path().join("example.txt");
+        std::fs::write(&path, "after\nnew working line\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let blame = document.open_blame().unwrap();
+        assert!(document.blame.is_none());
+        assert!(blame.blame.is_some());
+        assert_eq!(blame.path, document.path);
+        assert_eq!(blame.source, document.source);
+        assert_eq!(blame.title.as_deref(), Some("Blame: example.txt"));
+        assert!(!blame.can_format());
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let resources = pulldown_cmark_mdcat::resources::NoopResourceHandler;
+        let (text, links) = render_document_with_table_width(
+            &blame,
+            &blame.input,
+            &settings,
+            &resources,
+            Default::default(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(text.lines.len(), 2);
+        assert!(text.lines[0].to_string().ends_with("1 │ after"));
+        assert!(text.lines[1].to_string().contains("Working tree"));
+        let target = format!("mdcat-commit:{id}");
+        let link = links.iter().find(|link| link.target == target).unwrap();
+        assert_eq!(link.line, 0);
+        assert_eq!(link.start, 0);
+        assert_eq!(link.end, 8);
+        assert_eq!(
+            available_links(&blame, Default::default()),
+            vec![target.clone()]
+        );
+        let commit = blame.open_commit(&target).unwrap();
+        assert!(commit.diff.is_some());
+        assert!(commit.blame.is_none());
+        assert_eq!(
+            anchor_line_with_table_width(
+                &blame,
+                "L2",
+                &settings,
+                &resources,
+                Default::default(),
+                100
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert!(
+            crate::navigation::Document::load(dir.path().to_owned(), Default::default())
+                .unwrap()
+                .open_blame()
+                .is_err()
+        );
     }
 
     #[test]

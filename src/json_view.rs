@@ -15,6 +15,7 @@ enum Kind {
     String,
     Number,
     Literal,
+    Text,
 }
 
 struct Node {
@@ -34,6 +35,7 @@ struct Row {
 
 pub struct JsonView {
     nodes: Vec<Node>,
+    roots: Vec<usize>,
     rows: Vec<Row>,
     collapsed: HashSet<usize>,
     pub cursor: usize,
@@ -77,11 +79,94 @@ impl JsonView {
         parser.node(None);
         let mut view = Self {
             nodes: parser.nodes,
+            roots: vec![0],
             rows: Vec::new(),
             collapsed: HashSet::new(),
             cursor: 0,
             initial_layout_pending: true,
         };
+        view.rebuild(0);
+        Some(view)
+    }
+
+    /// Recognize complete, line-delimited JSON containers in otherwise literal text.
+    /// Requiring a container at the start of a line avoids interpreting ordinary
+    /// numbers, quoted prose, or bracketed log prefixes as JSON values.
+    pub fn parse_embedded(source: &str) -> Option<Self> {
+        let mut view = Self {
+            nodes: Vec::new(),
+            roots: Vec::new(),
+            rows: Vec::new(),
+            collapsed: HashSet::new(),
+            cursor: 0,
+            initial_layout_pending: true,
+        };
+        let mut offset = 0;
+        let mut found = false;
+        while offset < source.len() {
+            let rest = &source[offset..];
+            let line_end = rest.find('\n').unwrap_or(rest.len());
+            let line = &rest[..line_end];
+            let indent = line.len() - line.trim_start_matches([' ', '\t', '\r']).len();
+            let start = offset + indent;
+            let fragment = if matches!(source.as_bytes().get(start), Some(b'{' | b'[')) {
+                let mut stream = serde_json::Deserializer::from_str(&source[start..])
+                    .into_iter::<serde::de::IgnoredAny>();
+                if stream.next().is_some_and(|value| value.is_ok()) {
+                    let end = start + stream.byte_offset();
+                    let tail = &source[end..];
+                    let tail_end = tail.find('\n').unwrap_or(tail.len());
+                    if tail[..tail_end].trim().is_empty() {
+                        Self::parse(&source[start..end]).map(|json| (json, end + tail_end))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((json, end)) = fragment {
+                let base = view.nodes.len();
+                view.roots.push(base);
+                for mut node in json.nodes {
+                    node.range = node.range.start + start..node.range.end + start;
+                    node.parent = node.parent.map(|id| id + base);
+                    match &mut node.kind {
+                        Kind::Object(members) => {
+                            for (key, id) in members {
+                                *key = key.start + start..key.end + start;
+                                *id += base;
+                            }
+                        }
+                        Kind::Array(items) => {
+                            for id in items {
+                                *id += base;
+                            }
+                        }
+                        _ => {}
+                    }
+                    view.nodes.push(node);
+                }
+                offset = end;
+                found = true;
+            } else {
+                view.roots.push(view.nodes.len());
+                view.nodes.push(Node {
+                    range: offset..offset + line_end,
+                    parent: None,
+                    kind: Kind::Text,
+                });
+                offset += line_end;
+            }
+            if source.as_bytes().get(offset) == Some(&b'\n') {
+                offset += 1;
+            }
+        }
+        if !found {
+            return None;
+        }
         view.rebuild(0);
         Some(view)
     }
@@ -131,7 +216,9 @@ impl JsonView {
 
     fn rebuild(&mut self, selected: usize) {
         self.rows.clear();
-        self.append(0, 0, None, false);
+        for root in self.roots.clone() {
+            self.append(root, 0, None, false);
+        }
         self.cursor = self
             .rows
             .iter()
@@ -206,8 +293,10 @@ impl JsonView {
         self.collapsed.clear();
         if collapse {
             // Keep the root open so its fields remain discoverable.
-            for node in 1..self.nodes.len() {
-                if self.count(node).is_some_and(|count| count > 0) {
+            for node in 0..self.nodes.len() {
+                if self.nodes[node].parent.is_some()
+                    && self.count(node).is_some_and(|count| count > 0)
+                {
                     self.collapsed.insert(node);
                 }
             }
@@ -248,6 +337,9 @@ impl JsonView {
     pub fn strings(&self, source: &str) -> Vec<String> {
         let mut strings = Vec::new();
         for node in &self.nodes {
+            if matches!(node.kind, Kind::Text) {
+                strings.push(source[node.range.clone()].to_owned());
+            }
             if matches!(node.kind, Kind::String) {
                 strings.push(
                     serde_json::from_str(&source[node.range.clone()])
@@ -351,6 +443,9 @@ impl JsonView {
                 .iter()
                 .map(|row| {
                     let node = &self.nodes[row.node];
+                    if matches!(node.kind, Kind::Text) {
+                        return Line::raw(source[node.range.clone()].to_owned());
+                    }
                     let mut spans = vec![Span::raw("  ".repeat(row.depth))];
                     let count = self.count(row.node);
                     if row.closing {
@@ -579,6 +674,48 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn embedded_containers_keep_log_context_and_independent_folds() {
+        let source = "stdout:\n\n{\"kind\":\"plan\",\"items\":[{\"id\":1},{\"id\":2}]}\nstderr: failed\n  [\n    {\"file\":\"example.py\"}\n  ]\nend\n";
+        let mut view = JsonView::parse_embedded(source).unwrap();
+        let expanded = content(&view, source);
+        assert!(expanded.starts_with("stdout:\n\n{\n"));
+        assert!(expanded.contains("\"kind\": \"plan\""));
+        assert!(expanded.contains("stderr: failed\n[\n"));
+        assert!(expanded.ends_with("\nend"));
+        assert!(view.strings(source).contains(&"example.py".to_owned()));
+        assert!(view.strings(source).contains(&"stderr: failed".to_owned()));
+        view.select_row(0);
+        assert!(!view.toggle(0));
+        view.fold_all(true);
+        let folded = content(&view, source);
+        assert!(folded.contains("\"items\": [2]"));
+        assert!(folded.contains("stderr: failed\n[\n  { \"file\": \"example.py\", … }\n]\nend"));
+        let root = view.roots[2];
+        view.select_row(2);
+        assert!(view.toggle(2));
+        assert!(view.collapsed.contains(&root));
+        assert!(content(&view, source).contains("stderr: failed\n["));
+        view.fold_all(false);
+        assert_eq!(content(&view, source), expanded);
+    }
+
+    #[test]
+    fn embedded_detection_leaves_prose_invalid_and_partial_json_literal() {
+        let source =
+            "[mvk-error] failed\n{broken}\n42\n\"quoted\"\nprefix {\"a\":1}\n{\"a\":1} trailing\n";
+        assert!(JsonView::parse_embedded(source).is_none());
+        let source = format!("{source}{{\"valid\":true}}\n{{\"truncated\": [\n");
+        let view = JsonView::parse_embedded(&source).unwrap();
+        let rendered = content(&view, &source);
+        assert!(rendered.starts_with("[mvk-error] failed\n{broken}\n42\n"));
+        assert!(rendered.contains("{\"a\":1} trailing\n{\n  \"valid\": true\n}"));
+        assert!(rendered.ends_with("{\"truncated\": ["));
+        assert!(
+            JsonView::parse_embedded(&format!("{}0{}", "[".repeat(129), "]".repeat(129))).is_none()
+        );
     }
 
     #[test]

@@ -205,7 +205,7 @@ impl std::ops::Deref for Command {
 #[derive(Debug, clap::Args)]
 // #[command(author, version, about, after_help = after_help(), long_version = long_version())]
 pub struct CommonArgs {
-    /// Render one file in the built-in Ratatui analyzer (requires a terminal).
+    /// Render one file in the built-in Ratatui analyzer; accepts path:line (requires a terminal).
     #[arg(long, visible_alias = "browse", conflicts_with_all = ["watch", "paginate", "no_pager"])]
     pub analyzer: bool,
     /// Model for questions in browse mode (default: apple).

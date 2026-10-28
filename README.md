@@ -9,7 +9,56 @@ $ mdcat sample.md
 Use `mdcat --browse sample.md` (also available as `--analyzer`) for the built-in Ratatui/Crossterm viewer.
 Scroll with the arrow keys or j/k, use Page Up/Down and Home/End to navigate,
 and press q to close the current document. Mouse-wheel scrolling and terminal resizing are supported.
+Drag with the left mouse button to select text; hold Ctrl when starting the drag
+to select a rectangular region. Releasing the button copies the selection to the
+clipboard (macOS uses the system clipboard; other platforms use terminal OSC 52 support).
+Escape clears the selection. Links and foldable rows activate on a click, without dragging.
+Hold the pointer beyond the top or bottom edge while selecting to keep scrolling.
+Each 30 ms step scrolls 1 line for up to 99 selected rows, 2 lines for 100–512
+selected rows, and 4 lines for more than 512 selected rows.
 Images appear as text fallbacks in this mode.
+
+Press Ctrl+B on a tracked text file to switch the current window to Git blame. Each source
+line shows its commit hash, author, date, and line number; uncommitted lines are
+marked as working-tree changes. Author, date, and line number colors fade from
+warm tones for recent changes through green and blue to muted tones for old changes;
+working-tree changes use pink. Click a commit hash to open its diff, or use Tab
+to choose a commit from the link picker. Age color bands use <1, <2, <3, <4, <7,
+<10, <14, <30 days, then older changes. Hover over a hash to highlight the visible
+source lines attributed to that commit. Ctrl+B, q, or Escape returns to the file.
+Blame uses the original source, including local edits, even when viewing formatted
+code or rendered Markdown. Narrow windows hide author/date columns to leave room
+for source text. Search and mouse selection work in the blame view.
+
+Ctrl+H switches the current window to file history, following renames. The commit
+list appears on the left, with the existing side-by-side diff preview on the right.
+Up/Down or a click selects a commit; a working-tree entry includes local changes.
+The list shows commit messages only. Space in the list or a right-click pins a
+commit as the left-side reference, highlighted in the diff's before color;
+the selected commit uses the after color. Selecting another commit compares it
+against the reference. Pin the same
+entry again to restore comparisons against each commit's parent (HEAD for local changes).
+Tab or Left/Right changes focus; arrows and the mouse wheel scroll the focused pane,
+and Page Up/Down scroll the preview. Ctrl+F filters commits by hash, author, or subject.
+Enter opens the current comparison at full width in a nested diff window; q returns.
+On narrow terminals the list fills the window, with Enter opening the diff.
+Ctrl+H, q, or Escape returns to the original file view and scroll position.
+Ctrl+B and Ctrl+H can switch directly between blame and history in the same window.
+
+In a Git repository, `mdcat --browse .` shows a directory list on the left and a
+side-by-side diff preview on the right. Select with Up/Down or a click; Enter opens
+the selected file or directory normally. `f` toggles all files versus changed files;
+the changed view retains the directory structure and includes deleted files.
+Directories with changes open in changed-paths mode automatically; clean directories
+open with all files. Refreshing preserves your current filter choice.
+The preview always compares HEAD → working tree, showing staged and unstaged
+changes together. Untracked files preview as additions;
+clean files preview their contents. Enter on a deleted file opens its diff.
+Tab or Left/Right changes focus; arrows and the mouse wheel scroll the focused pane,
+while Page Up/Down scroll the preview. `d` opens the current diff at full width;
+`r` refreshes status. Returning from a file also refreshes the directory view.
+Narrow windows show the file list alone; Enter opens files and `d` opens diffs.
+Directories outside Git repositories retain the ordinary directory browser.
 
 Click a local file link to open it in a fixed window above the current document.
 Internal section links jump within the current document.
@@ -52,6 +101,11 @@ arguments in command examples (including fenced code blocks) are clickable and
 appear in the link picker too. Opening one displays the file in a nested viewer.
 Press Ctrl+N to open the current file in nano; shell aliases are honored, and the viewer reloads
 the file when nano exits.
+Press Ctrl+O in a C/C++, GLSL, HLSL, or Metal file to toggle a formatted view:
+four-space indentation, expanded statements, and same-line opening braces.
+Formatting uses `clang-format` and leaves the file on disk unchanged. Press Ctrl+O
+again to restore the original view. If clang-format is outside your PATH, set
+`clang_format = "/path/to/clang-format"` at the top level of mdcat's config file.
 Directory links open a nested listing with links to subdirectories and files. Use Up/Down to
 select an entry and Enter to open it. In a Git repository, changed and untracked entries are
 shown in yellow; directories are yellow when they contain changes.
@@ -60,6 +114,8 @@ using terminal graphics when available and colored character cells as a fallback
 image files use the terminal's configured image protocol and fit within half of its width and height.
 Attach `:172` (or `#L172`) to a path to jump to source line 172; this works with
 clicks and the link picker. Line links to Markdown files show their literal source.
+The initial browse argument also accepts `:line`, for example
+`mdcat --browse src/metal_compile_options.mm:22`.
 Line numbers beyond the file's end jump to its last line.
 Missing
 files and unsupported destinations show an error in the viewer. Local UTF-8 text files open here, including JSON, C/C++, headers, Python, GLSL, and Metal.
@@ -80,6 +136,10 @@ Home/End navigate the tree. File links still open in nested windows, and Tab lis
 links even inside folded sections. Backspace returns to the parent document.
 Field order, duplicate keys, and original value tokens are preserved. Invalid JSON
 falls back to syntax-highlighted text. Source-line links open the original source.
+Text (`.txt`) and log (`.log`) files also render complete JSON objects and arrays
+that occupy their own lines, including multiline fragments. Surrounding log text
+stays literal, and each fragment supports the same folding controls. Malformed
+or truncated fragments remain literal text.
 
 Press `?` to open a prompt popup and ask about the document. By default this uses Apple's on-device Foundation Models.
 With Apple models, opening the prompt starts background prewarming of both the title and answer

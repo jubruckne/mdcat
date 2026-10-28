@@ -6,7 +6,7 @@
 
 //! User configuration, loaded from `~/.config/mdcat/config.toml`.
 //!
-//! The file has two parts: a `[defaults]` table setting default values for a handful of CLI
+//! The file has an optional top-level `clang_format` path, a `[defaults]` table setting values for CLI
 //! flags, and a `[theme]` table customising a built-in theme (starting from `base`, then
 //! overriding individual styles on top of it), in the same spirit as editor theme files (e.g.
 //! Helix's `theme.toml`): a `[theme.palette]` of named colors, and a `[theme.styles]` table of
@@ -24,6 +24,9 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Path to clang-format for the viewer's Ctrl+O formatting toggle.
+    /// Defaults to looking up `clang-format` on PATH.
+    pub clang_format: Option<PathBuf>,
     /// Default values for CLI flags.
     #[serde(default)]
     pub defaults: Defaults,
@@ -382,6 +385,7 @@ mod tests {
     #[test]
     fn parses_full_config_and_applies_overrides() {
         let toml = r##"
+            clang_format = "/opt/llvm/bin/clang-format"
             [defaults]
             paginate = true
             margin = true
@@ -399,6 +403,10 @@ mod tests {
             code = { fg = "bright-yellow" }
         "##;
         let config: Config = toml::from_str(toml).unwrap();
+        assert_eq!(
+            config.clang_format,
+            Some(PathBuf::from("/opt/llvm/bin/clang-format"))
+        );
         assert_eq!(config.defaults.paginate, Some(Pagination::Enabled(true)));
         assert_eq!(config.defaults.margin, Some(true));
         assert_eq!(config.defaults.columns, Some(100));

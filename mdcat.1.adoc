@@ -121,6 +121,60 @@ In this case remote images render as hyperlinks.
     Home/End or g/G jump to the start/end. q or Escape closes the deepest document
     window, or exits at the original document. Ctrl+C exits the viewer.
     Mouse-wheel scrolling and reflow on terminal resize are supported.
+    Drag the left mouse button to select text; hold Ctrl when starting the drag
+    to select a rectangle. Release to copy the selection to the clipboard.
+    macOS uses the system clipboard; other platforms require terminal OSC 52 support.
+    Escape clears the selection before closing a document. Links and foldable rows
+    activate on a click without dragging.
+    Hold the pointer beyond the top or bottom edge while selecting to keep scrolling.
+    Every 30 ms, scrolling moves 1 line for up to 99 selected rows, 2 lines for
+    100–512 selected rows, and 4 lines for more than 512 selected rows.
+    Ctrl+B switches the current window to Git blame for the tracked text file.
+    Each line shows the commit hash, author, date, source line number, and source.
+    Author, date, and line number colors indicate age: recent changes use warm
+    tones, fading through green and blue to muted tones for old changes.
+    Age bands are <1, <2, <3, <4, <7, <10, <14, <30 days, then older changes.
+    Working-tree metadata uses pink. --no-colour disables these colors.
+    Hover over a commit hash to highlight its visible source lines.
+    Uncommitted lines are marked as working-tree changes. Click a hash to open
+    the commit diff, or press Tab to choose a commit. Ctrl+B, q, or Escape returns
+    to the file. Blame uses the original source, including local edits, even in
+    formatted or rendered views. Narrow windows hide author/date columns.
+    Search and mouse text selection are available in the blame window.
+    Ctrl+H switches the current window to file history, following renames.
+    Select a commit with Up/Down or a click to preview its changes with the shared
+    side-by-side diff renderer. The working-tree entry shows local changes.
+    The list shows commit messages only. Space or right-click pins an entry as
+    the left reference, highlighted in the before-diff color; the selection uses
+    the after-diff color. Select another entry to compare; pin the same entry again
+    to restore the default comparison against its parent (HEAD for local changes).
+    Tab or Left/Right changes focus; arrows and the wheel scroll the focused pane.
+    Page Up/Down scrolls the preview. Ctrl+F filters by hash, author, or subject.
+    Enter opens the comparison at full width in a nested diff window.
+    Narrow windows show the list alone. Ctrl+H, q, or Escape restores the original
+    file view and scroll position. Ctrl+B and Ctrl+H switch directly between blame
+    and history without opening another window.
+    In a Git repository, directory browsing shows files on the left and a
+    side-by-side diff preview on the right. Up/Down or click selects; Enter opens
+    files and directories. f toggles all/changed paths, retaining directory structure
+    and deleted files. Directories with changes start in changed-paths mode;
+    clean directories show all files. Refreshing preserves the chosen filter.
+    Previews always compare HEAD to working tree, showing
+    staged and unstaged changes together. Untracked files preview as additions;
+    clean files preview their contents. Enter on deleted files opens their diff.
+    Tab or Left/Right switches focus; arrows and the wheel scroll the focused pane.
+    Page Up/Down scrolls the preview. d opens a full-width diff; r refreshes status.
+    Returning from a file refreshes the listing. Narrow windows show only the list;
+    Enter opens files and d opens diffs. Non-Git directories use ordinary browsing.
+    The initial file argument accepts a positive, one-based :line suffix, for example
+    mdcat --browse src/metal_compile_options.mm:22. This opens the original source
+    at the requested line; a line beyond the file's end jumps to its last line.
+    An existing literal filename containing a colon takes precedence.
+    Ctrl+O toggles a formatted view of C/C++, GLSL, HLSL, and Metal source using
+    clang-format, with four-space indentation and same-line opening braces.
+    The file on disk stays unchanged. Press Ctrl+O again to restore the original
+    view. The optional top-level clang_format configuration key specifies the
+    executable path; otherwise clang-format is looked up on PATH.
     Click local file links without terminal modifier keys to open them in fixed nested
     windows, keeping dimmed parent title bars visible above the active document.
     Duplicate filenames include directory context in their titles. Hovering over a local
@@ -165,6 +219,9 @@ In this case remote images render as hyperlinks.
     c folds nested containers; e expands all. Backspace returns to the parent document.
     Field order, duplicate keys, and value tokens are preserved. Tab includes links
     inside folded sections. Invalid JSON and source-line links use source text.
+    Text (.txt) and log (.log) files also render complete JSON objects and arrays
+    on their own lines, including multiline fragments, with the same folding
+    controls. Surrounding text and invalid fragments remain literal.
 +
     Press `?` to open a prompt popup for a plain-text question about the open document.
     Opening the prompt starts background prewarming for both title and answer sessions
@@ -298,11 +355,13 @@ Also settable via `defaults.tabs` in `~/.config/mdcat/config.toml`.
 == Configuration file
 
 `mdcat` reads `~/.config/mdcat/config.toml` (or `$XDG_CONFIG_HOME/mdcat/config.toml` if that variable is set) if it exists.
-The file has two parts: a `[defaults]` table setting default values for a few CLI flags, and a `[theme]` table customising a built-in theme.
+The file supports a `[defaults]` table setting default values for a few CLI flags, a `[theme]` table customising a built-in theme, and an optional top-level `clang_format` path.
 See `config.toml.example` in the mdcat source repository for a fully annotated example.
 
 [source,toml]
 ----
+clang_format = "/path/to/clang-format"
+
 [defaults]
 margin = true
 columns = 100

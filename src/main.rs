@@ -34,14 +34,19 @@ use mdcat::args::{Args, ImageProtocolChoice, ThemeChoice};
 use mdcat::output::{resolved_pager_basename, Output};
 
 mod analyzer;
+mod blame_view;
+mod code_format;
 mod diff_view;
+mod directory_view;
 mod git_directory;
 mod git_links;
+mod history_view;
 mod json_view;
 mod link_tree;
 mod navigation;
 mod picker;
 mod query;
+mod text_selection;
 
 /// Clear the terminal screen and scrollback, then move the cursor home.
 fn clear_screen() {

@@ -11,12 +11,17 @@ pub struct Document {
     pub title: Option<String>,
     pub source: String,
     pub input: String,
+    unformatted_input: Option<String>,
     pub environment: Environment,
     pub language: Option<String>,
     pub json: Option<crate::json_view::JsonView>,
     pub diff: Option<crate::diff_view::DiffView>,
+    pub blame: Option<crate::blame_view::BlameView>,
+    pub file_history: Option<crate::history_view::HistoryView>,
+    pub original_view: Option<(Box<Document>, usize, Option<String>)>,
     pub image: Option<image::DynamicImage>,
     pub is_directory: bool,
+    pub directory_view: Option<crate::directory_view::DirectoryView>,
     pub directory_changes: std::collections::HashSet<PathBuf>,
     project_root: Option<PathBuf>,
     pub commits: crate::git_links::GitLinks,
@@ -45,6 +50,28 @@ pub fn source_line(fragment: &str) -> Option<usize> {
 }
 
 impl Document {
+    /// Open a viewer argument, optionally ending with a one-based `:line` suffix.
+    pub fn load_argument(
+        reference: &str,
+        options: mdcat::RenderOptions,
+    ) -> Result<(Self, Option<usize>)> {
+        // A literal existing filename wins, including names containing colons.
+        let (filename, line) = if std::path::Path::new(reference).exists() {
+            (reference, None)
+        } else {
+            split_line_reference(reference)
+                .map_or((reference, None), |(path, line)| (path, Some(line)))
+        };
+        let mut document = Self::load(filename.into(), options)?;
+        if line.is_some() {
+            if document.is_directory || document.image.is_some() {
+                bail!("Source line references require a text file");
+            }
+            document.show_source(options);
+        }
+        Ok((document, line))
+    }
+
     pub fn load(path: PathBuf, options: mdcat::RenderOptions) -> Result<Self> {
         // Resolve relative links from the displayed path, including symlink paths.
         let path = std::env::current_dir()?.join(path);
@@ -73,12 +100,17 @@ impl Document {
                 title: None,
                 source: String::new(),
                 input: String::new(),
+                unformatted_input: None,
+                blame: None,
+                file_history: None,
+                original_view: None,
                 environment,
                 language: None,
                 json: None,
                 diff: None,
                 image: Some(image),
                 is_directory: false,
+                directory_view: None,
                 directory_changes: Default::default(),
                 commits: crate::git_links::GitLinks::new(project_root.clone()),
                 project_root,
@@ -96,6 +128,8 @@ impl Document {
             .to_ascii_lowercase();
         let json = if extension == "json" {
             crate::json_view::JsonView::parse(&source)
+        } else if matches!(extension.as_str(), "txt" | "log") {
+            crate::json_view::JsonView::parse_embedded(&source)
         } else {
             None
         };
@@ -150,10 +184,15 @@ impl Document {
         let commits = crate::git_links::GitLinks::new(project_root.clone());
         commits.references(&source);
         Ok(Self {
+            unformatted_input: None,
+            blame: None,
+            file_history: None,
+            original_view: None,
             commits,
             diff,
             image: None,
             is_directory: false,
+            directory_view: None,
             directory_changes: Default::default(),
             title,
             project_root,
@@ -213,7 +252,12 @@ impl Document {
             .map(PathBuf::from);
         let commits = crate::git_links::GitLinks::new(project_root.clone());
         let directory_changes = crate::git_directory::changed_entries(&path);
+        let directory_view = crate::directory_view::DirectoryView::load(&path).ok();
         Ok(Self {
+            unformatted_input: None,
+            blame: None,
+            file_history: None,
+            original_view: None,
             path,
             title: None,
             source: input.clone(),
@@ -224,9 +268,111 @@ impl Document {
             diff: None,
             image: None,
             is_directory: true,
+            directory_view,
             directory_changes,
             project_root,
             commits,
+        })
+    }
+
+    pub fn open_directory_diff(&self) -> Result<Self> {
+        let patch = self
+            .directory_view
+            .as_ref()
+            .context("No directory comparison")?
+            .patch();
+        let mut next = Self::load_directory(self.path.clone())?;
+        next.directory_view = None;
+        next.is_directory = false;
+        next.title = Some("Directory comparison".into());
+        next.path = self
+            .commits
+            .root
+            .as_ref()
+            .unwrap_or(&self.path)
+            .join(".git/directory comparison");
+        next.source = patch.to_owned();
+        next.input = next.source.clone();
+        let mut diff = crate::diff_view::DiffView::parse(patch);
+        diff.set_comparison_label("HEAD → working tree");
+        diff.fold_all(false);
+        next.diff = Some(diff);
+        next.language = Some("diff".into());
+        Ok(next)
+    }
+
+    pub fn open_history(&self) -> Result<Self> {
+        if self.is_directory || self.image.is_some() || !self.path.is_file() {
+            bail!("History requires a tracked text file");
+        }
+        let root = self
+            .commits
+            .root
+            .as_ref()
+            .context("No Git repository for this file")?;
+        let view = crate::history_view::HistoryView::load(root, &self.path)?;
+        let mut next = Self::load(self.path.clone(), Default::default())?;
+        next.title = Some(format!(
+            "History: {}",
+            self.path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        next.json = None;
+        next.diff = None;
+        next.file_history = Some(view);
+        Ok(next)
+    }
+
+    pub fn open_history_diff(&self) -> Result<Self> {
+        let view = self.file_history.as_ref().context("No history view")?;
+        let mut next = Self::load(self.path.clone(), Default::default())?;
+        next.title = Some("History diff".into());
+        // This is a generated comparison, not the working file's contents.
+        // Match commit views so source-only actions cannot blame the patch text.
+        if let Some(root) = &self.commits.root {
+            next.path = root.join(".git/history comparison");
+        }
+        next.source = view.patch().to_owned();
+        next.input = next.source.clone();
+        let mut diff = crate::diff_view::DiffView::parse(&next.source);
+        diff.fold_all(false);
+        next.diff = Some(diff);
+        next.json = None;
+        next.language = Some("diff".into());
+        Ok(next)
+    }
+
+    pub fn open_blame(&self) -> Result<Self> {
+        if self.is_directory || self.image.is_some() || !self.path.is_file() {
+            bail!("Git blame requires a tracked text file");
+        }
+        let root = self
+            .commits
+            .root
+            .as_ref()
+            .context("No Git repository for this file")?;
+        let blame = crate::blame_view::BlameView::load(&self.path, root, &self.source)?;
+        Ok(Self {
+            path: self.path.clone(),
+            title: Some(format!(
+                "Blame: {}",
+                self.path.file_name().unwrap_or_default().to_string_lossy()
+            )),
+            source: self.source.clone(),
+            input: self.source.clone(),
+            unformatted_input: None,
+            environment: self.environment.clone(),
+            language: Some(self.language.clone().unwrap_or_else(|| "md".into())),
+            json: None,
+            diff: None,
+            blame: Some(blame),
+            file_history: None,
+            original_view: None,
+            image: None,
+            is_directory: false,
+            directory_view: None,
+            directory_changes: Default::default(),
+            project_root: self.project_root.clone(),
+            commits: crate::git_links::GitLinks::new(Some(root.clone())),
         })
     }
 
@@ -250,9 +396,14 @@ impl Document {
             path: root.join(format!(".git/commit {}", &id[..12])),
             title: crate::git_links::commit_title(&source),
             input: source.clone(),
+            unformatted_input: None,
+            blame: None,
+            file_history: None,
+            original_view: None,
             diff: Some(crate::diff_view::DiffView::parse(&source)),
             image: None,
             is_directory: false,
+            directory_view: None,
             directory_changes: Default::default(),
             source,
             environment: Environment::for_local_directory(&root)?,
@@ -311,6 +462,9 @@ impl Document {
     }
 
     pub fn show_source(&mut self, options: mdcat::RenderOptions) {
+        if let Some(input) = self.unformatted_input.take() {
+            self.input = input;
+        }
         self.json = None;
         self.diff = None;
         if self.language.is_none() {
@@ -320,6 +474,35 @@ impl Document {
                 |width| expand_tabs(&self.source, width).into_owned(),
             );
         }
+    }
+
+    pub fn can_format(&self) -> bool {
+        self.language.is_some()
+            && self.json.is_none()
+            && self.diff.is_none()
+            && self.blame.is_none()
+            && self.file_history.is_none()
+            && self.image.is_none()
+            && !self.is_directory
+            && crate::code_format::supports(&self.path)
+    }
+
+    pub fn is_formatted(&self) -> bool {
+        self.unformatted_input.is_some()
+    }
+
+    /// Toggle a formatted presentation without changing the source or file.
+    pub fn toggle_formatting(&mut self) -> Result<bool> {
+        if let Some(input) = self.unformatted_input.take() {
+            self.input = input;
+            return Ok(false);
+        }
+        if !self.can_format() {
+            bail!("Formatting is available for C/C++, GLSL, HLSL, and Metal source files");
+        }
+        let formatted = crate::code_format::format(&self.source)?;
+        self.unformatted_input = Some(std::mem::replace(&mut self.input, formatted));
+        Ok(true)
     }
 
     /// Find existing path arguments in commands without interpreting or running the command.
@@ -420,6 +603,49 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_arguments_open_original_source_at_attached_line_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, source) in [
+            ("options.mm", "// first\nvoid main() {}\n"),
+            ("report.md", "---\nkey: value\n---\n# Heading\n"),
+            ("data.json", "{\n\"nested\": {\"value\": 1}\n}\n"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, source).unwrap();
+            let (document, line) =
+                Document::load_argument(&format!("{}:2", path.display()), Default::default())
+                    .unwrap();
+            assert_eq!(line, Some(2));
+            assert_eq!(document.path, path);
+            assert_eq!(document.input, source);
+            assert!(document.json.is_none());
+            assert!(document.language.is_some());
+            for invalid in ["0", "-2", "999999999999999999999999999"] {
+                assert!(Document::load_argument(
+                    &format!("{}:{invalid}", path.display()),
+                    Default::default(),
+                )
+                .is_err());
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            // Existing colon-containing names keep their literal meaning.
+            let path = dir.path().join("literal:22");
+            std::fs::write(&path, "literal file\n").unwrap();
+            let (document, line) =
+                Document::load_argument(path.to_str().unwrap(), Default::default()).unwrap();
+            assert_eq!(document.path, path);
+            assert_eq!(line, None);
+        }
+        assert!(Document::load_argument(
+            &format!("{}:2", dir.path().display()),
+            Default::default(),
+        )
+        .is_err());
+    }
 
     #[test]
     fn attached_line_numbers_resolve_to_file_and_source_fragment() {

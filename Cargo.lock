@@ -2033,6 +2033,7 @@ dependencies = [
  "anstyle",
  "anstyle-query",
  "anyhow",
+ "base64",
  "chrono",
  "clap",
  "clap_complete",
@@ -2063,6 +2064,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "two-face",
+ "unicode-segmentation",
+ "unicode-width",
  "url",
 ]
 

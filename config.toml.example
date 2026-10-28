@@ -6,6 +6,10 @@
 #
 # See `man 1 mdcat`'s "Configuration file" section for the full reference.
 
+# Formatter executable for the viewer's Ctrl+O toggle. Omit to use clang-format on PATH.
+# Set this before any [table] headers; it is a top-level key.
+# clang_format = "/path/to/clang-format"
+
 # [defaults] sets default values for a handful of CLI flags. Each one only applies when the
 # corresponding flag isn't passed explicitly on the command line — the CLI flag always wins.
 [defaults]

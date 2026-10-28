@@ -33,6 +33,8 @@ struct Layout {
     headers: Vec<usize>,
 }
 pub struct DiffView {
+    comparison_label: Option<String>,
+    show_fold_markers: bool,
     metadata: Vec<String>,
     files: Vec<File>,
     layout: RefCell<Layout>,
@@ -80,9 +82,39 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     .collect()
 }
 
+pub fn before_style(dark: bool) -> Style {
+    Style::default()
+        .fg(if dark {
+            Color::Rgb(251, 145, 139)
+        } else {
+            Color::Rgb(150, 30, 30)
+        })
+        .bg(if dark {
+            Color::Rgb(62, 35, 35)
+        } else {
+            Color::Rgb(255, 228, 228)
+        })
+}
+
+pub fn after_style(dark: bool) -> Style {
+    Style::default()
+        .fg(if dark {
+            Color::Rgb(184, 210, 126)
+        } else {
+            Color::Rgb(35, 100, 30)
+        })
+        .bg(if dark {
+            Color::Rgb(37, 51, 33)
+        } else {
+            Color::Rgb(228, 245, 222)
+        })
+}
+
 impl DiffView {
     pub fn parse(source: &str) -> Self {
         let mut view = Self {
+            comparison_label: None,
+            show_fold_markers: true,
             metadata: Vec::new(),
             files: Vec::new(),
             layout: RefCell::new(Layout::default()),
@@ -271,6 +303,14 @@ impl DiffView {
         }
     }
 
+    pub fn set_comparison_label(&mut self, label: &str) {
+        self.comparison_label = Some(label.to_owned());
+    }
+
+    pub fn set_fold_markers_visible(&mut self, visible: bool) {
+        self.show_fold_markers = visible;
+    }
+
     pub fn render(&self, width: usize, dark: bool) -> Text<'static> {
         let width = width.max(1);
         let mut lines = Vec::new();
@@ -280,28 +320,8 @@ impl DiffView {
         } else {
             Color::Rgb(100, 100, 100)
         });
-        let removed_style = Style::default()
-            .fg(if dark {
-                Color::Rgb(251, 145, 139)
-            } else {
-                Color::Rgb(150, 30, 30)
-            })
-            .bg(if dark {
-                Color::Rgb(62, 35, 35)
-            } else {
-                Color::Rgb(255, 228, 228)
-            });
-        let added_style = Style::default()
-            .fg(if dark {
-                Color::Rgb(184, 210, 126)
-            } else {
-                Color::Rgb(35, 100, 30)
-            })
-            .bg(if dark {
-                Color::Rgb(37, 51, 33)
-            } else {
-                Color::Rgb(228, 245, 222)
-            });
+        let removed_style = before_style(dark);
+        let added_style = after_style(dark);
         let mut push = |line: Line<'static>, file: Option<usize>| {
             lines.push(line);
             layout.files.push(file);
@@ -351,11 +371,28 @@ impl DiffView {
             } else {
                 format!(" {total:>count_digits$} ")
             };
-            let caption = fit(
-                &format!("{} {name}", if file.collapsed { "+" } else { "−" }),
-                name_width,
-            );
-            let spacing = " ".repeat(name_width.saturating_sub(Line::raw(&caption).width()));
+            let marker = if self.show_fold_markers {
+                if file.collapsed {
+                    "+ "
+                } else {
+                    "− "
+                }
+            } else {
+                ""
+            };
+            // Match the source panes' separator column, rather than centering
+            // within the filename/statistics space in this header.
+            let label = self.comparison_label.as_ref().and_then(|label| {
+                let label = format!("({label})");
+                let label_width = Line::raw(&label).width();
+                let center = (width.saturating_sub(3)) / 2 + 1;
+                let start = center.saturating_sub(label_width / 2);
+                (width >= 24 && start + label_width <= name_width).then_some((start, label))
+            });
+            let caption_width = label
+                .as_ref()
+                .map_or(name_width, |(start, _)| start.saturating_sub(1));
+            let caption = fit(&format!("{marker}{name}"), caption_width);
             let style = Style::default()
                 .fg(Color::Rgb(145, 172, 238))
                 .add_modifier(Modifier::BOLD)
@@ -365,32 +402,30 @@ impl DiffView {
                     Modifier::empty()
                 });
             let header = if name_width >= 3 {
-                push(
-                    Line::from(vec![
-                        Span::styled(caption, style),
-                        Span::raw(spacing),
-                        Span::styled(count, muted),
-                        Span::styled(
-                            "+".repeat(plus),
-                            Style::default().fg(added_style.fg.unwrap()),
-                        ),
-                        Span::styled(
-                            "-".repeat(minus),
-                            Style::default().fg(removed_style.fg.unwrap()),
-                        ),
-                        Span::raw(" ".repeat(max_bar.saturating_sub(cells))),
-                    ]),
-                    Some(index),
-                )
+                let mut header_spans = vec![Span::styled(caption, style)];
+                if let Some((start, label)) = label {
+                    let used = Line::from(header_spans.clone()).width();
+                    header_spans.push(Span::raw(" ".repeat(start.saturating_sub(used))));
+                    header_spans.push(Span::styled(label, muted));
+                }
+                let used = Line::from(header_spans.clone()).width();
+                header_spans.push(Span::raw(" ".repeat(name_width.saturating_sub(used))));
+                header_spans.extend(vec![
+                    Span::styled(count, muted),
+                    Span::styled(
+                        "+".repeat(plus),
+                        Style::default().fg(added_style.fg.unwrap()),
+                    ),
+                    Span::styled(
+                        "-".repeat(minus),
+                        Style::default().fg(removed_style.fg.unwrap()),
+                    ),
+                    Span::raw(" ".repeat(max_bar.saturating_sub(cells))),
+                ]);
+                push(Line::from(header_spans), Some(index))
             } else {
                 push(
-                    Line::styled(
-                        fit(
-                            &format!("{} {name}  {total}", if file.collapsed { "+" } else { "−" }),
-                            width,
-                        ),
-                        style,
-                    ),
+                    Line::styled(fit(&format!("{marker}{name}  {total}"), width), style),
                     Some(index),
                 )
             };
