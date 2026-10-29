@@ -45,17 +45,26 @@ On narrow terminals the list fills the window, with Enter opening the diff.
 Ctrl+H, q, or Escape returns to the original file view and scroll position.
 Ctrl+B and Ctrl+H can switch directly between blame and history in the same window.
 
-In a Git repository, `mdcat --browse .` shows a directory list on the left and a
+In a Git repository, `mdcat --browse` (equivalent to `mdcat --browse .`) shows a directory list on the left and a
 side-by-side diff preview on the right. Select with Up/Down or a click; Enter opens
 the selected file or directory normally. `f` toggles all files versus changed files;
 the changed view retains the directory structure and includes deleted files.
 Directories with changes open in changed-paths mode automatically; clean directories
-open with all files. Refreshing preserves your current filter choice.
+open with all files. Background polling refreshes every two seconds; `r` refreshes
+immediately. Refreshing preserves your current filter, selected file, and preview
+scroll position when the selected file remains available.
+Polling and redraws pause while the terminal reports the tab as unfocused, and
+polling resumes immediately on focus. Unchanged polls do not redraw the view.
+Files that newly appear or change during polling get a yellow dot for one minute
+after the marker is first drawn.
 The preview always compares HEAD → working tree, showing staged and unstaged
 changes together. Untracked files preview as additions;
 clean files preview their contents. Enter on a deleted file opens its diff.
-Tab or Left/Right changes focus; arrows and the mouse wheel scroll the focused pane,
-while Page Up/Down scroll the preview. `d` opens the current diff at full width;
+The diff's filename, comparison label, and change summary stay pinned while scrolling.
+Tab or Left/Right changes focus; arrows select files or scroll the focused preview.
+The mouse wheel scrolls the pane under the pointer without changing file selection.
+Page Up/Down scroll the preview. Each pane has a scrollbar that supports
+clicking and dragging when it overflows. `d` opens the current diff at full width;
 `r` refreshes status. Returning from a file also refreshes the directory view.
 Narrow windows show the file list alone; Enter opens files and `d` opens diffs.
 Directories outside Git repositories retain the ordinary directory browser.

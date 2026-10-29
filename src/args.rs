@@ -205,14 +205,14 @@ impl std::ops::Deref for Command {
 #[derive(Debug, clap::Args)]
 // #[command(author, version, about, after_help = after_help(), long_version = long_version())]
 pub struct CommonArgs {
-    /// Render one file in the built-in Ratatui analyzer; accepts path:line (requires a terminal).
+    /// Browse a file or directory (default: current directory); accepts path:line (requires a terminal).
     #[arg(long, visible_alias = "browse", conflicts_with_all = ["watch", "paginate", "no_pager"])]
     pub analyzer: bool,
     /// Model for questions in browse mode (default: apple).
     #[arg(short = 'm', long, value_enum)]
     pub model: Option<QueryModel>,
     /// Files to read.  If - read from standard input instead.
-    #[arg(default_value="-", value_hint = ValueHint::FilePath)]
+    #[arg(default_value="-", default_value_if("analyzer", "true", "."), value_hint = ValueHint::FilePath)]
     pub filenames: Vec<String>,
     /// Disable all colours and other styles.
     #[arg(short = 'c', long, aliases=["nocolour", "no-color", "nocolor"])]
@@ -323,6 +323,20 @@ mod tests {
     #[test]
     fn verify_app() {
         Args::command().debug_assert();
+    }
+
+    #[test]
+    fn browse_defaults_to_current_directory() {
+        for flag in ["--browse", "--analyzer"] {
+            let args = Args::try_parse_from(["mdcat", flag]).unwrap();
+            assert_eq!(args.command.filenames, ["."]);
+            for path in ["-", "README.md", "."] {
+                let args = Args::try_parse_from(["mdcat", flag, path]).unwrap();
+                assert_eq!(args.command.filenames, [path]);
+            }
+        }
+        let args = Args::try_parse_from(["mdcat"]).unwrap();
+        assert_eq!(args.command.filenames, ["-"]);
     }
     #[test]
     fn pagination_config_and_cli_precedence() {

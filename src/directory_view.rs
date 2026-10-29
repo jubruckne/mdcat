@@ -3,8 +3,9 @@ use anyhow::{Context, Result};
 use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span, Text},
+    widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::{
     cell::Cell,
@@ -13,11 +14,13 @@ use std::{
     process::Command,
 };
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 struct Change {
     index: u8,
     old: Option<PathBuf>,
+    stamp: Option<(u64, Option<std::time::SystemTime>)>,
 }
+#[derive(Clone, PartialEq, Eq)]
 struct Entry {
     path: PathBuf,
     directory: bool,
@@ -30,23 +33,32 @@ pub enum Action {
     Close,
 }
 enum Preview {
+    Unchanged,
     Diff(crate::diff_view::DiffView),
     Text(Text<'static>),
 }
+type RefreshResult = Result<(Option<PathBuf>, bool, Box<DirectoryView>)>;
 pub struct DirectoryView {
     directory: PathBuf,
     root: PathBuf,
+    head: Option<Vec<u8>>,
+    preview_stamp: Option<(u64, Option<std::time::SystemTime>)>,
     changes: BTreeMap<PathBuf, Change>,
     entries: Vec<Entry>,
     cursor: usize,
+    list_scroll: usize,
     changed_only: bool,
     preview: Preview,
     patch: String,
     preview_scroll: usize,
     preview_max: Cell<usize>,
     preview_focus: bool,
+    dragging_scrollbar: Option<bool>,
     wide: Cell<bool>,
     pub height: usize,
+    last_poll: std::time::Instant,
+    pending_refresh: Option<std::sync::mpsc::Receiver<RefreshResult>>,
+    recent: BTreeMap<PathBuf, Cell<Option<std::time::Instant>>>,
 }
 fn git(root: &Path, args: &[&str], paths: &[PathBuf]) -> Result<Vec<u8>> {
     let out = Command::new("git")
@@ -90,28 +102,185 @@ impl DirectoryView {
         let mut view = Self {
             directory,
             root,
+            head: None,
+            preview_stamp: None,
             changes: BTreeMap::new(),
             entries: Vec::new(),
             cursor: 0,
+            list_scroll: 0,
             changed_only: false,
             preview: Preview::Text(Text::default()),
             patch: String::new(),
             preview_scroll: 0,
             preview_max: Cell::new(0),
             preview_focus: false,
+            dragging_scrollbar: None,
             wide: Cell::new(false),
             height: 20,
+            last_poll: std::time::Instant::now(),
+            pending_refresh: None,
+            recent: BTreeMap::new(),
         };
         view.read_changes()?;
         view.changed_only = !view.changes.is_empty();
         view.rebuild()?;
+        view.ensure_selection_visible();
         view.load_preview()?;
         Ok(view)
     }
     pub fn refresh(&mut self) -> Result<()> {
+        self.pending_refresh = None;
+        self.last_poll = std::time::Instant::now();
+        let selected = self.selected_path().map(Path::to_owned);
+        let scroll = self.preview_scroll;
         self.read_changes()?;
         self.rebuild()?;
-        self.load_preview()
+        self.load_preview()?;
+        if self.selected_path() == selected.as_deref() {
+            self.preview_scroll = scroll;
+        }
+        Ok(())
+    }
+    fn selected_path(&self) -> Option<&Path> {
+        self.entries
+            .get(self.cursor)
+            .map(|entry| entry.path.as_path())
+    }
+    pub fn poll_timeout(&self) -> std::time::Duration {
+        let refresh = if self.pending_refresh.is_some() {
+            std::time::Duration::from_millis(100)
+        } else {
+            std::time::Duration::from_secs(2).saturating_sub(self.last_poll.elapsed())
+        };
+        self.recent
+            .values()
+            .filter_map(Cell::get)
+            .fold(refresh, |timeout, started| {
+                timeout.min(std::time::Duration::from_secs(60).saturating_sub(started.elapsed()))
+            })
+    }
+    pub fn refresh_on_focus(&mut self) {
+        self.pending_refresh = None;
+        self.last_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    }
+    pub fn poll_refresh(&mut self) -> Result<bool> {
+        let expired = self.expire_markers(std::time::Instant::now());
+        if let Some(receiver) = &self.pending_refresh {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.pending_refresh = None;
+                    let (selected, changed_only, next) = result?;
+                    // Ignore a preview requested before the user changed selection or filter.
+                    if changed_only != self.changed_only
+                        || selected.as_deref() != self.selected_path()
+                    {
+                        return Ok(expired);
+                    }
+                    let text_changed = match (&self.preview, &next.preview) {
+                        (_, Preview::Unchanged) => false,
+                        (Preview::Text(a), Preview::Text(b)) => a != b,
+                        (Preview::Diff(_), Preview::Diff(_)) => false,
+                        _ => true,
+                    };
+                    let changed = self.entries != next.entries
+                        || self.changes != next.changes
+                        || self.patch != next.patch
+                        || text_changed;
+                    if changed {
+                        for (path, change) in &next.changes {
+                            if self.changes.get(path) != Some(change) {
+                                self.recent.insert(path.clone(), Cell::new(None));
+                            }
+                        }
+                        for entry in &next.entries {
+                            if !entry.directory
+                                && !self.entries.iter().any(|old| old.path == entry.path)
+                            {
+                                self.recent.insert(entry.path.clone(), Cell::new(None));
+                            }
+                        }
+                        if self.selected_path() != next.selected_path() {
+                            self.preview_scroll = 0;
+                        }
+                        self.changes = next.changes;
+                        self.entries = next.entries;
+                        self.cursor = next.cursor;
+                        if !matches!(next.preview, Preview::Unchanged) {
+                            self.preview = next.preview;
+                        }
+                        self.patch = next.patch;
+                    }
+                    self.preview_stamp = next.preview_stamp;
+                    self.head = next.head;
+                    return Ok(changed || expired);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(expired),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.pending_refresh = None;
+                    anyhow::bail!("Directory refresh worker stopped");
+                }
+            }
+        }
+        if self.last_poll.elapsed() >= std::time::Duration::from_secs(2) {
+            self.last_poll = std::time::Instant::now();
+            let mut snapshot = Self {
+                directory: self.directory.clone(),
+                root: self.root.clone(),
+                head: self.head.clone(),
+                preview_stamp: self.preview_stamp,
+                changes: self.changes.clone(),
+                entries: self.entries.clone(),
+                cursor: self.cursor,
+                list_scroll: self.list_start(),
+                changed_only: self.changed_only,
+                preview: Preview::Text(Text::default()),
+                patch: self.patch.clone(),
+                preview_scroll: 0,
+                preview_max: Cell::new(0),
+                preview_focus: false,
+                dragging_scrollbar: None,
+                wide: Cell::new(false),
+                height: self.height,
+                last_poll: self.last_poll,
+                pending_refresh: None,
+                recent: BTreeMap::new(),
+            };
+            let (sender, receiver) = std::sync::mpsc::channel();
+            self.pending_refresh = Some(receiver);
+            std::thread::spawn(move || {
+                let selected = snapshot.selected_path().map(Path::to_owned);
+                let changed_only = snapshot.changed_only;
+                let result = (|| -> Result<()> {
+                    let old_changes = snapshot.changes.clone();
+                    let old_head = snapshot.head.clone();
+                    let old_entries = snapshot.entries.clone();
+                    snapshot.read_changes()?;
+                    snapshot.rebuild()?;
+                    if old_changes == snapshot.changes
+                        && old_head == snapshot.head
+                        && old_entries == snapshot.entries
+                        && snapshot.preview_stamp == snapshot.selected_stamp()
+                    {
+                        snapshot.preview = Preview::Unchanged;
+                    } else {
+                        snapshot.load_preview()?;
+                    }
+                    Ok(())
+                })()
+                .map(|()| (selected, changed_only, Box::new(snapshot)));
+                let _ = sender.send(result);
+            });
+        }
+        Ok(expired)
+    }
+    fn expire_markers(&mut self, now: std::time::Instant) -> bool {
+        let before = self.recent.len();
+        self.recent.retain(|_, started| {
+            started.get().is_none_or(|started| {
+                now.saturating_duration_since(started) < std::time::Duration::from_secs(60)
+            })
+        });
+        self.recent.len() != before
     }
     fn read_changes(&mut self) -> Result<()> {
         let relative = self.directory.strip_prefix(&self.root)?;
@@ -122,31 +291,57 @@ impl DirectoryView {
         };
         let bytes = git(
             &self.root,
-            &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=all",
+            ],
             &[path],
         )?;
         self.changes.clear();
         let mut records = bytes.split(|b| *b == 0);
         while let Some(record) = records.next() {
-            if record.len() < 4 {
+            if let Some(oid) = record.strip_prefix(b"# branch.oid ") {
+                self.head = (oid != b"(initial)").then(|| oid.to_vec());
                 continue;
             }
-            let path = self.root.join(path_bytes(&record[3..]));
-            let old = if matches!(record[0], b'R' | b'C') || matches!(record[1], b'R' | b'C') {
-                Some(self.root.join(path_bytes(
-                    records.next().context("Incomplete rename status")?,
-                )))
-            } else {
-                None
+            let (index, path, old) = match record.first() {
+                Some(b'1' | b'2' | b'u') => {
+                    let fields = if record[0] == b'1' {
+                        9
+                    } else if record[0] == b'2' {
+                        10
+                    } else {
+                        11
+                    };
+                    let parts = record.splitn(fields, |b| *b == b' ').collect::<Vec<_>>();
+                    anyhow::ensure!(
+                        parts.len() == fields && parts[1].len() == 2,
+                        "Invalid Git status record"
+                    );
+                    let old = if record[0] == b'2' {
+                        Some(self.root.join(path_bytes(
+                            records.next().context("Incomplete rename status")?,
+                        )))
+                    } else {
+                        None
+                    };
+                    (
+                        parts[1][0],
+                        self.root.join(path_bytes(parts[fields - 1])),
+                        old,
+                    )
+                }
+                Some(b'?') => (b'?', self.root.join(path_bytes(&record[2..])), None),
+                _ => continue,
             };
             if path.starts_with(&self.directory) {
-                self.changes.insert(
-                    path,
-                    Change {
-                        index: record[0],
-                        old,
-                    },
-                );
+                let stamp = std::fs::metadata(&path)
+                    .ok()
+                    .map(|m| (m.len(), m.modified().ok()));
+                self.changes.insert(path, Change { index, old, stamp });
             }
         }
         Ok(())
@@ -232,7 +427,12 @@ impl DirectoryView {
             });
         Ok(())
     }
+    fn selected_stamp(&self) -> Option<(u64, Option<std::time::SystemTime>)> {
+        let metadata = std::fs::metadata(self.selected_path()?).ok()?;
+        Some((metadata.len(), metadata.modified().ok()))
+    }
     fn load_preview(&mut self) -> Result<()> {
+        self.preview_stamp = self.selected_stamp();
         self.preview_scroll = 0;
         self.patch.clear();
         let Some(entry) = self.entries.get(self.cursor) else {
@@ -258,15 +458,8 @@ impl DirectoryView {
         if let Some(old) = change.and_then(|c| c.old.as_ref()) {
             paths.push(old.strip_prefix(&self.root)?.to_owned());
         }
-        let has_head = Command::new("git")
-            .arg("-C")
-            .arg(&self.root)
-            .args(["rev-parse", "--verify", "HEAD"])
-            .output()?
-            .status
-            .success();
         let untracked = change.is_some_and(|c| c.index == b'?');
-        let patch = if untracked || !has_head {
+        let patch = if untracked || self.head.is_none() {
             if path.exists() {
                 addition(path, &relative)?
             } else {
@@ -339,7 +532,25 @@ impl DirectoryView {
             self.cursor = next;
             self.load_preview()?;
         }
+        self.ensure_selection_visible();
         Ok(())
+    }
+    fn ensure_selection_visible(&mut self) {
+        let height = self.height.max(1);
+        let start = self.list_start();
+        self.list_scroll = if self.cursor < start {
+            self.cursor
+        } else if self.cursor >= start + height {
+            self.cursor + 1 - height
+        } else {
+            start
+        };
+    }
+    fn scroll_list(&mut self, delta: isize) {
+        self.list_scroll = self
+            .list_start()
+            .saturating_add_signed(delta)
+            .min(self.entries.len().saturating_sub(self.height.max(1)));
     }
     fn scroll_preview(&mut self, delta: isize) {
         self.preview_scroll = self
@@ -364,6 +575,7 @@ impl DirectoryView {
             KeyCode::Char('f') => {
                 self.changed_only = !self.changed_only;
                 self.rebuild()?;
+                self.ensure_selection_visible();
                 self.load_preview()?;
             }
             KeyCode::Char('r') => self.refresh()?,
@@ -378,10 +590,12 @@ impl DirectoryView {
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_preview(self.height as isize),
             KeyCode::Home if !self.preview_focus => {
                 self.cursor = 0;
+                self.ensure_selection_visible();
                 self.load_preview()?;
             }
             KeyCode::End if !self.preview_focus => {
                 self.cursor = self.entries.len().saturating_sub(1);
+                self.ensure_selection_visible();
                 self.load_preview()?;
             }
             KeyCode::Home => self.preview_scroll = 0,
@@ -398,10 +612,45 @@ impl DirectoryView {
         }
     }
     fn list_start(&self) -> usize {
-        self.cursor.saturating_sub(self.height.max(1) - 1)
+        self.list_scroll
+            .min(self.entries.len().saturating_sub(self.height.max(1)))
     }
     pub fn mouse(&mut self, mouse: MouseEvent, area: Rect) -> Result<()> {
         let width = usize::from(area.width.saturating_sub(4));
+        let left = Self::list_width(width);
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            self.dragging_scrollbar = None;
+            return Ok(());
+        }
+        let list_track = area.x + 2 + left.saturating_sub(1) as u16;
+        let preview_track = area.right().saturating_sub(2);
+        let track_click = matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            && mouse.row > area.y
+            && mouse.row < area.bottom().saturating_sub(1)
+            && (mouse.column == list_track || (left < width && mouse.column == preview_track));
+        if track_click {
+            self.dragging_scrollbar = Some(left < width && mouse.column == preview_track);
+        }
+        if track_click || matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            if let Some(preview) = self.dragging_scrollbar {
+                self.preview_focus = preview;
+                let height = usize::from(area.height.saturating_sub(2));
+                let row =
+                    usize::from(mouse.row.saturating_sub(area.y + 1)).min(height.saturating_sub(1));
+                let max = if preview {
+                    self.preview_max.get()
+                } else {
+                    self.entries.len().saturating_sub(height)
+                };
+                let position = row.saturating_mul(max) / height.saturating_sub(1).max(1);
+                if preview {
+                    self.preview_scroll = position;
+                } else if max > 0 {
+                    self.list_scroll = position;
+                }
+                return Ok(());
+            }
+        }
         if mouse.row <= area.y
             || mouse.row >= area.bottom().saturating_sub(1)
             || mouse.column < area.x + 2
@@ -418,34 +667,48 @@ impl DirectoryView {
                     self.load_preview()?;
                 }
             }
-            MouseEventKind::ScrollDown if !self.preview_focus => self.move_by(1)?,
-            MouseEventKind::ScrollUp if !self.preview_focus => self.move_by(-1)?,
+            MouseEventKind::ScrollDown if !self.preview_focus => self.scroll_list(3),
+            MouseEventKind::ScrollUp if !self.preview_focus => self.scroll_list(-3),
             MouseEventKind::ScrollDown => self.scroll_preview(3),
             MouseEventKind::ScrollUp => self.scroll_preview(-3),
             _ => (),
         }
         Ok(())
     }
-    pub fn footer(&self) -> String {
-        format!(
-            " {} · {} · f: all/changed · Enter: open · d: diff · Tab: focus · r: refresh ",
-            if self.changed_only {
-                "Changed files"
-            } else {
-                "All files"
-            },
-            "HEAD → working tree"
-        )
+    pub fn footer(&self) -> Line<'static> {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        Line::from(vec![
+            Span::raw(" f: "),
+            Span::styled(
+                "all",
+                if self.changed_only {
+                    Style::default()
+                } else {
+                    bold
+                },
+            ),
+            Span::raw("/"),
+            Span::styled(
+                "changed",
+                if self.changed_only {
+                    bold
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(" · r: refresh "),
+        ])
     }
     pub fn render(&self, width: usize, dark: bool) -> Text<'static> {
         let left = Self::list_width(width);
         let split = left < width;
         self.wide.set(split);
-        let right = width.saturating_sub(left + 3);
+        let right = width.saturating_sub(left + 2);
         let preview = if split {
             match &self.preview {
                 Preview::Diff(diff) => diff.render(right, dark),
                 Preview::Text(text) => text.clone(),
+                Preview::Unchanged => unreachable!("worker sentinel must not reach rendering"),
             }
         } else {
             Text::default()
@@ -482,21 +745,94 @@ impl DirectoryView {
                             style,
                         )
                     });
-            let mut line = clip(Line::styled(label, style), left);
+            let mut line = clip(Line::styled(label, style), left.saturating_sub(1));
             line.spans.push(Span::styled(
                 " ".repeat(left.saturating_sub(line.width())),
                 style,
             ));
             if split {
                 line.spans
-                    .push(Span::styled(" │ ", Style::default().fg(Color::DarkGray)));
-                if let Some(part) = preview.lines.get(offset + row) {
+                    .push(Span::styled("│ ", Style::default().fg(Color::DarkGray)));
+                let preview_row = if row == 0 && matches!(self.preview, Preview::Diff(_)) {
+                    0
+                } else {
+                    offset + row
+                };
+                if let Some(part) = preview.lines.get(preview_row) {
                     line.spans.extend(clip(part.clone(), right).spans);
                 }
             }
             rows.push(line);
         }
         Text::from(rows)
+    }
+    pub fn draw_decorations(&self, frame: &mut ratatui::Frame<'_>, area: Rect, no_colour: bool) {
+        let width = usize::from(area.width.saturating_sub(4));
+        let height = usize::from(area.height.saturating_sub(2));
+        if width == 0 || height == 0 {
+            return;
+        }
+        for (row, entry) in self
+            .entries
+            .iter()
+            .skip(self.list_start())
+            .take(height)
+            .enumerate()
+        {
+            if let Some(started) = self.recent.get(&entry.path) {
+                if started.get().is_none() {
+                    started.set(Some(std::time::Instant::now()));
+                }
+                frame.buffer_mut()[(area.x + 1, area.y + 1 + row as u16)]
+                    .set_symbol("·")
+                    .set_style(if no_colour {
+                        Style::default()
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    });
+            }
+        }
+        let left = Self::list_width(width);
+        let tracks = [
+            (
+                area.x + 2 + left.saturating_sub(1) as u16,
+                self.entries.len().saturating_sub(height),
+                self.list_start(),
+            ),
+            (
+                area.right().saturating_sub(2),
+                self.preview_max.get(),
+                self.preview_scroll,
+            ),
+        ];
+        for (index, (x, max, position)) in tracks.into_iter().enumerate() {
+            if max == 0 || (index == 1 && left == width) {
+                continue;
+            }
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(if no_colour {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                })
+                .thumb_style(if no_colour {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Gray)
+                });
+            let mut state = ScrollbarState::new(max + 1)
+                .position(position.min(max))
+                .viewport_content_length(height);
+            frame.render_stateful_widget(
+                scrollbar,
+                Rect::new(x, area.y + 1, 1, height as u16),
+                &mut state,
+            );
+        }
     }
 }
 fn clean(text: &str) -> String {
@@ -582,6 +918,197 @@ mod tests {
             .position(|e| e.path.ends_with(filename))
             .unwrap();
         view.load_preview().unwrap();
+    }
+    fn background_refresh(view: &mut DirectoryView) -> bool {
+        view.last_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        assert!(!view.poll_refresh().unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let changed = view.poll_refresh().unwrap();
+            if view.pending_refresh.is_none() {
+                return changed;
+            }
+            assert!(std::time::Instant::now() < deadline, "refresh timed out");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+    #[test]
+    fn polling_markers_start_on_render_and_expire_after_one_minute() {
+        let (dir, _) = crate::git_links::tests::repository();
+        let mut view = DirectoryView::load(dir.path()).unwrap();
+        select(&mut view, "example.txt");
+        assert!(view.recent.is_empty());
+        std::fs::write(dir.path().join("example.txt"), "new edit\n").unwrap();
+        std::fs::write(dir.path().join("new.txt"), "new file\n").unwrap();
+        assert!(background_refresh(&mut view));
+        let path = view.directory.join("example.txt");
+        let new_path = view.directory.join("new.txt");
+        assert!(view.recent[&path].get().is_none());
+        assert!(view.recent[&new_path].get().is_none());
+        // Time before the first draw does not consume the marker's lifetime.
+        assert!(
+            !view.expire_markers(std::time::Instant::now() + std::time::Duration::from_secs(120))
+        );
+        let text = view.render(120, true);
+        let selected_row = view.cursor - view.list_start();
+        assert!(text.lines[selected_row]
+            .to_string()
+            .starts_with("example.txt"));
+        assert!(
+            view.recent[&path].get().is_none(),
+            "layout must not start the timer"
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(124, 22)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(text),
+                    Rect::new(2, 1, 120, 20),
+                );
+                view.draw_decorations(frame, Rect::new(0, 0, 124, 22), false);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1 + selected_row as u16)].symbol(), "·");
+        assert_eq!(buffer[(1, 1 + selected_row as u16)].fg, Color::Yellow);
+        assert_eq!(buffer[(2, 1 + selected_row as u16)].symbol(), "e");
+        let started = view.recent[&path].get().unwrap();
+        assert!(!background_refresh(&mut view));
+        assert_eq!(view.recent[&path].get(), Some(started));
+        assert!(!view.expire_markers(started + std::time::Duration::from_secs(59)));
+        assert!(view.expire_markers(started + std::time::Duration::from_secs(61)));
+        assert!(!view.recent.contains_key(&path));
+        assert!(!view.render(120, true).to_string().contains('·'));
+    }
+    #[test]
+    fn pane_scrollbars_render_and_support_clicks_and_dragging() {
+        let (dir, _) = crate::git_links::tests::repository();
+        let root = dir.path();
+        std::fs::write(root.join("example.txt"), "long preview\n".repeat(100)).unwrap();
+        for index in 0..20 {
+            std::fs::write(root.join(format!("new-{index:02}.txt")), "new\n").unwrap();
+        }
+        let mut view = DirectoryView::load(root).unwrap();
+        view.height = 8;
+        select(&mut view, "example.txt");
+        let area = Rect::new(0, 0, 124, 10);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(124, 10)).unwrap();
+        let text = view.render(120, true);
+        view.preview_scroll = 10;
+        let scrolled = view.render(120, true);
+        assert_eq!(
+            text.lines[0], scrolled.lines[0],
+            "diff header must stay pinned"
+        );
+        assert_ne!(text.lines[1], scrolled.lines[1], "diff body must scroll");
+        view.preview_scroll = 0;
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(text),
+                    Rect::new(2, 1, 120, 8),
+                );
+                view.draw_decorations(frame, area, true);
+            })
+            .unwrap();
+        for x in [41, 122] {
+            let symbols = (1..9)
+                .map(|y| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>();
+            assert!(symbols.contains('┃') && symbols.contains('│'), "{symbols}");
+        }
+        assert_eq!(
+            terminal.backend().buffer()[(42, 1)].symbol(),
+            "│",
+            "divider must sit directly beside the list scrollbar"
+        );
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let selected = view.cursor;
+        let patch = view.patch.clone();
+        view.mouse(mouse(MouseEventKind::ScrollDown, 4, 3), area)
+            .unwrap();
+        assert_eq!(view.list_start(), 3);
+        assert_eq!(view.cursor, selected);
+        assert_eq!(view.patch, patch);
+        assert_eq!(view.preview_scroll, 0);
+        view.mouse(mouse(MouseEventKind::ScrollUp, 4, 3), area)
+            .unwrap();
+        assert_eq!(view.list_start(), 0);
+        view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 122, 8), area)
+            .unwrap();
+        assert_eq!(view.preview_scroll, view.preview_max.get());
+        view.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 122, 0), area)
+            .unwrap();
+        assert_eq!(view.preview_scroll, 0);
+        view.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 122, 0), area)
+            .unwrap();
+        assert!(view.dragging_scrollbar.is_none());
+        view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 41, 8), area)
+            .unwrap();
+        assert_eq!(view.cursor, 0, "scrollbar must not change selection");
+        assert_eq!(view.list_start(), view.entries.len() - view.height);
+        view.key(KeyCode::Down).unwrap();
+        assert_eq!(view.cursor, 1);
+        assert!(view.cursor >= view.list_start() && view.cursor < view.list_start() + view.height);
+    }
+    #[test]
+    fn background_poll_detects_head_changes_with_unchanged_status_and_file() {
+        let (dir, _) = crate::git_links::tests::repository();
+        let root = dir.path();
+        std::fs::write(root.join("example.txt"), "working\n").unwrap();
+        let mut view = DirectoryView::load(root).unwrap();
+        assert!(view.patch.contains("-after"));
+        let changes = view.changes.clone();
+        let stamp = view.preview_stamp;
+        command(root, &["reset", "--mixed", "HEAD~1"]);
+        assert!(background_refresh(&mut view));
+        assert!(view.changes == changes);
+        assert_eq!(view.preview_stamp, stamp);
+        assert!(view.patch.contains("-before"));
+        assert!(!background_refresh(&mut view));
+    }
+    #[test]
+    fn background_poll_preserves_selection_filter_and_scroll_and_detects_changes() {
+        let (dir, _) = crate::git_links::tests::repository();
+        let root = dir.path();
+        let mut view = DirectoryView::load(root).unwrap();
+        select(&mut view, "example.txt");
+        view.preview_scroll = 3;
+        assert!(!background_refresh(&mut view));
+        assert_eq!(view.preview_scroll, 3);
+        std::fs::write(root.join("example.txt"), "polling update\n").unwrap();
+        std::fs::write(root.join("new.txt"), "new file\n").unwrap();
+        assert!(background_refresh(&mut view));
+        assert!(!view.changed_only);
+        assert!(view.selected_path().unwrap().ends_with("example.txt"));
+        assert_eq!(view.preview_scroll, 3);
+        assert!(view.patch.contains("+polling update"));
+        std::fs::write(root.join("example.txt"), "another edit\n").unwrap();
+        assert!(background_refresh(&mut view));
+        assert!(view.patch.contains("+another edit"));
+        assert!(view.entries.iter().any(|e| e.path.ends_with("new.txt")));
+        command(root, &["add", "."]);
+        command(root, &["commit", "-qm", "Commit polled changes"]);
+        assert!(background_refresh(&mut view));
+        assert!(view.patch.is_empty());
+        std::fs::remove_file(root.join("new.txt")).unwrap();
+        assert!(background_refresh(&mut view));
+        assert!(view.changes.contains_key(&view.directory.join("new.txt")));
+        view.key(KeyCode::Char('f')).unwrap();
+        select(&mut view, "new.txt");
+        command(root, &["add", "."]);
+        command(root, &["commit", "-qm", "Remove selected file"]);
+        assert!(background_refresh(&mut view));
+        assert!(view.changed_only);
+        assert!(view.entries.is_empty());
+        assert_eq!(view.preview_scroll, 0);
     }
     #[test]
     fn directory_combines_staged_and_unstaged_changes_and_handles_other_file_states() {

@@ -5,7 +5,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::{
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
     execute,
 };
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, LinkType, Parser, Tag, TagEnd};
@@ -50,7 +50,7 @@ pub fn run(
     );
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<()> {
-        execute!(std::io::stdout(), EnableMouseCapture)?;
+        execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
         let mut text = Text::default();
         let mut rendered_width = None;
         let mut scroll = 0usize;
@@ -73,8 +73,24 @@ pub fn run(
         )> = None;
 
         let animation_started = std::time::Instant::now();
+        let mut focused = true;
         loop {
+            while !focused {
+                if matches!(event::read()?, Event::FocusGained) {
+                    focused = true;
+                    if let Some(view) = document.directory_view.as_mut() {
+                        view.refresh_on_focus();
+                    }
+                }
+            }
             query.poll();
+            if let Some(view) = document.directory_view.as_mut() {
+                match view.poll_refresh() {
+                    Ok(true) => rendered_width = None,
+                    Ok(false) => (),
+                    Err(error) => status = format!(" {error:#} "),
+                }
+            }
             if let Some((started, message)) = &zero_match_notice {
                 if status != *message {
                     zero_match_notice = None;
@@ -418,8 +434,8 @@ pub fn run(
                 } else if let Some(path) = hovered_path.as_deref() {
                     path
                 } else if status.is_empty() {
-                    if let Some(footer) = directory_footer.as_deref() {
-                        footer
+                    if directory_footer.is_some() {
+                        ""
                     } else if document.file_history.is_some() {
                         " Ctrl+H: back · ↑↓: select · Space/right click: base · Enter: diff · Tab: focus · PgUp/Dn: scroll · Ctrl+F: find "
                     } else if document.blame.is_some() {
@@ -461,8 +477,16 @@ pub fn run(
                     } else {
                         Style::default()
                     };
+                    let hint_line = if search_footer.is_none()
+                        && hovered_path.is_none()
+                        && status.is_empty()
+                    {
+                        directory_footer.unwrap_or_else(|| Line::from(hint))
+                    } else {
+                        Line::from(hint)
+                    };
                     frame.render_widget(
-                        Line::styled(hint, hint_style),
+                        hint_line.style(hint_style),
                         ratatui::layout::Rect::new(
                             area.x + 2,
                             area.bottom().saturating_sub(1),
@@ -479,7 +503,9 @@ pub fn run(
                         }
                     }
                 }
-                if max_scroll > 0 && area.width >= 5 && area.height > 2 {
+                if let Some(view) = &document.directory_view {
+                    view.draw_decorations(frame, area, no_colour);
+                } else if max_scroll > 0 && area.width >= 5 && area.height > 2 {
                     let track = ratatui::layout::Rect::new(
                         area.right() - 2,
                         area.y + 1,
@@ -540,10 +566,46 @@ pub fn run(
                 100
             };
             let mut poll_timeout = std::time::Duration::from_millis(refresh_ms);
+            if refresh_ms == 100 && !query.open && !response.visible && link_picker.is_none() {
+                if let Some(view) = document.directory_view.as_ref() {
+                    poll_timeout = view.poll_timeout();
+                }
+            }
             if !query.open && !response.visible && link_picker.is_none() {
                 poll_timeout = selection.poll_timeout(poll_timeout, std::time::Instant::now());
             }
-            if !event::poll(poll_timeout)? {
+            let event_ready = loop {
+                if event::poll(poll_timeout)? {
+                    break true;
+                }
+                // An unchanged directory poll needs no new frame. Stay asleep here
+                // until input, a changed snapshot, or an active UI timer needs one.
+                if refresh_ms != 100
+                    || query.open
+                    || response.visible
+                    || link_picker.is_some()
+                    || search.open
+                    || selection.poll_timeout(std::time::Duration::MAX, std::time::Instant::now())
+                        != std::time::Duration::MAX
+                {
+                    break false;
+                }
+                let Some(view) = document.directory_view.as_mut() else {
+                    break false;
+                };
+                match view.poll_refresh() {
+                    Ok(true) => {
+                        rendered_width = None;
+                        break false;
+                    }
+                    Ok(false) => poll_timeout = view.poll_timeout(),
+                    Err(error) => {
+                        status = format!(" {error:#} ");
+                        break false;
+                    }
+                }
+            };
+            if !event_ready {
                 continue;
             }
             let mut open_target = None;
@@ -554,6 +616,12 @@ pub fn run(
             }
             let is_mouse = matches!(event, Event::Mouse(_));
             match event {
+                Event::FocusLost => focused = false,
+                Event::FocusGained => {
+                    if let Some(view) = document.directory_view.as_mut() {
+                        view.refresh_on_focus();
+                    }
+                }
                 Event::Key(key) if key.kind != KeyEventKind::Release && link_picker.is_some() => {
                     let picker = link_picker.as_mut().unwrap();
                     let navigate = matches!(
@@ -1137,10 +1205,7 @@ pub fn run(
                     _ => {}
                 },
                 Event::Mouse(mouse) if document.directory_view.is_some() => {
-                    if !matches!(
-                        mouse.kind,
-                        MouseEventKind::Moved | MouseEventKind::Up(_) | MouseEventKind::Drag(_)
-                    ) {
+                    if !matches!(mouse.kind, MouseEventKind::Moved) {
                         if let Err(error) =
                             document.directory_view.as_mut().unwrap().mouse(mouse, area)
                         {
@@ -1393,7 +1458,7 @@ pub fn run(
         }
         Ok(())
     })();
-    let mouse_restore = execute!(std::io::stdout(), DisableMouseCapture);
+    let mouse_restore = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
     let restore = ratatui::try_restore();
     result?;
     mouse_restore?;
@@ -1405,7 +1470,7 @@ fn edit_in_nano(
     terminal: &mut ratatui::DefaultTerminal,
     path: &std::path::Path,
 ) -> Result<std::process::ExitStatus> {
-    execute!(std::io::stdout(), DisableMouseCapture)?;
+    execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange)?;
     ratatui::try_restore()?;
     let shell = std::env::var_os("SHELL").map(std::path::PathBuf::from);
     let shell_name = shell
@@ -1430,7 +1495,7 @@ fn edit_in_nano(
             .status(),
     };
     *terminal = ratatui::try_init()?;
-    execute!(std::io::stdout(), EnableMouseCapture)?;
+    execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
     Ok(result?)
 }
 
