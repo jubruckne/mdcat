@@ -7,6 +7,8 @@ $ mdcat sample.md
 ```
 
 Use `mdcat --browse sample.md` (also available as `--analyzer`) for the built-in Ratatui/Crossterm viewer.
+Inside a Git repository, `mdcat --browse 191f7f1` opens a commit's message and diff;
+short and full commit hashes work. Existing file and directory paths take precedence.
 Scroll with the arrow keys or j/k, use Page Up/Down and Home/End to navigate,
 and press q to close the current document. Mouse-wheel scrolling and terminal resizing are supported.
 Drag with the left mouse button to select text; hold Ctrl when starting the drag

@@ -55,14 +55,39 @@ impl Document {
         reference: &str,
         options: mdcat::RenderOptions,
     ) -> Result<(Self, Option<usize>)> {
+        Self::load_argument_at(reference, options, &std::env::current_dir()?)
+    }
+
+    fn load_argument_at(
+        reference: &str,
+        options: mdcat::RenderOptions,
+        directory: &std::path::Path,
+    ) -> Result<(Self, Option<usize>)> {
+        if !directory.join(reference).exists()
+            && ((7..=40).contains(&reference.len()) || reference.len() == 64)
+            && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            let root = directory
+                .ancestors()
+                .find(|path| path.join(".git").exists())
+                .context("No Git repository for commit argument")?;
+            let commits = crate::git_links::GitLinks::new(Some(root.to_owned()));
+            let target = commits
+                .references(reference)
+                .into_iter()
+                .next()
+                .with_context(|| format!("Could not resolve Git commit {reference}"))?
+                .1;
+            return Ok((Self::from_commit(&commits, target.as_str())?, None));
+        }
         // A literal existing filename wins, including names containing colons.
-        let (filename, line) = if std::path::Path::new(reference).exists() {
+        let (filename, line) = if directory.join(reference).exists() {
             (reference, None)
         } else {
             split_line_reference(reference)
                 .map_or((reference, None), |(path, line)| (path, Some(line)))
         };
-        let mut document = Self::load(filename.into(), options)?;
+        let mut document = Self::load(directory.join(filename), options)?;
         if line.is_some() {
             if document.is_directory || document.image.is_some() {
                 bail!("Source line references require a text file");
@@ -390,7 +415,11 @@ impl Document {
     }
 
     pub fn open_commit(&self, target: &str) -> Result<Self> {
-        let (root, source) = self.commits.show(target)?;
+        Self::from_commit(&self.commits, target)
+    }
+
+    fn from_commit(commits: &crate::git_links::GitLinks, target: &str) -> Result<Self> {
+        let (root, source) = commits.show(target)?;
         let id = crate::git_links::commit_id(target).context("Invalid Git commit")?;
         Ok(Self {
             path: root.join(format!(".git/commit {}", &id[..12])),
@@ -603,6 +632,29 @@ impl Document {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn viewer_arguments_open_commits_with_existing_paths_taking_precedence() {
+        let (dir, id) = crate::git_links::tests::repository();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        for directory in [dir.path(), nested.as_path()] {
+            for hash in [&id[..7], id.as_str()] {
+                let (document, line) =
+                    Document::load_argument_at(hash, Default::default(), directory).unwrap();
+                assert!(document.diff.is_some());
+                assert!(document.source.starts_with(&format!("commit {id}")));
+                assert!(document.source.contains("-before\n+after"));
+                assert!(line.is_none());
+            }
+        }
+        assert!(Document::load_argument_at("0000000", Default::default(), dir.path()).is_err());
+        std::fs::write(dir.path().join(&id[..7]), "literal file\n").unwrap();
+        let (document, _) =
+            Document::load_argument_at(&id[..7], Default::default(), dir.path()).unwrap();
+        assert_eq!(document.source, "literal file\n");
+        assert!(document.diff.is_none());
+    }
 
     #[test]
     fn viewer_arguments_open_original_source_at_attached_line_numbers() {
