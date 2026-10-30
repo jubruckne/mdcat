@@ -1,6 +1,6 @@
 //! Interactive Markdown viewer.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
@@ -20,6 +20,32 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState,
     },
 };
+
+fn apply_grep(
+    view: Option<&mut crate::directory_view::DirectoryView>,
+    snapshot: Option<&crate::directory_view::GrepSnapshot>,
+    query: Option<&str>,
+) -> Result<()> {
+    let view = view.context("Grep directory is no longer open")?;
+    match query.filter(|query| !query.is_empty()) {
+        Some(query) => view.search_grep(query),
+        None => view.restore_grep(snapshot.context("Grep snapshot is unavailable")?),
+    }
+}
+
+fn counterpart(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let extensions: &[&str] = match path.extension()?.to_str()? {
+        "h" => &["c", "cpp"],
+        "hpp" => &["cpp", "c"],
+        "c" => &["h", "hpp"],
+        "cpp" => &["hpp", "h"],
+        _ => return None,
+    };
+    extensions
+        .iter()
+        .map(|ext| path.with_extension(ext))
+        .find(|candidate| candidate.is_file())
+}
 
 pub fn run(
     filename: &str,
@@ -65,7 +91,12 @@ pub fn run(
         let mut status = String::new();
         let mut zero_match_notice: Option<(std::time::Instant, String)> = None;
         let mut pending_anchor = initial_line.map(|line| format!("L{line}"));
+        let mut highlighted_source_line: Option<usize> = None;
+        let mut highlighted_row: Option<usize> = None;
         let mut search = Search::default();
+        let mut grep_input: Option<Search> = None;
+        let mut grep_snapshot = None;
+        let mut grep_deadline: Option<std::time::Instant> = None;
         let mut image_picker: Option<ratatui_image::picker::Picker> = None;
         let mut image_state: Option<(
             std::path::PathBuf,
@@ -84,6 +115,11 @@ pub fn run(
                 }
             }
             query.poll();
+            if grep_input.is_some() && document.directory_view.is_none() {
+                grep_input = None;
+                grep_snapshot = None;
+                grep_deadline = None;
+            }
             if let Some(view) = document.directory_view.as_mut() {
                 match view.poll_refresh() {
                     Ok(true) => rendered_width = None,
@@ -234,20 +270,53 @@ pub fn run(
                         options,
                         table_width,
                     )? {
-                        scroll = line;
                         if let Some(source_line) = crate::navigation::source_line(&anchor) {
+                            highlighted_source_line = Some(source_line);
+                            scroll = source_line_scroll(line, height);
                             let actual = source_line.min(document.source.lines().count().max(1));
                             status = if actual == source_line {
                                 format!(" Source line {actual} ")
                             } else {
                                 format!(" Source line {actual} (requested {source_line}) ")
                             };
+                        } else {
+                            highlighted_source_line = None;
+                            scroll = line;
                         }
                     } else {
+                        highlighted_source_line = None;
                         status = format!("Heading not found: #{anchor}");
                     }
                 }
+                highlighted_row = if let Some(line) = highlighted_source_line {
+                    anchor_line_with_table_width(
+                        &document,
+                        &format!("L{line}"),
+                        &settings,
+                        resources,
+                        options,
+                        table_width,
+                    )?
+                } else {
+                    None
+                };
                 rendered_width = Some((width, table_width));
+            }
+            if grep_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+                grep_deadline = None;
+                if let (Some(input), Some(view)) =
+                    (grep_input.as_ref(), document.directory_view.as_mut())
+                {
+                    let result = apply_grep(Some(view), grep_snapshot.as_ref(), Some(&input.input));
+                    match result {
+                        Ok(()) => {
+                            status.clear();
+                            rendered_width = None;
+                        }
+                        Err(error) => status = format!(" {error:#} "),
+                    }
+                    continue;
+                }
             }
             let max_scroll = text.lines.len().saturating_sub(height.max(1));
             if search
@@ -282,6 +351,20 @@ pub fn run(
                 .and_then(|(column, row)| link_at(&links, area, scroll, column, row))
                 .filter(|link| document.can_open(&link.target))
                 .map(|link| link.target.as_str());
+            let hovered_grep = mouse_position
+                .filter(|_| {
+                    !query.open
+                        && !response.visible
+                        && !dragging_scrollbar
+                        && !selection.dragging
+                        && link_picker.is_none()
+                })
+                .and_then(|(column, row)| {
+                    document
+                        .directory_view
+                        .as_ref()?
+                        .grep_link_at(column, row, area)
+                });
             terminal.draw(|frame| {
                 // Each fixed child covers its parent's body, leaving its title bar visible.
                 for (index, (_, position, _)) in history.iter().skip(first_parent).enumerate() {
@@ -322,6 +405,8 @@ pub fn run(
                     )),
                     area,
                 );
+
+                draw_source_line_highlight(frame, area, scroll, highlighted_row, no_colour || crossterm::style::Colored::ansi_color_disabled(), settings.theme.is_dark);
 
                 if let Some((_, protocol)) = image_state.as_mut() {
                     let image_area = ratatui::layout::Rect::new(
@@ -377,6 +462,9 @@ pub fn run(
                             })
                     },
                 );
+                if let Some((_, _, rect)) = &hovered_grep {
+                    frame.buffer_mut().set_style(*rect, Style::default().add_modifier(ratatui::style::Modifier::UNDERLINED));
+                }
                 if let Some(blame) = &document.blame {
                     let style = if no_colour || crossterm::style::Colored::ansi_color_disabled() {
                         Style::default().add_modifier(ratatui::style::Modifier::BOLD)
@@ -413,8 +501,11 @@ pub fn run(
                     no_colour || crossterm::style::Colored::ansi_color_disabled(),
                 );
                 selection.highlight(frame, &text, area, scroll);
-                let hovered_path =
-                    hovered.and_then(|target| hover_path(&document, target, &working_directory));
+                let hovered_path = hovered.and_then(|target| hover_path(&document, target, &working_directory))
+                    .or_else(|| hovered_grep.as_ref().map(|(path, line, _)| {
+                        let path = path.strip_prefix(&working_directory).unwrap_or(path);
+                        match line { Some(line) => format!(" {}:{line} ", path.display()), None => format!(" {} ", path.display()) }
+                    }));
                 let hint_width = area.width.saturating_sub(
                     4 + format!(
                         " {} / {} ──",
@@ -423,7 +514,10 @@ pub fn run(
                     )
                     .len() as u16,
                 );
-                let search_footer = if search.open {
+                let search_footer = if let Some(input) = &grep_input {
+                    let (footer, cursor) = input.footer(usize::from(hint_width));
+                    Some((footer.replacen(" Find:", " Grep:", 1), cursor))
+                } else if search.open {
                     Some(search.footer(usize::from(hint_width)))
                 } else {
                     None
@@ -574,6 +668,10 @@ pub fn run(
             if !query.open && !response.visible && link_picker.is_none() {
                 poll_timeout = selection.poll_timeout(poll_timeout, std::time::Instant::now());
             }
+            if let Some(deadline) = grep_deadline {
+                poll_timeout =
+                    poll_timeout.min(deadline.saturating_duration_since(std::time::Instant::now()));
+            }
             let event_ready = loop {
                 if event::poll(poll_timeout)? {
                     break true;
@@ -585,6 +683,7 @@ pub fn run(
                     || response.visible
                     || link_picker.is_some()
                     || search.open
+                    || grep_input.is_some()
                     || selection.poll_timeout(std::time::Duration::MAX, std::time::Instant::now())
                         != std::time::Duration::MAX
                 {
@@ -753,6 +852,87 @@ pub fn run(
                         _ => {}
                     }
                 }
+                Event::Key(key) if key.kind != KeyEventKind::Release && grep_input.is_some() => {
+                    let input = grep_input.as_mut().unwrap();
+                    let old_input = input.input.clone();
+                    match key.code {
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break
+                        }
+                        KeyCode::Esc => {
+                            grep_input = None;
+                            grep_deadline = None;
+                            match apply_grep(
+                                document.directory_view.as_mut(),
+                                grep_snapshot.as_ref(),
+                                None,
+                            ) {
+                                Ok(()) => status.clear(),
+                                Err(error) => status = format!(" {error:#} "),
+                            }
+                            grep_snapshot = None;
+                            rendered_width = None;
+                        }
+                        KeyCode::Enter => {
+                            let query = input.input.clone();
+                            grep_input = None;
+                            grep_deadline = None;
+                            match apply_grep(
+                                document.directory_view.as_mut(),
+                                grep_snapshot.as_ref(),
+                                Some(&query),
+                            ) {
+                                Ok(()) => {
+                                    status.clear();
+                                    rendered_width = None;
+                                }
+                                Err(error) => status = format!(" {error:#} "),
+                            }
+                            grep_snapshot = None;
+                        }
+                        KeyCode::Left => input.move_cursor(false),
+                        KeyCode::Right => input.move_cursor(true),
+                        KeyCode::Home => input.cursor = 0,
+                        KeyCode::End => input.cursor = input.input.len(),
+                        KeyCode::Backspace if input.cursor > 0 => {
+                            let end = input.cursor;
+                            input.move_cursor(false);
+                            input.input.drain(input.cursor..end);
+                        }
+                        KeyCode::Delete if input.cursor < input.input.len() => {
+                            let start = input.cursor;
+                            input.move_cursor(true);
+                            input.input.drain(start..input.cursor);
+                            input.cursor = start;
+                        }
+                        KeyCode::Char(c)
+                            if !key
+                                .modifiers
+                                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                                && !c.is_control() =>
+                        {
+                            input.input.insert(input.cursor, c);
+                            input.cursor += c.len_utf8();
+                        }
+                        _ => (),
+                    }
+                    if grep_input
+                        .as_ref()
+                        .is_some_and(|input| input.input != old_input)
+                    {
+                        grep_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_millis(150));
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && document.directory_view.is_some()
+                        && key.code == KeyCode::Char('g')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    grep_snapshot = Some(document.directory_view.as_ref().unwrap().grep_snapshot());
+                    grep_input = Some(Search::default());
+                }
                 Event::Key(key) if key.kind != KeyEventKind::Release && search.open => {
                     let old_input = search.input.clone();
                     match key.code {
@@ -862,7 +1042,7 @@ pub fn run(
                                 | KeyCode::End
                                 | KeyCode::PageUp
                                 | KeyCode::PageDown
-                                | KeyCode::Char('j' | 'k' | 'f' | 'r' | 'd' | 'q' | ' ')
+                                | KeyCode::Char('j' | 'k' | 'f' | 'r' | 'd' | 'q' | 'a' | ' ')
                         ) =>
                 {
                     match document.directory_view.as_mut().unwrap().key(key.code) {
@@ -905,6 +1085,28 @@ pub fn run(
                 }
                 Event::Key(key)
                     if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('t')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if let Some(path) = counterpart(&document.path) {
+                        if history
+                            .last()
+                            .is_some_and(|(previous, _, _)| previous.path == path)
+                        {
+                            go_back = true;
+                        } else {
+                            open_target = Some(
+                                url::Url::from_file_path(path)
+                                    .map_err(|_| anyhow::anyhow!("Invalid file path"))?
+                                    .to_string(),
+                            );
+                        }
+                    } else {
+                        status = " No matching source or header in this directory ".into();
+                    }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
                         && key.code == KeyCode::Char('h')
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
@@ -940,15 +1142,50 @@ pub fn run(
                         && key.code == KeyCode::Char('o')
                         && key.modifiers.contains(KeyModifiers::CONTROL) =>
                 {
+                    let original = document.input.clone();
+                    let render_settings = Settings {
+                        terminal_size: pulldown_cmark_mdcat::TerminalSize {
+                            columns: width,
+                            ..settings.terminal_size
+                        },
+                        terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi
+                            .capabilities(),
+                        syntax_set: settings.syntax_set,
+                        theme: settings.theme.clone(),
+                        syntax_theme: settings.syntax_theme.clone(),
+                    };
+                    let source_start = if document.can_format() || document.is_formatted() {
+                        anchor_line_with_table_width(
+                            &document,
+                            "L1",
+                            &render_settings,
+                            resources,
+                            options,
+                            table_width,
+                        )?
+                        .unwrap_or(0)
+                    } else {
+                        0
+                    };
                     match document.toggle_formatting() {
                         Ok(formatted) => {
+                            highlighted_source_line = None;
+                            highlighted_row = None;
                             status = if formatted {
                                 " Formatted view · Ctrl+O: original · file unchanged ".into()
                             } else {
                                 " Original source ".into()
                             };
+                            if scroll > source_start {
+                                let anchor = source_start
+                                    + formatted_line_position(
+                                        &original,
+                                        &document.input,
+                                        scroll - source_start,
+                                    );
+                                scroll = source_line_scroll(anchor, height);
+                            }
                             rendered_width = None;
-                            scroll = 0;
                             selected = None;
                             search = Search::default();
                         }
@@ -1205,7 +1442,47 @@ pub fn run(
                     _ => {}
                 },
                 Event::Mouse(mouse) if document.directory_view.is_some() => {
-                    if !matches!(mouse.kind, MouseEventKind::Moved) {
+                    if let Some((path, line)) = document
+                        .directory_view
+                        .as_ref()
+                        .unwrap()
+                        .grep_target_at(mouse, area)
+                    {
+                        let finalized = if let Some(input) = grep_input.as_ref() {
+                            let result = apply_grep(
+                                document.directory_view.as_mut(),
+                                grep_snapshot.as_ref(),
+                                Some(&input.input),
+                            );
+                            match result {
+                                Ok(()) => {
+                                    grep_input = None;
+                                    grep_deadline = None;
+                                    grep_snapshot = None;
+                                    status.clear();
+                                    rendered_width = None;
+                                    true
+                                }
+                                Err(error) => {
+                                    grep_deadline = None;
+                                    status = format!(" {error:#} ");
+                                    false
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if finalized {
+                            if let Ok(mut url) = url::Url::from_file_path(path) {
+                                if let Some(line) = line {
+                                    url.set_fragment(Some(&format!("L{line}")));
+                                }
+                                open_target = Some(url.to_string());
+                            } else {
+                                status = " Invalid file path ".into();
+                            }
+                        }
+                    } else if !matches!(mouse.kind, MouseEventKind::Moved) {
                         if let Err(error) =
                             document.directory_view.as_mut().unwrap().mouse(mouse, area)
                         {
@@ -1341,6 +1618,9 @@ pub fn run(
                     .map(|(doc, position, selection)| (*doc, position, selection))
                     .or_else(|| history.pop());
                 if let Some((previous, position, selection)) = previous {
+                    grep_input = None;
+                    grep_snapshot = None;
+                    grep_deadline = None;
                     document = previous;
                     if document.is_directory {
                         document.directory_changes =
@@ -1355,6 +1635,8 @@ pub fn run(
                     selected = selection;
                     rendered_width = None;
                     pending_anchor = None;
+                    highlighted_source_line = None;
+                    highlighted_row = None;
                     status.clear();
                     dragging_scrollbar = false;
                     query = crate::query::Query::new(model);
@@ -1375,6 +1657,11 @@ pub fn run(
                     };
                     match next {
                         Ok(next) => {
+                            grep_input = None;
+                            grep_snapshot = None;
+                            grep_deadline = None;
+                            highlighted_source_line = None;
+                            highlighted_row = None;
                             let mut previous = std::mem::replace(&mut document, next);
                             document.original_view =
                                 Some(previous.original_view.take().unwrap_or_else(|| {
@@ -1405,6 +1692,8 @@ pub fn run(
                         document.show_source(options);
                     }
                     if pending_anchor.is_none() {
+                        highlighted_source_line = None;
+                        highlighted_row = None;
                         scroll = 0;
                     }
                     rendered_width = None;
@@ -1438,6 +1727,9 @@ pub fn run(
                 })();
                 match result {
                     Ok((next, anchor)) => {
+                        grep_input = None;
+                        grep_snapshot = None;
+                        grep_deadline = None;
                         history.push((
                             std::mem::replace(&mut document, next),
                             scroll,
@@ -1445,6 +1737,8 @@ pub fn run(
                         ));
                         scroll = 0;
                         pending_anchor = anchor;
+                        highlighted_source_line = None;
+                        highlighted_row = None;
                         rendered_width = None;
                         dragging_scrollbar = false;
                         status.clear();
@@ -2264,6 +2558,66 @@ fn draw_directory_changes(
             );
         }
     }
+}
+
+// Locate the same approximate token position after whitespace and line breaks change.
+fn formatted_line_position(before: &str, after: &str, line: usize) -> usize {
+    let offset = before
+        .lines()
+        .take(line)
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .count();
+    let mut seen = 0usize;
+    let mut row = 0usize;
+    for c in after.chars() {
+        if c == '\n' {
+            row += 1;
+        }
+        if !c.is_whitespace() {
+            if seen == offset {
+                return row;
+            }
+            seen += 1;
+        }
+    }
+    row.min(after.lines().count().saturating_sub(1))
+}
+
+fn source_line_scroll(row: usize, height: usize) -> usize {
+    row.saturating_sub(4.min(height.saturating_sub(1)))
+}
+
+fn draw_source_line_highlight(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    scroll: usize,
+    row: Option<usize>,
+    no_colour: bool,
+    dark: bool,
+) {
+    let height = usize::from(area.height.saturating_sub(2));
+    let Some(row) = row.filter(|row| *row >= scroll && *row < scroll + height) else {
+        return;
+    };
+    let style = if no_colour {
+        Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+    } else {
+        Style::default().bg(if dark {
+            Color::Rgb(48, 58, 76)
+        } else {
+            Color::Rgb(224, 234, 250)
+        })
+    };
+    frame.buffer_mut().set_style(
+        ratatui::layout::Rect::new(
+            area.x + 2,
+            area.y + 1 + (row - scroll) as u16,
+            area.width.saturating_sub(4),
+            1,
+        ),
+        style,
+    );
 }
 
 fn draw_link_highlights(
@@ -3206,6 +3560,70 @@ fn resize_frame(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formatting_preserves_approximate_code_position_in_both_directions() {
+        let original = "void f() {\n  int x=1; int y=2;\n  use(x,y);\n}\n";
+        let formatted = "void f() {\n    int x = 1;\n    int y = 2;\n    use(x, y);\n}\n";
+        assert_eq!(super::formatted_line_position(original, formatted, 2), 3);
+        assert_eq!(super::formatted_line_position(formatted, original, 3), 2);
+        let anchor = super::formatted_line_position(original, formatted, 2);
+        assert_eq!(super::source_line_scroll(anchor + 20, 40), 19);
+        assert_eq!(super::formatted_line_position(original, formatted, 1), 1);
+        assert_eq!(super::formatted_line_position("\n\n", "\n", 10), 0);
+    }
+    #[test]
+    fn source_line_jump_positions_and_highlights_the_target() {
+        use ratatui::{
+            backend::TestBackend,
+            layout::Rect,
+            style::{Color, Modifier},
+            Terminal,
+        };
+        assert_eq!(super::source_line_scroll(100, 40), 96);
+        assert_eq!(super::source_line_scroll(2, 40), 0);
+        assert_eq!(super::source_line_scroll(100, 3), 98);
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                super::draw_source_line_highlight(
+                    frame,
+                    Rect::new(0, 0, 20, 8),
+                    90,
+                    Some(92),
+                    false,
+                    true,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            terminal.backend().buffer()[(2, 3)].bg,
+            Color::Rgb(48, 58, 76)
+        );
+        assert_eq!(terminal.backend().buffer()[(2, 2)].bg, Color::Reset);
+        terminal
+            .draw(|frame| {
+                super::draw_source_line_highlight(
+                    frame,
+                    Rect::new(0, 0, 20, 8),
+                    90,
+                    Some(92),
+                    true,
+                    true,
+                )
+            })
+            .unwrap();
+        assert!(terminal.backend().buffer()[(2, 3)]
+            .modifier
+            .contains(Modifier::REVERSED));
+    }
+    #[test]
+    fn grep_finalization_handles_closed_directory_or_missing_snapshot() {
+        assert!(super::apply_grep(None, None, None).is_err());
+        assert!(super::apply_grep(None, None, Some("pattern")).is_err());
+        let (dir, _) = crate::git_links::tests::repository();
+        let mut view = crate::directory_view::DirectoryView::load(dir.path()).unwrap();
+        assert!(super::apply_grep(Some(&mut view), None, None).is_err());
+    }
     use super::*;
 
     #[test]

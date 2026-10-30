@@ -32,6 +32,8 @@ Blame uses the original source, including local edits, even when viewing formatt
 code or rendered Markdown. Narrow windows hide author/date columns to leave room
 for source text. Search and mouse selection work in the blame view.
 
+Ctrl+T opens the matching C/C++ source or header in the same directory.
+
 Ctrl+H switches the current window to file history, following renames. The commit
 list appears on the left, with the existing side-by-side diff preview on the right.
 Up/Down or a click selects a commit; a working-tree entry includes local changes.
@@ -49,8 +51,12 @@ Ctrl+B and Ctrl+H can switch directly between blame and history in the same wind
 
 In a Git repository, `mdcat --browse` (equivalent to `mdcat --browse .`) shows a directory list on the left and a
 side-by-side diff preview on the right. Select with Up/Down or a click; Enter opens
-the selected file or directory normally. `f` toggles all files versus changed files;
+the selected file or directory normally. `f` cycles all files, changed files, and grep results (after a search);
 the changed view retains the directory structure and includes deleted files.
+Ctrl+G prompts for a ripgrep regular expression within the current directory and updates
+results as you type. Escape restores the previous view. Matching files and their parent
+directories appear on the left; all results appear on the right until a file or directory
+is selected. Press `a` or click the selected row again to show all results. Click a file heading or line number to open the file or jump to that line. Enter opens the selected file or directory. `r` reruns the search.
 Directories with changes open in changed-paths mode automatically; clean directories
 open with all files. Background polling refreshes every two seconds; `r` refreshes
 immediately. Refreshing preserves your current filter, selected file, and preview
@@ -115,7 +121,7 @@ the file when nano exits.
 Press Ctrl+O in a C/C++, GLSL, HLSL, or Metal file to toggle a formatted view:
 four-space indentation, expanded statements, and same-line opening braces.
 Formatting uses `clang-format` and leaves the file on disk unchanged. Press Ctrl+O
-again to restore the original view. If clang-format is outside your PATH, set
+again to restore the original view; the viewer keeps approximately the same position. If clang-format is outside your PATH, set
 `clang_format = "/path/to/clang-format"` at the top level of mdcat's config file.
 Directory links open a nested listing with links to subdirectories and files. Use Up/Down to
 select an entry and Enter to open it. In a Git repository, changed and untracked entries are

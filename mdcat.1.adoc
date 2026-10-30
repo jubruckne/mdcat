@@ -141,6 +141,13 @@ In this case remote images render as hyperlinks.
     to the file. Blame uses the original source, including local edits, even in
     formatted or rendered views. Narrow windows hide author/date columns.
     Search and mouse text selection are available in the blame window.
+    Ctrl+T opens the matching C/C++ source or header in the same directory.
+    In the directory browser, Ctrl+G searches incrementally with a ripgrep regular
+    expression; Escape restores the previous view. Matching files and directories
+    appear on the left and all matching lines on the right until a row is selected.
+    Press a or click the selected row again to show all results. Click a filename or
+    line number in the preview to open the file or jump to that line.
+    f cycles all files, changed files, and grep results after a search; r reruns it.
     Ctrl+H switches the current window to file history, following renames.
     Select a commit with Up/Down or a click to preview its changes with the shared
     side-by-side diff renderer. The working-tree entry shows local changes.
@@ -173,7 +180,7 @@ In this case remote images render as hyperlinks.
     Ctrl+O toggles a formatted view of C/C++, GLSL, HLSL, and Metal source using
     clang-format, with four-space indentation and same-line opening braces.
     The file on disk stays unchanged. Press Ctrl+O again to restore the original
-    view. The optional top-level clang_format configuration key specifies the
+    view, keeping approximately the same position. The optional top-level clang_format configuration key specifies the
     executable path; otherwise clang-format is looked up on PATH.
     Click local file links without terminal modifier keys to open them in fixed nested
     windows, keeping dimmed parent title bars visible above the active document.

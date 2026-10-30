@@ -37,7 +37,24 @@ enum Preview {
     Diff(crate::diff_view::DiffView),
     Text(Text<'static>),
 }
+#[derive(Clone)]
+struct GrepLink {
+    path: PathBuf,
+    line: Option<usize>,
+    start: usize,
+    end: usize,
+}
 type RefreshResult = Result<(Option<PathBuf>, bool, Box<DirectoryView>)>;
+#[derive(Clone)]
+pub struct GrepSnapshot {
+    query: Option<String>,
+    last: String,
+    files: BTreeSet<PathBuf>,
+    changed_only: bool,
+    selected: Option<PathBuf>,
+    preview_scroll: usize,
+    grep_all: bool,
+}
 pub struct DirectoryView {
     directory: PathBuf,
     root: PathBuf,
@@ -48,6 +65,11 @@ pub struct DirectoryView {
     cursor: usize,
     list_scroll: usize,
     changed_only: bool,
+    grep_query: Option<String>,
+    grep_all: bool,
+    grep_files: BTreeSet<PathBuf>,
+    last_grep: String,
+    grep_links: Vec<Option<GrepLink>>,
     preview: Preview,
     patch: String,
     preview_scroll: usize,
@@ -109,6 +131,11 @@ impl DirectoryView {
             cursor: 0,
             list_scroll: 0,
             changed_only: false,
+            grep_query: None,
+            grep_all: false,
+            grep_files: BTreeSet::new(),
+            last_grep: String::new(),
+            grep_links: Vec::new(),
             preview: Preview::Text(Text::default()),
             patch: String::new(),
             preview_scroll: 0,
@@ -134,6 +161,9 @@ impl DirectoryView {
         let selected = self.selected_path().map(Path::to_owned);
         let scroll = self.preview_scroll;
         self.read_changes()?;
+        if let Some(query) = self.grep_query.clone() {
+            self.run_grep(&query)?;
+        }
         self.rebuild()?;
         self.load_preview()?;
         if self.selected_path() == selected.as_deref() {
@@ -142,6 +172,9 @@ impl DirectoryView {
         Ok(())
     }
     fn selected_path(&self) -> Option<&Path> {
+        if self.grep_all {
+            return None;
+        }
         self.entries
             .get(self.cursor)
             .map(|entry| entry.path.as_path())
@@ -165,6 +198,11 @@ impl DirectoryView {
     }
     pub fn poll_refresh(&mut self) -> Result<bool> {
         let expired = self.expire_markers(std::time::Instant::now());
+        if self.grep_query.is_some() {
+            self.pending_refresh = None;
+            self.last_poll = std::time::Instant::now();
+            return Ok(expired);
+        }
         if let Some(receiver) = &self.pending_refresh {
             match receiver.try_recv() {
                 Ok(result) => {
@@ -233,6 +271,11 @@ impl DirectoryView {
                 cursor: self.cursor,
                 list_scroll: self.list_start(),
                 changed_only: self.changed_only,
+                grep_query: self.grep_query.clone(),
+                grep_all: self.grep_all,
+                grep_files: self.grep_files.clone(),
+                last_grep: self.last_grep.clone(),
+                grep_links: Vec::new(),
                 preview: Preview::Text(Text::default()),
                 patch: self.patch.clone(),
                 preview_scroll: 0,
@@ -354,7 +397,12 @@ impl DirectoryView {
     fn rebuild(&mut self) -> Result<()> {
         let selected = self.entries.get(self.cursor).map(|e| e.path.clone());
         let mut nodes = BTreeSet::new();
-        for path in self.changes.keys() {
+        let paths: Vec<&PathBuf> = if self.grep_query.is_some() {
+            self.grep_files.iter().collect()
+        } else {
+            self.changes.keys().collect()
+        };
+        for path in paths {
             let mut node = path.as_path();
             while node != self.directory {
                 nodes.insert(node.to_owned());
@@ -363,7 +411,7 @@ impl DirectoryView {
             }
         }
         let mut entries = Vec::new();
-        if self.changed_only {
+        if self.changed_only || self.grep_query.is_some() {
             fn walk(
                 dir: &Path,
                 nodes: &BTreeSet<PathBuf>,
@@ -388,7 +436,24 @@ impl DirectoryView {
                     }
                 }
             }
-            walk(&self.directory, &nodes, &self.changes, 0, &mut entries);
+            let files = if self.grep_query.is_some() {
+                self.grep_files
+                    .iter()
+                    .map(|p| {
+                        (
+                            p.clone(),
+                            Change {
+                                index: 0,
+                                old: None,
+                                stamp: None,
+                            },
+                        )
+                    })
+                    .collect()
+            } else {
+                self.changes.clone()
+            };
+            walk(&self.directory, &nodes, &files, 0, &mut entries);
         } else {
             for entry in std::fs::read_dir(&self.directory)? {
                 let entry = entry?;
@@ -427,6 +492,76 @@ impl DirectoryView {
             });
         Ok(())
     }
+    pub fn grep_snapshot(&self) -> GrepSnapshot {
+        GrepSnapshot {
+            query: self.grep_query.clone(),
+            last: self.last_grep.clone(),
+            files: self.grep_files.clone(),
+            changed_only: self.changed_only,
+            selected: self.selected_path().map(Path::to_owned),
+            preview_scroll: self.preview_scroll,
+            grep_all: self.grep_all,
+        }
+    }
+    pub fn restore_grep(&mut self, snapshot: &GrepSnapshot) -> Result<()> {
+        self.grep_query = snapshot.query.clone();
+        self.last_grep = snapshot.last.clone();
+        self.grep_files = snapshot.files.clone();
+        self.changed_only = snapshot.changed_only;
+        self.grep_all = snapshot.grep_all;
+        self.rebuild()?;
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| Some(&entry.path) == snapshot.selected.as_ref())
+        {
+            self.cursor = index;
+        }
+        self.ensure_selection_visible();
+        self.load_preview()?;
+        self.preview_scroll = snapshot.preview_scroll;
+        Ok(())
+    }
+    fn run_grep(&mut self, query: &str) -> Result<()> {
+        let out = Command::new("rg")
+            .current_dir(&self.directory)
+            .args([
+                "--files-with-matches",
+                "--null",
+                "--color=never",
+                "-e",
+                query,
+                "--",
+                ".",
+            ])
+            .output()
+            .context("Could not run ripgrep (rg)")?;
+        anyhow::ensure!(
+            out.status.success() || out.status.code() == Some(1),
+            "ripgrep: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        self.grep_files = out
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|b| !b.is_empty())
+            .map(|p| {
+                self.directory
+                    .join(path_bytes(p.strip_prefix(b"./").unwrap_or(p)))
+            })
+            .collect();
+        Ok(())
+    }
+    pub fn search_grep(&mut self, query: &str) -> Result<()> {
+        self.run_grep(query)?;
+        self.last_grep = query.to_owned();
+        self.grep_query = Some(query.to_owned());
+        self.grep_all = true;
+        self.pending_refresh = None;
+        self.rebuild()?;
+        self.ensure_selection_visible();
+        self.load_preview()
+    }
     fn selected_stamp(&self) -> Option<(u64, Option<std::time::SystemTime>)> {
         let metadata = std::fs::metadata(self.selected_path()?).ok()?;
         Some((metadata.len(), metadata.modified().ok()))
@@ -435,6 +570,32 @@ impl DirectoryView {
         self.preview_stamp = self.selected_stamp();
         self.preview_scroll = 0;
         self.patch.clear();
+        self.grep_links.clear();
+        if let Some(query) = &self.grep_query {
+            let relative = if self.grep_all {
+                Path::new(".")
+            } else if let Some(entry) = self.entries.get(self.cursor) {
+                entry.path.strip_prefix(&self.directory)?
+            } else {
+                self.preview = Preview::Text(Text::from("No matches."));
+                return Ok(());
+            };
+            let out = Command::new("rg")
+                .current_dir(&self.directory)
+                .args(["--json", "-e", query, "--"])
+                .arg(relative)
+                .output()
+                .context("Could not run ripgrep (rg)")?;
+            anyhow::ensure!(
+                out.status.success() || out.status.code() == Some(1),
+                "ripgrep: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            let (text, links) = format_grep_results(&out.stdout)?;
+            self.grep_links = links;
+            self.preview = Preview::Text(text);
+            return Ok(());
+        }
         let Some(entry) = self.entries.get(self.cursor) else {
             self.preview = Preview::Text(Text::from("No files in this filter."));
             return Ok(());
@@ -515,6 +676,9 @@ impl DirectoryView {
         &self.patch
     }
     fn open(&self) -> Action {
+        if self.grep_all {
+            return Action::None;
+        }
         self.entries.get(self.cursor).map_or(Action::None, |e| {
             if e.path.exists() {
                 Action::Open(e.path.clone())
@@ -524,6 +688,12 @@ impl DirectoryView {
         })
     }
     fn move_by(&mut self, delta: isize) -> Result<()> {
+        if self.grep_all && !self.entries.is_empty() {
+            self.grep_all = false;
+            self.cursor = if delta < 0 { self.entries.len() - 1 } else { 0 };
+            self.ensure_selection_visible();
+            return self.load_preview();
+        }
         let next = self
             .cursor
             .saturating_add_signed(delta)
@@ -573,9 +743,24 @@ impl DirectoryView {
             }
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace => return Ok(Action::Close),
             KeyCode::Char('f') => {
-                self.changed_only = !self.changed_only;
+                if self.grep_query.is_some() {
+                    self.grep_query = None;
+                    self.grep_all = false;
+                    self.changed_only = false;
+                } else if !self.changed_only {
+                    self.changed_only = true;
+                } else if !self.last_grep.is_empty() {
+                    self.grep_query = Some(self.last_grep.clone());
+                    self.grep_all = true;
+                } else {
+                    self.changed_only = false;
+                }
                 self.rebuild()?;
                 self.ensure_selection_visible();
+                self.load_preview()?;
+            }
+            KeyCode::Char('a') if self.grep_query.is_some() => {
+                self.grep_all = true;
                 self.load_preview()?;
             }
             KeyCode::Char('r') => self.refresh()?,
@@ -589,11 +774,13 @@ impl DirectoryView {
             KeyCode::PageUp => self.scroll_preview(-(self.height as isize)),
             KeyCode::PageDown | KeyCode::Char(' ') => self.scroll_preview(self.height as isize),
             KeyCode::Home if !self.preview_focus => {
+                self.grep_all = false;
                 self.cursor = 0;
                 self.ensure_selection_visible();
                 self.load_preview()?;
             }
             KeyCode::End if !self.preview_focus => {
+                self.grep_all = false;
                 self.cursor = self.entries.len().saturating_sub(1);
                 self.ensure_selection_visible();
                 self.load_preview()?;
@@ -614,6 +801,52 @@ impl DirectoryView {
     fn list_start(&self) -> usize {
         self.list_scroll
             .min(self.entries.len().saturating_sub(self.height.max(1)))
+    }
+    pub fn grep_link_at(
+        &self,
+        column: u16,
+        row: u16,
+        area: Rect,
+    ) -> Option<(PathBuf, Option<usize>, Rect)> {
+        if self.grep_query.is_none() {
+            return None;
+        }
+        let width = usize::from(area.width.saturating_sub(4));
+        let left = Self::list_width(width);
+        if left == width || row <= area.y || row >= area.bottom().saturating_sub(1) {
+            return None;
+        }
+        let start_x = area.x as usize + 2 + left + 2;
+        let relative_column = usize::from(column).checked_sub(start_x)?;
+        let right_width = width.saturating_sub(left + 2);
+        if relative_column >= right_width || column >= area.right().saturating_sub(2) {
+            return None;
+        }
+        let preview_row =
+            usize::from(row - area.y - 1) + self.preview_scroll.min(self.preview_max.get());
+        let link = self.grep_links.get(preview_row)?.as_ref()?;
+        let end = link.end.min(right_width);
+        if relative_column < link.start || relative_column >= end {
+            return None;
+        }
+        let rect = Rect::new(
+            (start_x + link.start) as u16,
+            row,
+            (end - link.start) as u16,
+            1,
+        );
+        Some((self.directory.join(&link.path), link.line, rect))
+    }
+    pub fn grep_target_at(
+        &self,
+        mouse: MouseEvent,
+        area: Rect,
+    ) -> Option<(PathBuf, Option<usize>)> {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+        self.grep_link_at(mouse.column, mouse.row, area)
+            .map(|(path, line, _)| (path, line))
     }
     pub fn mouse(&mut self, mouse: MouseEvent, area: Rect) -> Result<()> {
         let width = usize::from(area.width.saturating_sub(4));
@@ -663,6 +896,8 @@ impl DirectoryView {
             MouseEventKind::Down(MouseButton::Left) if !self.preview_focus => {
                 let cursor = self.list_start() + usize::from(mouse.row - area.y - 1);
                 if cursor < self.entries.len() {
+                    self.grep_all =
+                        self.grep_query.is_some() && !self.grep_all && self.cursor == cursor;
                     self.cursor = cursor;
                     self.load_preview()?;
                 }
@@ -681,7 +916,7 @@ impl DirectoryView {
             Span::raw(" f: "),
             Span::styled(
                 "all",
-                if self.changed_only {
+                if self.changed_only || self.grep_query.is_some() {
                     Style::default()
                 } else {
                     bold
@@ -690,13 +925,22 @@ impl DirectoryView {
             Span::raw("/"),
             Span::styled(
                 "changed",
-                if self.changed_only {
+                if self.changed_only && self.grep_query.is_none() {
                     bold
                 } else {
                     Style::default()
                 },
             ),
-            Span::raw(" · r: refresh "),
+            Span::raw("/"),
+            Span::styled(
+                "grep",
+                if self.grep_query.is_some() {
+                    bold
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::raw(" · Ctrl+G: grep · a: all results · r: refresh "),
         ])
     }
     pub fn render(&self, width: usize, dark: bool) -> Text<'static> {
@@ -724,7 +968,7 @@ impl DirectoryView {
                     .get(start + row)
                     .map_or((String::new(), Style::default()), |e| {
                         let name = clean(&e.path.file_name().unwrap_or_default().to_string_lossy());
-                        let style = if start + row == self.cursor {
+                        let style = if !self.grep_all && start + row == self.cursor {
                             crate::diff_view::after_style(dark)
                         } else if self.relevant(&e.path) {
                             Style::default().fg(if dark {
@@ -835,6 +1079,108 @@ impl DirectoryView {
         }
     }
 }
+fn grep_json_bytes(value: &serde_json::Value) -> Result<Vec<u8>> {
+    if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+        Ok(text.as_bytes().to_vec())
+    } else {
+        use base64::Engine;
+        Ok(base64::engine::general_purpose::STANDARD.decode(
+            value
+                .get("bytes")
+                .and_then(|v| v.as_str())
+                .context("Invalid ripgrep JSON text")?,
+        )?)
+    }
+}
+
+fn format_grep_results(output: &[u8]) -> Result<(Text<'static>, Vec<Option<GrepLink>>)> {
+    let events: Vec<serde_json::Value> = output
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice)
+        .collect::<std::result::Result<_, _>>()?;
+    let number_width = events
+        .iter()
+        .filter(|event| event["type"] == "match")
+        .filter_map(|event| event["data"]["line_number"].as_u64())
+        .map(|number| number.to_string().len())
+        .max()
+        .unwrap_or(1);
+    let mut rows = Vec::new();
+    let mut links = Vec::new();
+    let mut previous_path: Option<Vec<u8>> = None;
+    for event in events {
+        if event["type"] != "match" {
+            continue;
+        }
+        let data = &event["data"];
+        let path = grep_json_bytes(&data["path"])?;
+        if previous_path.as_ref() != Some(&path) {
+            if !rows.is_empty() {
+                rows.push(Line::default());
+                links.push(None);
+            }
+            let label = clean(&String::from_utf8_lossy(&path));
+            links.push(Some(GrepLink {
+                path: path_bytes(&path),
+                line: None,
+                start: 0,
+                end: unicode_width::UnicodeWidthStr::width(label.as_str()),
+            }));
+            rows.push(Line::styled(label, Style::default().fg(Color::Magenta)));
+            previous_path = Some(path.clone());
+        }
+        let line_number = data["line_number"].as_u64().unwrap_or(0) as usize;
+        let digits = line_number.to_string().len();
+        links.push(Some(GrepLink {
+            path: path_bytes(&path),
+            line: Some(line_number),
+            start: number_width.saturating_sub(digits),
+            end: number_width,
+        }));
+        let bytes = grep_json_bytes(&data["lines"])?;
+        let content = bytes.strip_suffix(b"\n").unwrap_or(&bytes);
+        let content = content.strip_suffix(b"\r").unwrap_or(content);
+        let mut spans = vec![
+            Span::styled(
+                format!(
+                    "{:>number_width$}",
+                    data["line_number"].as_u64().unwrap_or(0)
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::raw(": "),
+        ];
+        let mut offset = 0;
+        if let Some(matches) = data["submatches"].as_array() {
+            for matched in matches {
+                let start = matched["start"].as_u64().unwrap_or(0) as usize;
+                let end = matched["end"].as_u64().unwrap_or(0) as usize;
+                if start < offset || end < start || end > content.len() {
+                    continue;
+                }
+                spans.push(Span::raw(clean(&String::from_utf8_lossy(
+                    &content[offset..start],
+                ))));
+                spans.push(Span::styled(
+                    clean(&String::from_utf8_lossy(&content[start..end])),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ));
+                offset = end;
+            }
+        }
+        spans.push(Span::raw(clean(&String::from_utf8_lossy(
+            &content[offset..],
+        ))));
+        rows.push(Line::from(spans));
+    }
+    if rows.is_empty() {
+        rows.push(Line::raw("No matches."));
+        links.push(None);
+    }
+    Ok((Text::from(rows), links))
+}
+
 fn clean(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
@@ -912,6 +1258,7 @@ mod tests {
         );
     }
     fn select(view: &mut DirectoryView, filename: &str) {
+        view.grep_all = false;
         view.cursor = view
             .entries
             .iter()
@@ -931,6 +1278,114 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "refresh timed out");
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+    #[test]
+    fn grep_click_targets_follow_preview_scroll() {
+        let (dir, _) = crate::git_links::tests::repository();
+        let path = dir.path().join("match space.txt");
+        std::fs::write(&path, "hit\n".repeat(20)).unwrap();
+        let mut view = DirectoryView::load(dir.path()).unwrap();
+        view.height = 4;
+        view.search_grep("hit").unwrap();
+        view.render(120, true);
+        let area = Rect::new(0, 0, 124, 6);
+        let x = 2 + DirectoryView::list_width(120) as u16 + 2;
+        let click = |column, row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let expected = view.directory.join("match space.txt");
+        let (hover_file, hover_line, rect) = view.grep_link_at(x, 1, area).unwrap();
+        assert_eq!(hover_file, expected);
+        assert_eq!(hover_line, None);
+        assert_eq!(rect.x, x);
+        assert!(rect.width > 1);
+        let (file, line) = view.grep_target_at(click(x, 1), area).unwrap();
+        assert_eq!(file, expected);
+        assert_eq!(line, None);
+        let (_, hover_line, rect) = view.grep_link_at(x + 1, 2, area).unwrap();
+        assert_eq!(hover_line, Some(1));
+        assert_eq!(rect, Rect::new(x + 1, 2, 1, 1));
+        let (file, line) = view.grep_target_at(click(x + 1, 2), area).unwrap();
+        assert_eq!(file, expected);
+        assert_eq!(line, Some(1));
+        assert!(view.grep_target_at(click(x + 5, 2), area).is_none());
+        view.preview_scroll = 10;
+        let (_, line) = view.grep_target_at(click(x, 1), area).unwrap();
+        assert_eq!(line, Some(10));
+        assert!(view.grep_target_at(click(3, 1), area).is_none());
+    }
+    #[test]
+    fn grep_line_numbers_align_across_files() {
+        let records = concat!(
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"a\"},\"lines\":{\"text\":\"hit\\n\"},\"line_number\":2,\"submatches\":[]}}\n",
+            "{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"b\"},\"lines\":{\"text\":\"hit\\n\"},\"line_number\":1144,\"submatches\":[]}}\n"
+        );
+        let text = format_grep_results(records.as_bytes())
+            .unwrap()
+            .0
+            .to_string();
+        assert!(text.contains("   2: hit"));
+        assert!(text.contains("1144: hit"));
+    }
+    #[test]
+    fn grep_shows_matching_tree_and_lines_and_cycles_filters() {
+        let (dir, _) = crate::git_links::tests::repository();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(dir.path().join("nested/match.txt"), "first\nneedle here\n").unwrap();
+        std::fs::write(dir.path().join("nested/other.txt"), "needle again\n").unwrap();
+        let mut view = DirectoryView::load(dir.path()).unwrap();
+        std::fs::write(dir.path().join("root-match.txt"), "needle root\n").unwrap();
+        let snapshot = view.grep_snapshot();
+        view.search_grep("needle").unwrap();
+        assert!(view.selected_path().is_none());
+        let Preview::Text(all) = &view.preview else {
+            panic!("expected grep preview")
+        };
+        assert!(all.to_string().contains("needle root") && all.to_string().contains("needle here"));
+        assert!(matches!(view.key(KeyCode::Enter).unwrap(), Action::None));
+        view.key(KeyCode::Down).unwrap();
+        assert!(view.selected_path().is_some());
+        view.key(KeyCode::Char('a')).unwrap();
+        assert!(view.selected_path().is_none());
+        select(&mut view, "nested");
+        let Preview::Text(preview) = &view.preview else {
+            panic!("expected grep preview")
+        };
+        assert!(preview
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .any(|span| span.content == "needle"
+                && span.style.fg == Some(Color::Red)
+                && span.style.add_modifier.contains(Modifier::BOLD)));
+        let preview = preview.to_string();
+        assert!(preview.contains("nested/match.txt\n2: needle here"));
+        assert!(preview.contains("nested/other.txt\n1: needle again"));
+        view.restore_grep(&snapshot).unwrap();
+        assert!(view.grep_query.is_none());
+        view.search_grep("needle").unwrap();
+        assert!(view
+            .entries
+            .iter()
+            .any(|e| e.directory && e.path.ends_with("nested")));
+        select(&mut view, "nested/match.txt");
+        assert!(view
+            .render(120, true)
+            .to_string()
+            .contains("2: needle here"));
+        view.key(KeyCode::Char('f')).unwrap();
+        assert!(!view.changed_only && view.grep_query.is_none());
+        view.key(KeyCode::Char('f')).unwrap();
+        assert!(view.changed_only && view.grep_query.is_none());
+        view.key(KeyCode::Char('f')).unwrap();
+        assert_eq!(view.grep_query.as_deref(), Some("needle"));
+        assert!(view.search_grep("[").is_err());
+        assert_eq!(view.grep_query.as_deref(), Some("needle"));
+        view.search_grep("no-such-match-xyz").unwrap();
+        assert!(view.entries.is_empty());
     }
     #[test]
     fn polling_markers_start_on_render_and_expire_after_one_minute() {
