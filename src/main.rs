@@ -36,6 +36,7 @@ use mdcat::output::{resolved_pager_basename, Output};
 mod analyzer;
 mod blame_view;
 mod code_format;
+mod code_hover;
 mod diff_view;
 mod directory_view;
 mod git_directory;

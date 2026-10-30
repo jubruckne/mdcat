@@ -85,6 +85,10 @@ pub fn run(
         let mut links = Vec::<pulldown_cmark_mdcat::ratatui::LinkRegion>::new();
         let mut selected: Option<String> = None;
         let mut mouse_position = None;
+        let mut code_hover = crate::code_hover::Hover::default();
+        let mut hover_source: std::sync::Arc<str> = "".into();
+        let mut hover_first_row = None;
+        let mut hover_revision = 0u64;
         let mut link_picker: Option<LinkPicker> = None;
         let mut titles = Vec::new();
         let mut history: Vec<(crate::navigation::Document, usize, Option<String>)> = Vec::new();
@@ -300,6 +304,33 @@ pub fn run(
                 } else {
                     None
                 };
+                code_hover.update(None);
+                hover_revision += 1;
+                hover_first_row = None;
+                if document.can_format()
+                    && document
+                        .path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| {
+                            matches!(e, "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx")
+                        })
+                {
+                    hover_source = pulldown_cmark_mdcat::expand_tabs(
+                        &document.input,
+                        options.tabs.unwrap_or(4),
+                    )
+                    .into_owned()
+                    .into();
+                    hover_first_row = anchor_line_with_table_width(
+                        &document,
+                        "L1",
+                        &settings,
+                        resources,
+                        options,
+                        table_width,
+                    )?;
+                }
                 rendered_width = Some((width, table_width));
             }
             if grep_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
@@ -365,6 +396,30 @@ pub fn run(
                         .as_ref()?
                         .grep_link_at(column, row, area)
                 });
+            let hover_allowed = !query.open
+                && !response.visible
+                && !search.open
+                && !selection.dragging
+                && !dragging_scrollbar
+                && link_picker.is_none();
+            if !(hover_allowed && mouse_position.is_some_and(|(x, y)| code_hover.contains(x, y))) {
+                let target = if hover_allowed && hovered.is_none() {
+                    mouse_position.and_then(|(x, y)| {
+                        crate::code_hover::target_at(
+                            &document.path,
+                            hover_source.clone(),
+                            hover_revision,
+                            hover_first_row?,
+                            &text,
+                            (scroll, area),
+                            (x, y),
+                        )
+                    })
+                } else {
+                    None
+                };
+                code_hover.update(target);
+            }
             terminal.draw(|frame| {
                 // Each fixed child covers its parent's body, leaving its title bar visible.
                 for (index, (_, position, _)) in history.iter().skip(first_parent).enumerate() {
@@ -626,6 +681,7 @@ pub fn run(
                         });
                     frame.render_stateful_widget(scrollbar, track, &mut state);
                 }
+                code_hover.draw(frame, area, settings, no_colour || crossterm::style::Colored::ansi_color_disabled());
                 if response.visible {
                     response.draw(frame);
                 }
@@ -715,7 +771,27 @@ pub fn run(
             }
             let is_mouse = matches!(event, Event::Mouse(_));
             match event {
-                Event::FocusLost => focused = false,
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Esc
+                        && code_hover.visible() =>
+                {
+                    code_hover.dismiss()
+                }
+                Event::Mouse(mouse)
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                    ) && code_hover.scroll(
+                        mouse.column,
+                        mouse.row,
+                        matches!(mouse.kind, MouseEventKind::ScrollDown),
+                    ) => {}
+                Event::Mouse(mouse) if code_hover.contains(mouse.column, mouse.row) => {}
+                Event::FocusLost => {
+                    code_hover.dismiss();
+                    focused = false;
+                }
                 Event::FocusGained => {
                     if let Some(view) = document.directory_view.as_mut() {
                         view.refresh_on_focus();
@@ -4243,6 +4319,17 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>();
             assert_eq!(content.trim(), format!("// SOURCE_{}", requested.min(200)));
+            let target = crate::code_hover::target_at(
+                &code.path,
+                code.input.clone().into(),
+                1,
+                row - requested.min(200) + 1,
+                &text,
+                (row, ratatui::layout::Rect::new(0, 0, 80, 12)),
+                (6, 1),
+            );
+            assert!(target.is_some());
+            assert_eq!(target.unwrap().line, requested.min(200) - 1);
         }
     }
 

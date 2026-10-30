@@ -123,6 +123,14 @@ four-space indentation, expanded statements, and same-line opening braces.
 Formatting uses `clang-format` and leaves the file on disk unchanged. Press Ctrl+O
 again to restore the original view; the viewer keeps approximately the same position. If clang-format is outside your PATH, set
 `clang_format = "/path/to/clang-format"` at the top level of mdcat's config file.
+In C/C++ source and headers, pause the mouse over an identifier to show symbol information
+from `clangd`. Tooltips show formatted C++ declarations: variables and constants, multiline function
+signatures, public class/struct/union members, and enum values. Aliases are followed
+through related types in the same header when available. Escape dismisses the popup; use the mouse wheel over it to scroll longer
+answers. Hover also works in the Ctrl+O formatted view. `clangd` must be on PATH; it uses
+the project's compile commands and `.clangd` configuration to resolve includes and types.
+Without suitable compiler flags, some symbols may be unavailable. The server starts on the
+first hover and stops when mdcat exits.
 Directory links open a nested listing with links to subdirectories and files. Use Up/Down to
 select an entry and Enter to open it. In a Git repository, changed and untracked entries are
 shown in yellow; directories are yellow when they contain changes.

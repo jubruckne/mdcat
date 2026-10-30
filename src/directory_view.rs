@@ -808,9 +808,7 @@ impl DirectoryView {
         row: u16,
         area: Rect,
     ) -> Option<(PathBuf, Option<usize>, Rect)> {
-        if self.grep_query.is_none() {
-            return None;
-        }
+        self.grep_query.as_ref()?;
         let width = usize::from(area.width.saturating_sub(4));
         let left = Self::list_width(width);
         if left == width || row <= area.y || row >= area.bottom().saturating_sub(1) {

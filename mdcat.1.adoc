@@ -177,6 +177,12 @@ In this case remote images render as hyperlinks.
     mdcat --browse src/metal_compile_options.mm:22. This opens the original source
     at the requested line; a line beyond the file's end jumps to its last line.
     An existing literal filename containing a colon takes precedence.
+    Hover over C/C++ identifiers to show symbol information from clangd (on PATH).
+    Tooltips show formatted declarations, multiline function signatures, public
+    class/struct/union members, and enum values, following aliases in the same header
+    when available. Escape dismisses the popup; the mouse wheel scrolls longer answers.
+    This also works in formatted views. Accurate results require suitable project
+    compile commands or .clangd configuration.
     Ctrl+O toggles a formatted view of C/C++, GLSL, HLSL, and Metal source using
     clang-format, with four-space indentation and same-line opening braces.
     The file on disk stays unchanged. Press Ctrl+O again to restore the original
