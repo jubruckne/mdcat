@@ -40,6 +40,8 @@ pub struct Selection {
     moved: bool,
     rectangular: bool,
     next_scroll: Option<std::time::Instant>,
+    diff_bounds: Option<Vec<[Option<(usize, usize)>; 2]>>,
+    diff_side: Option<usize>,
 }
 
 impl Selection {
@@ -51,12 +53,65 @@ impl Selection {
             moved: false,
             rectangular,
             next_scroll: None,
+            diff_bounds: None,
+            diff_side: None,
         };
+    }
+
+    pub fn constrain_diff(&mut self, bounds: Vec<[Option<(usize, usize)>; 2]>) {
+        if let Some(anchor) = self.anchor {
+            if bounds
+                .get(anchor.row)
+                .is_none_or(|row| row.iter().all(Option::is_none))
+            {
+                return;
+            }
+            self.diff_side = bounds.get(anchor.row).and_then(|sides| {
+                sides.iter().position(|range| {
+                    range.is_some_and(|(start, end)| anchor.column >= start && anchor.column < end)
+                })
+            });
+            self.diff_bounds = Some(bounds);
+        }
+    }
+
+    fn ranges(&self, row: usize, width: usize) -> Vec<(usize, usize)> {
+        let Some((start, end)) = self.range(row, width) else {
+            return Vec::new();
+        };
+        let Some(bounds) = &self.diff_bounds else {
+            return vec![(start, end)];
+        };
+        let Some(sides) = bounds.get(row) else {
+            return Vec::new();
+        };
+        sides
+            .iter()
+            .enumerate()
+            .filter_map(|(side, range)| {
+                if !self.rectangular && self.diff_side != Some(side) {
+                    return None;
+                }
+                let (left, right) = (*range)?;
+                let clipped = (start.max(left), end.min(right));
+                (clipped.0 < clipped.1).then_some(clipped)
+            })
+            .collect()
     }
 
     pub fn extend(&mut self, point: Point) {
         if self.dragging {
             self.moved |= self.anchor != Some(point);
+            let mut point = point;
+            if !self.rectangular {
+                if let (Some(bounds), Some(side), Some(anchor)) =
+                    (&self.diff_bounds, self.diff_side, self.anchor)
+                {
+                    if let Some((start, end)) = bounds.get(anchor.row).and_then(|row| row[side]) {
+                        point.column = point.column.clamp(start, end.saturating_sub(1));
+                    }
+                }
+            }
             self.head = Some(point);
         }
     }
@@ -154,24 +209,27 @@ impl Selection {
                 break;
             };
             let line = line.to_string();
-            let Some((start, end)) = self.range(row, line.width()) else {
-                continue;
-            };
-            let mut column = 0;
+            let ranges = self.ranges(row, line.width());
             let mut selected = String::new();
-            for grapheme in line.graphemes(true) {
-                let next = column + grapheme.width();
-                if column < end && next > start {
-                    selected.push_str(grapheme);
+            for (start, end) in ranges {
+                let mut column = 0;
+                for grapheme in line.graphemes(true) {
+                    let next = column + grapheme.width();
+                    if column < end && next > start {
+                        selected.push_str(grapheme);
+                    }
+                    column = next;
                 }
-                column = next;
+                if self.rectangular {
+                    // Preserve the shape when rows end before the rectangle does.
+                    selected.extend(std::iter::repeat_n(
+                        ' ',
+                        end.saturating_sub(column.max(start)),
+                    ));
+                }
             }
-            if self.rectangular {
-                // Preserve the shape when rows end before the rectangle does.
-                selected.extend(std::iter::repeat_n(
-                    ' ',
-                    end.saturating_sub(column.max(start)),
-                ));
+            if self.diff_bounds.is_some() && !self.rectangular {
+                selected.truncate(selected.trim_end().len());
             }
             rows.push(selected);
         }
@@ -187,37 +245,36 @@ impl Selection {
             .skip(scroll)
             .take(usize::from(area.height.saturating_sub(2)))
         {
-            let Some((mut start, mut end)) = self.range(index, line.width()) else {
-                continue;
-            };
-            // Expand to whole graphemes, including wide characters and emoji.
-            let line = line.to_string();
-            // Renderers may pad rows to the viewport width. Do not highlight
-            // that padding or empty cells after the actual text.
-            let line = line.trim_end();
-            let mut column = 0;
-            for grapheme in line.graphemes(true) {
-                let next = column + grapheme.width();
-                if column < start && next > start {
-                    start = column;
+            for (mut start, mut end) in self.ranges(index, line.width()) {
+                // Expand to whole graphemes, including wide characters and emoji.
+                let line = line.to_string();
+                // Renderers may pad rows to the viewport width. Do not highlight
+                // that padding or empty cells after the actual text.
+                let line = line.trim_end();
+                let mut column = 0;
+                for grapheme in line.graphemes(true) {
+                    let next = column + grapheme.width();
+                    if column < start && next > start {
+                        start = column;
+                    }
+                    if column < end && next > end {
+                        end = next;
+                    }
+                    column = next;
                 }
-                if column < end && next > end {
-                    end = next;
+                start = start.min(width);
+                end = end.min(width).min(column);
+                if end > start {
+                    frame.buffer_mut().set_style(
+                        Rect::new(
+                            area.x + 2 + start as u16,
+                            area.y + 1 + (index - scroll) as u16,
+                            (end - start) as u16,
+                            1,
+                        ),
+                        Style::default().add_modifier(Modifier::REVERSED),
+                    );
                 }
-                column = next;
-            }
-            start = start.min(width);
-            end = end.min(width).min(column);
-            if end > start {
-                frame.buffer_mut().set_style(
-                    Rect::new(
-                        area.x + 2 + start as u16,
-                        area.y + 1 + (index - scroll) as u16,
-                        (end - start) as u16,
-                        1,
-                    ),
-                    Style::default().add_modifier(Modifier::REVERSED),
-                );
             }
         }
     }
@@ -266,6 +323,29 @@ mod tests {
             column: end.1,
         });
         selection
+    }
+
+    #[test]
+    fn diff_selection_clips_to_panes_and_excludes_gutters() {
+        let text = Text::from(
+            "1  old   │ 2  new
+3  next  │ 4  more",
+        );
+        let bounds = vec![[Some((3, 9)), Some((14, 18))]; 2];
+        let mut selection = Selection::default();
+        selection.start(Point { row: 0, column: 3 }, false);
+        selection.constrain_diff(bounds.clone());
+        selection.extend(Point { row: 1, column: 17 });
+        assert_eq!(
+            selection.contents(&text),
+            "old
+next"
+        );
+        let mut rectangular = Selection::default();
+        rectangular.start(Point { row: 0, column: 3 }, true);
+        rectangular.constrain_diff(bounds);
+        rectangular.extend(Point { row: 1, column: 17 });
+        assert_eq!(rectangular.contents(&text), "old   new \nnext  more");
     }
 
     #[test]

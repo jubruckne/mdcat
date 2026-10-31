@@ -1,6 +1,6 @@
 //! Directory browser with scoped Git status and a shared side-by-side diff preview.
 use anyhow::{Context, Result};
-use crossterm::event::{KeyCode, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Command,
@@ -76,6 +76,9 @@ pub struct DirectoryView {
     preview_max: Cell<usize>,
     preview_focus: bool,
     dragging_scrollbar: Option<bool>,
+    text_selection: crate::text_selection::Selection,
+    selection_text: RefCell<Text<'static>>,
+    selection_width: usize,
     wide: Cell<bool>,
     pub height: usize,
     last_poll: std::time::Instant,
@@ -142,6 +145,9 @@ impl DirectoryView {
             preview_max: Cell::new(0),
             preview_focus: false,
             dragging_scrollbar: None,
+            text_selection: Default::default(),
+            selection_text: RefCell::new(Text::default()),
+            selection_width: 0,
             wide: Cell::new(false),
             height: 20,
             last_poll: std::time::Instant::now(),
@@ -244,6 +250,7 @@ impl DirectoryView {
                         self.entries = next.entries;
                         self.cursor = next.cursor;
                         if !matches!(next.preview, Preview::Unchanged) {
+                            self.text_selection = Default::default();
                             self.preview = next.preview;
                         }
                         self.patch = next.patch;
@@ -282,6 +289,9 @@ impl DirectoryView {
                 preview_max: Cell::new(0),
                 preview_focus: false,
                 dragging_scrollbar: None,
+                text_selection: Default::default(),
+                selection_text: RefCell::new(Text::default()),
+                selection_width: 0,
                 wide: Cell::new(false),
                 height: self.height,
                 last_poll: self.last_poll,
@@ -567,6 +577,7 @@ impl DirectoryView {
         Some((metadata.len(), metadata.modified().ok()))
     }
     fn load_preview(&mut self) -> Result<()> {
+        self.text_selection = Default::default();
         self.preview_stamp = self.selected_stamp();
         self.preview_scroll = 0;
         self.patch.clear();
@@ -846,9 +857,103 @@ impl DirectoryView {
         self.grep_link_at(mouse.column, mouse.row, area)
             .map(|(path, line, _)| (path, line))
     }
+    fn selection_area(area: Rect) -> Option<Rect> {
+        let width = usize::from(area.width.saturating_sub(4));
+        let left = Self::list_width(width);
+        if left >= width || area.height < 4 {
+            return None;
+        }
+        Some(Rect::new(
+            area.x + left as u16 + 2,
+            area.y + 1,
+            (width - left + 2) as u16,
+            area.height - 1,
+        ))
+    }
+
+    pub fn clear_text_selection(&mut self) -> bool {
+        if !self.text_selection.active() {
+            return false;
+        }
+        self.text_selection = Default::default();
+        true
+    }
+
+    pub fn selection_poll_timeout(
+        &self,
+        idle: std::time::Duration,
+        now: std::time::Instant,
+    ) -> std::time::Duration {
+        self.text_selection.poll_timeout(idle, now)
+    }
+
+    pub fn selection_auto_scroll(
+        &mut self,
+        pointer: Option<(u16, u16)>,
+        area: Rect,
+        now: std::time::Instant,
+    ) -> bool {
+        if self.selection_width != 0
+            && self.selection_width != usize::from(area.width.saturating_sub(4))
+        {
+            self.text_selection = Default::default();
+            self.selection_width = 0;
+        }
+        let Some(area) = Self::selection_area(area) else {
+            return false;
+        };
+        let old = self.preview_scroll;
+        let scroll = self.text_selection.auto_scroll(
+            pointer,
+            area,
+            old + 1,
+            self.preview_max.get() + 1,
+            now,
+        );
+        self.preview_scroll = scroll.saturating_sub(1);
+        old != self.preview_scroll
+    }
+
+    pub fn highlight_selection(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        if let Some(area) = Self::selection_area(area) {
+            self.text_selection.highlight(
+                frame,
+                &self.selection_text.borrow(),
+                area,
+                self.preview_scroll.min(self.preview_max.get()) + 1,
+            );
+        }
+    }
+
     pub fn mouse(&mut self, mouse: MouseEvent, area: Rect) -> Result<()> {
         let width = usize::from(area.width.saturating_sub(4));
         let left = Self::list_width(width);
+        if self.text_selection.dragging {
+            if let Some(selection_area) = Self::selection_area(area) {
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+                ) {
+                    self.text_selection.extend(crate::text_selection::Point::at(
+                        mouse.column,
+                        mouse.row,
+                        selection_area,
+                        self.preview_scroll.min(self.preview_max.get()) + 1,
+                    ));
+                    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                        self.text_selection.dragging = false;
+                        if self.text_selection.active() {
+                            let contents =
+                                self.text_selection.contents(&self.selection_text.borrow());
+                            if !contents.is_empty() {
+                                crate::text_selection::copy(&contents)?;
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+        }
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
             self.dragging_scrollbar = None;
             return Ok(());
@@ -890,6 +995,29 @@ impl DirectoryView {
             return Ok(());
         }
         self.preview_focus = usize::from(mouse.column - area.x - 2) >= Self::list_width(width);
+        if self.preview_focus && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if let (Preview::Diff(diff), Some(selection_area)) =
+                (&self.preview, Self::selection_area(area))
+            {
+                if mouse.row > selection_area.y
+                    && mouse.column >= selection_area.x + 2
+                    && mouse.column < area.right().saturating_sub(2)
+                {
+                    self.text_selection.start(
+                        crate::text_selection::Point::at(
+                            mouse.column,
+                            mouse.row,
+                            selection_area,
+                            self.preview_scroll.min(self.preview_max.get()) + 1,
+                        ),
+                        mouse.modifiers.contains(KeyModifiers::CONTROL),
+                    );
+                    self.text_selection.constrain_diff(diff.selection_bounds());
+                    self.selection_width = width;
+                    return Ok(());
+                }
+            }
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if !self.preview_focus => {
                 let cursor = self.list_start() + usize::from(mouse.row - area.y - 1);
@@ -955,6 +1083,7 @@ impl DirectoryView {
         } else {
             Text::default()
         };
+        *self.selection_text.borrow_mut() = preview.clone();
         self.preview_max
             .set(preview.lines.len().saturating_sub(self.height));
         let start = self.list_start();
@@ -1277,6 +1406,52 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
+    #[test]
+    fn diff_preview_selection_uses_scrolled_pane_coordinates() {
+        let (dir, _) = crate::git_links::tests::repository();
+        let mut view = DirectoryView::load(dir.path()).unwrap();
+        let patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-old one\n-old two\n+new one\n+new two\n";
+        let mut diff = crate::diff_view::DiffView::parse(patch);
+        diff.fold_all(false);
+        view.preview = Preview::Diff(diff);
+        view.height = 3;
+        let area = Rect::new(0, 0, 124, 5);
+        let width = usize::from(area.width - 4);
+        view.render(width, true);
+        let Preview::Diff(diff) = &view.preview else {
+            unreachable!()
+        };
+        let bounds = diff.selection_bounds();
+        let row = bounds.iter().position(|sides| sides[0].is_some()).unwrap();
+        view.preview_scroll = row.saturating_sub(1);
+        view.render(width, true);
+        let start = bounds[row][0].unwrap().0;
+        let end = bounds[row][1].unwrap().0;
+        let x = area.x as usize + 2 + DirectoryView::list_width(width) + 2;
+        let y = area.y + 2;
+        let mouse = |kind, column| MouseEvent {
+            kind,
+            column: column as u16,
+            row: y,
+            modifiers: KeyModifiers::empty(),
+        };
+        view.mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), x + start),
+            area,
+        )
+        .unwrap();
+        view.mouse(
+            mouse(MouseEventKind::Drag(MouseButton::Left), x + end),
+            area,
+        )
+        .unwrap();
+        assert_eq!(
+            view.text_selection.contents(&view.selection_text.borrow()),
+            "old one"
+        );
+        assert!(view.clear_text_selection());
+    }
+
     #[test]
     fn grep_click_targets_follow_preview_scroll() {
         let (dir, _) = crate::git_links::tests::repository();

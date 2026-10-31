@@ -31,6 +31,7 @@ struct File {
 struct Layout {
     files: Vec<Option<usize>>,
     headers: Vec<usize>,
+    selection: Vec<[Option<(usize, usize)>; 2]>,
 }
 pub struct DiffView {
     comparison_label: Option<String>,
@@ -250,6 +251,17 @@ impl DiffView {
         view
     }
 
+    pub fn pinned_header(&self, scroll: usize) -> Option<usize> {
+        self.layout
+            .borrow()
+            .headers
+            .iter()
+            .copied()
+            .take_while(|&header| header <= scroll)
+            .last()
+            .filter(|&header| header < scroll)
+    }
+
     pub fn toggle(&mut self, row: usize, header_only: bool) -> Option<usize> {
         let layout = self.layout.borrow();
         let file = (if header_only {
@@ -311,10 +323,15 @@ impl DiffView {
         self.show_fold_markers = visible;
     }
 
+    pub fn selection_bounds(&self) -> Vec<[Option<(usize, usize)>; 2]> {
+        self.layout.borrow().selection.clone()
+    }
+
     pub fn render(&self, width: usize, dark: bool) -> Text<'static> {
         let width = width.max(1);
         let mut lines = Vec::new();
         let mut layout = Layout::default();
+        let mut selection_rows = Vec::new();
         let muted = Style::default().fg(if dark {
             Color::Rgb(146, 140, 131)
         } else {
@@ -491,7 +508,16 @@ impl DiffView {
                                     .cloned()
                                     .unwrap_or_else(|| vec![Span::raw(" ".repeat(right_width))]),
                             );
-                            push(Line::from(spans), Some(index));
+                            let line_index = push(Line::from(spans), Some(index));
+                            let left_gutter = (digits + 2).min(left_width.saturating_sub(1));
+                            let right_gutter = (digits + 2).min(right_width.saturating_sub(1));
+                            selection_rows.push((
+                                line_index,
+                                [
+                                    Some((left_gutter, left_width)),
+                                    Some((left_width + 3 + right_gutter, width)),
+                                ],
+                            ));
                         }
                     }
                     Row::Pair { old, new, changed } => {
@@ -505,16 +531,28 @@ impl DiffView {
                         };
                         for (cell, marker, style) in cells {
                             if let Some(cell) = cell {
-                                for text in
-                                    wrap(&format!("{marker}{} {}", cell.number, cell.text), width)
+                                let prefix = format!("{marker}{} ", cell.number);
+                                for (part, text) in wrap(&format!("{prefix}{}", cell.text), width)
+                                    .into_iter()
+                                    .enumerate()
                                 {
-                                    push(Line::styled(text, style), Some(index));
+                                    let row = push(Line::styled(text, style), Some(index));
+                                    let start = if part == 0 {
+                                        prefix.len().min(width)
+                                    } else {
+                                        0
+                                    };
+                                    selection_rows.push((row, [Some((start, width)), None]));
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+        layout.selection.resize(lines.len(), [None, None]);
+        for (row, bounds) in selection_rows {
+            layout.selection[row] = bounds;
         }
         *self.layout.borrow_mut() = layout;
         Text::from(lines)
@@ -601,6 +639,17 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n")
     }
+    #[test]
+    fn pinned_header_follows_the_visible_file() {
+        let view = DiffView::parse(PATCH);
+        view.render(100, true);
+        let headers = view.layout.borrow().headers.clone();
+        assert_eq!(view.pinned_header(headers[0]), None);
+        assert_eq!(view.pinned_header(headers[0] + 1), Some(headers[0]));
+        assert_eq!(view.pinned_header(headers[1]), None);
+        assert_eq!(view.pinned_header(headers[1] + 1), Some(headers[1]));
+    }
+
     #[test]
     fn aligns_replacements_tracks_line_numbers_and_preserves_special_files() {
         let mut view = DiffView::parse(PATCH);

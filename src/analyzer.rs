@@ -362,14 +362,46 @@ pub fn run(
                 }
             }
             scroll = scroll.min(max_scroll);
+            let pin_active = document
+                .diff
+                .as_ref()
+                .and_then(|diff| diff.pinned_header(scroll))
+                .is_some()
+                && area.height > 3;
+            let selection_area = if pin_active {
+                ratatui::layout::Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+            } else {
+                area
+            };
             if !query.open && !response.visible && link_picker.is_none() {
-                scroll = selection.auto_scroll(
-                    mouse_position,
-                    area,
-                    scroll,
-                    max_scroll,
-                    std::time::Instant::now(),
-                );
+                let offset = usize::from(pin_active);
+                scroll = selection
+                    .auto_scroll(
+                        mouse_position,
+                        selection_area,
+                        scroll + offset,
+                        max_scroll + offset,
+                        std::time::Instant::now(),
+                    )
+                    .saturating_sub(offset);
+            }
+            let pinned_header = document
+                .diff
+                .as_ref()
+                .and_then(|diff| diff.pinned_header(scroll))
+                .filter(|_| area.height > 3);
+            let selection_area = if pinned_header.is_some() {
+                ratatui::layout::Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+            } else {
+                area
+            };
+            let selection_scroll = scroll + usize::from(pinned_header.is_some());
+            if !query.open && !response.visible && link_picker.is_none() {
+                if let Some(view) = document.directory_view.as_mut() {
+                    if view.selection_auto_scroll(mouse_position, area, std::time::Instant::now()) {
+                        rendered_width = None;
+                    }
+                }
             }
             let hovered = mouse_position
                 .filter(|_| {
@@ -555,7 +587,10 @@ pub fn run(
                     scroll,
                     no_colour || crossterm::style::Colored::ansi_color_disabled(),
                 );
-                selection.highlight(frame, &text, area, scroll);
+                selection.highlight(frame, &text, selection_area, selection_scroll);
+                if let Some(header) = pinned_header.and_then(|row| text.lines.get(row)) {
+                    frame.render_widget(Paragraph::new(header.clone()), ratatui::layout::Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 1));
+                }
                 let hovered_path = hovered.and_then(|target| hover_path(&document, target, &working_directory))
                     .or_else(|| hovered_grep.as_ref().map(|(path, line, _)| {
                         let path = path.strip_prefix(&working_directory).unwrap_or(path);
@@ -654,6 +689,7 @@ pub fn run(
                 }
                 if let Some(view) = &document.directory_view {
                     view.draw_decorations(frame, area, no_colour);
+                    view.highlight_selection(frame, area);
                 } else if max_scroll > 0 && area.width >= 5 && area.height > 2 {
                     let track = ratatui::layout::Rect::new(
                         area.right() - 2,
@@ -718,7 +754,8 @@ pub fn run(
             let mut poll_timeout = std::time::Duration::from_millis(refresh_ms);
             if refresh_ms == 100 && !query.open && !response.visible && link_picker.is_none() {
                 if let Some(view) = document.directory_view.as_ref() {
-                    poll_timeout = view.poll_timeout();
+                    poll_timeout =
+                        view.selection_poll_timeout(view.poll_timeout(), std::time::Instant::now());
                 }
             }
             if !query.open && !response.visible && link_picker.is_none() {
@@ -742,6 +779,12 @@ pub fn run(
                     || grep_input.is_some()
                     || selection.poll_timeout(std::time::Duration::MAX, std::time::Instant::now())
                         != std::time::Duration::MAX
+                    || document.directory_view.as_ref().is_some_and(|view| {
+                        view.selection_poll_timeout(
+                            std::time::Duration::MAX,
+                            std::time::Instant::now(),
+                        ) != std::time::Duration::MAX
+                    })
                 {
                     break false;
                 }
@@ -1089,6 +1132,16 @@ pub fn run(
                             }
                         }
                     }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Esc
+                        && document
+                            .directory_view
+                            .as_mut()
+                            .is_some_and(|view| view.clear_text_selection()) =>
+                {
+                    status.clear();
                 }
                 Event::Key(key)
                     if key.kind != KeyEventKind::Release
@@ -1594,31 +1647,52 @@ pub fn run(
                         scroll = scrollbar_position(mouse.row, area, max_scroll);
                     }
                     MouseEventKind::Down(MouseButton::Left)
+                        if pinned_header.is_some()
+                            && mouse.row == area.y + 1
+                            && mouse.column >= area.x + 2
+                            && mouse.column < area.right().saturating_sub(2) =>
+                    {
+                        if let Some(diff) = document.diff.as_mut() {
+                            if let Some(header) = diff.toggle(pinned_header.unwrap(), true) {
+                                scroll = header;
+                                rendered_width = None;
+                            }
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
                         if mouse.column >= area.x + 2
                             && mouse.column < area.right().saturating_sub(2)
                             && mouse.row > area.y
                             && mouse.row < area.bottom().saturating_sub(1) =>
                     {
                         selection.start(
-                            crate::text_selection::Point::at(mouse.column, mouse.row, area, scroll),
+                            crate::text_selection::Point::at(
+                                mouse.column,
+                                mouse.row,
+                                selection_area,
+                                selection_scroll,
+                            ),
                             mouse.modifiers.contains(KeyModifiers::CONTROL),
                         );
+                        if let Some(diff) = &document.diff {
+                            selection.constrain_diff(diff.selection_bounds());
+                        }
                         status.clear();
                     }
                     MouseEventKind::Drag(MouseButton::Left) if selection.dragging => {
                         selection.extend(crate::text_selection::Point::at(
                             mouse.column,
                             mouse.row,
-                            area,
-                            scroll,
+                            selection_area,
+                            selection_scroll,
                         ));
                     }
                     MouseEventKind::Up(MouseButton::Left) if selection.dragging => {
                         selection.extend(crate::text_selection::Point::at(
                             mouse.column,
                             mouse.row,
-                            area,
-                            scroll,
+                            selection_area,
+                            selection_scroll,
                         ));
                         selection.dragging = false;
                         if selection.active() {
