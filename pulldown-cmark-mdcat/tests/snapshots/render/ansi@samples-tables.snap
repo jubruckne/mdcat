@@ -6,28 +6,30 @@ input_file: pulldown-cmark-mdcat/tests/markdown/samples/tables.md
 Explicit line breaks in a cell:
 
 ──────────
- [1ma[0m      [1mb[0m 
+]777;mdcat-table;5,1\ [1ma[0m      [1mb[0m 
 ──────────
- line1  x 
- line2    
- b      c 
+]777;mdcat-table;5,1\ line1  x 
+]777;mdcat-table;5,1\ line2    
+[2m[90m ──────── [0m
+]777;mdcat-table;5,1\ b      c 
 ──────────
-
+]777;mdcat-table;\
 Wide cell content wraps to fit the terminal:
 
 ────────────────────────────────────────────────────────────────────────────────
- [1mhead[0m                                                                           
+]777;mdcat-table;78\ [1mhead[0m                                                                           
 ────────────────────────────────────────────────────────────────────────────────
- This is a long cell that should wrap across multiple lines because its content 
- exceeds the eighty column default terminal width used in these render tests.   
+]777;mdcat-table;78\ This is a long cell that should wrap across multiple lines because its content 
+]777;mdcat-table;78\ exceeds the eighty column default terminal width used in these render tests.   
 ────────────────────────────────────────────────────────────────────────────────
-
+]777;mdcat-table;\
 Column widths are distributed proportionally, without breaking a short word
 apart just to make room for a long neighbour:
 
 ────────────────────────────────────────────────────────────────────────────────
- [1ma[0m      [1mb[0m                                                                       
+]777;mdcat-table;5,71\ [1ma[0m      [1mb[0m                                                                       
 ────────────────────────────────────────────────────────────────────────────────
- short  this cell has quite a lot of content that needs wrapping to fit, unlike 
-        its narrow single-word neighbour                                        
+]777;mdcat-table;5,71\ short  this cell has quite a lot of content that needs wrapping to fit, unlike 
+]777;mdcat-table;5,71\        its narrow single-word neighbour                                        
 ────────────────────────────────────────────────────────────────────────────────
+]777;mdcat-table;\

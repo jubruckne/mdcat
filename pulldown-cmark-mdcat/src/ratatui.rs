@@ -849,6 +849,30 @@ pub fn push_linked_text_with_table_width<'e, I>(
 where
     I: Iterator<Item = Event<'e>>,
 {
+    let (text, links, _) = push_linked_text_with_table_metadata(
+        settings,
+        environment,
+        resource_handler,
+        events,
+        table_columns,
+    )?;
+    Ok((text, links))
+}
+
+/// Column content ranges for each rendered table line (terminal cell coordinates).
+pub type TableBounds = Vec<(usize, Vec<(usize, usize)>)>;
+
+/// Render linked text and retain table column boundaries for mouse selection.
+pub fn push_linked_text_with_table_metadata<'e, I>(
+    settings: &Settings,
+    environment: &Environment,
+    resource_handler: &dyn ResourceUrlHandler,
+    events: I,
+    table_columns: u16,
+) -> Result<(Text<'static>, Vec<LinkRegion>, TableBounds)>
+where
+    I: Iterator<Item = Event<'e>>,
+{
     let tty_settings = Settings {
         terminal_capabilities: TerminalProgram::Ansi.capabilities(),
         terminal_size: settings.terminal_size,
@@ -867,10 +891,17 @@ where
     )?;
     let output =
         String::from_utf8(output).map_err(|error| Error::new(ErrorKind::InvalidData, error))?;
-    Ok(ansi_to_linked_text(&output))
+    Ok(ansi_to_linked_text_with_tables(&output))
 }
 
+#[cfg(test)]
 fn ansi_to_linked_text(input: &str) -> (Text<'static>, Vec<LinkRegion>) {
+    let (text, links, _) = ansi_to_linked_text_with_tables(input);
+    (text, links)
+}
+
+fn ansi_to_linked_text_with_tables(input: &str) -> (Text<'static>, Vec<LinkRegion>, TableBounds) {
+    let mut tables = Vec::new();
     let mut builder = TextBuilder::default();
     let mut style = CurrentStyle::default();
     let mut active: Option<(String, usize)> = None;
@@ -899,6 +930,19 @@ fn ansi_to_linked_text(input: &str) -> (Text<'static>, Vec<LinkRegion>) {
             '\x1b' => {
                 builder.flush_span(style);
                 if let Some(osc) = parse_escape(&mut chars, &mut style) {
+                    if let Some(widths) = osc.strip_prefix("777;mdcat-table;") {
+                        let mut left = column(&builder);
+                        let ranges = widths
+                            .split(',')
+                            .filter_map(|w| w.parse::<usize>().ok())
+                            .map(|width| {
+                                let range = (left + 1, left + 1 + width);
+                                left += width + 2;
+                                range
+                            })
+                            .collect();
+                        tables.push((builder.lines.len(), ranges));
+                    }
                     if let Some(target) = osc.strip_prefix("8;;") {
                         finish(&builder, &active, &mut links);
                         active =
@@ -918,7 +962,7 @@ fn ansi_to_linked_text(input: &str) -> (Text<'static>, Vec<LinkRegion>) {
         }
     }
     finish(&builder, &active, &mut links);
-    (builder.finish(style), links)
+    (builder.finish(style), links, tables)
 }
 
 /// Render a markdown string into Ratatui text.
@@ -1440,6 +1484,16 @@ mod tests {
                 .any(|span| span.content.contains("cd")
                     && span.style.add_modifier.contains(Modifier::BOLD)));
         }
+    }
+
+    #[test]
+    fn table_metadata_tracks_unicode_columns_without_changing_text() {
+        let (text, links, bounds) = ansi_to_linked_text_with_tables(
+            "  \x1b]777;mdcat-table;4,5\x1b\\ 界   hello \n\x1b]777;mdcat-table;\x1b\\after\n",
+        );
+        assert_eq!(text.lines[0].to_string(), "   界   hello ");
+        assert!(links.is_empty());
+        assert_eq!(bounds, vec![(0, vec![(3, 7), (9, 14)]), (1, vec![])]);
     }
 
     #[test]

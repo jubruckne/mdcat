@@ -8,7 +8,7 @@ use std::cmp::{max, min};
 use std::io::{Result, Write};
 use std::iter::zip;
 
-use anstyle::Style;
+use anstyle::{AnsiColor, Color, Style};
 use pulldown_cmark::{Alignment, CodeBlockKind, HeadingLevel};
 use syntect::highlighting::HighlightState;
 use syntect::parsing::{ParseState, ScopeStack};
@@ -731,6 +731,14 @@ fn write_table_row<W: Write>(
     let empty_line: Vec<TableRun> = Vec::new();
     for line_idx in 0..height {
         write_table_prefix(writer, indent, line_prefix)?;
+        if output.capabilities.style.is_some() {
+            let widths = widths
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            write!(writer, "\x1b]777;mdcat-table;{widths}\x1b\\")?;
+        }
         for ((cell, &width), &alignment) in zip(zip(wrapped_cells, widths), alignments) {
             let line = cell.get(line_idx).unwrap_or(&empty_line);
             write_table_cell_line(writer, output, line, width, alignment)?;
@@ -789,10 +797,29 @@ pub fn write_table<W: Write>(
             write_table_rule(writer, capabilities, indent, line_prefix, rule_length)?;
         }
 
-        for row in table.rows {
+        let mut previous_multiline = false;
+        for (row_index, row) in table.rows.into_iter().enumerate() {
             let wrapped_cells: Vec<_> = zip(row.cells, &widths)
                 .map(|(cell, &width)| wrap_cell(cell, width))
                 .collect();
+            let multiline = wrapped_cells.iter().any(|cell| cell.len() > 1);
+            if row_index > 0 && (previous_multiline || multiline) {
+                write_table_prefix(writer, indent, line_prefix)?;
+                let style = Style::new()
+                    .fg_color(Some(Color::Ansi(AnsiColor::BrightBlack)))
+                    .dimmed();
+                write_styled(
+                    writer,
+                    capabilities,
+                    &style,
+                    format!(
+                        " {} ",
+                        "─".repeat(usize::from(rule_length.saturating_sub(2)))
+                    ),
+                )?;
+                writeln!(writer)?;
+            }
+            previous_multiline = multiline;
             write_table_row(
                 writer,
                 &output,
@@ -804,6 +831,9 @@ pub fn write_table<W: Write>(
             )?;
         }
         write_table_rule(writer, capabilities, indent, line_prefix, rule_length)?;
+        if capabilities.style.is_some() {
+            write!(writer, "\x1b]777;mdcat-table;\x1b\\")?;
+        }
     }
     Ok(())
 }

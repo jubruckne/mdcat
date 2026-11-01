@@ -42,6 +42,8 @@ pub struct Selection {
     next_scroll: Option<std::time::Instant>,
     diff_bounds: Option<Vec<[Option<(usize, usize)>; 2]>>,
     diff_side: Option<usize>,
+    table_column: Option<(usize, usize, usize, usize)>,
+    table_rows: Vec<usize>,
 }
 
 impl Selection {
@@ -55,7 +57,45 @@ impl Selection {
             next_scroll: None,
             diff_bounds: None,
             diff_side: None,
+            table_column: None,
+            table_rows: Vec::new(),
         };
+    }
+
+    pub fn constrain_table(&mut self, bounds: &pulldown_cmark_mdcat::ratatui::TableBounds) {
+        if self.rectangular {
+            return;
+        }
+        let Some(anchor) = self.anchor else {
+            return;
+        };
+        let Some(index) = bounds.iter().position(|(row, _)| *row == anchor.row) else {
+            return;
+        };
+        let Some(&(left, right)) = bounds[index]
+            .1
+            .iter()
+            .find(|&&(left, right)| anchor.column >= left && anchor.column < right)
+        else {
+            return;
+        };
+        // Rules between rows have no cells. Stop at prose or a differently laid out table.
+        let mut first = index;
+        let mut last = index;
+        while first > 0
+            && bounds[first].0 - bounds[first - 1].0 <= 2
+            && bounds[first - 1].1 == bounds[index].1
+        {
+            first -= 1;
+        }
+        while last + 1 < bounds.len()
+            && bounds[last + 1].0 - bounds[last].0 <= 2
+            && bounds[last + 1].1 == bounds[index].1
+        {
+            last += 1;
+        }
+        self.table_rows = bounds[first..=last].iter().map(|(row, _)| *row).collect();
+        self.table_column = Some((bounds[first].0, bounds[last].0, left, right));
     }
 
     pub fn constrain_diff(&mut self, bounds: Vec<[Option<(usize, usize)>; 2]>) {
@@ -79,6 +119,17 @@ impl Selection {
         let Some((start, end)) = self.range(row, width) else {
             return Vec::new();
         };
+        if let Some((_, _, left, right)) = self.table_column {
+            if !self.table_rows.contains(&row) {
+                return Vec::new();
+            }
+            let clipped = (start.max(left), end.min(right));
+            return if clipped.0 < clipped.1 {
+                vec![clipped]
+            } else {
+                Vec::new()
+            };
+        }
         let Some(bounds) = &self.diff_bounds else {
             return vec![(start, end)];
         };
@@ -103,6 +154,10 @@ impl Selection {
         if self.dragging {
             self.moved |= self.anchor != Some(point);
             let mut point = point;
+            if let Some((first, last, left, right)) = self.table_column {
+                point.row = point.row.clamp(first, last);
+                point.column = point.column.clamp(left, right.saturating_sub(1));
+            }
             if !self.rectangular {
                 if let (Some(bounds), Some(side), Some(anchor)) =
                     (&self.diff_bounds, self.diff_side, self.anchor)
@@ -208,6 +263,9 @@ impl Selection {
             let Some(line) = text.lines.get(row) else {
                 break;
             };
+            if self.table_column.is_some() && !self.table_rows.contains(&row) {
+                continue;
+            }
             let line = line.to_string();
             let ranges = self.ranges(row, line.width());
             let mut selected = String::new();
@@ -228,7 +286,7 @@ impl Selection {
                     ));
                 }
             }
-            if self.diff_bounds.is_some() && !self.rectangular {
+            if (self.diff_bounds.is_some() || self.table_column.is_some()) && !self.rectangular {
                 selected.truncate(selected.trim_end().len());
             }
             rows.push(selected);
@@ -308,6 +366,25 @@ pub fn copy(text: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn table_selection_stays_in_column_and_skips_rules() {
+        let text = Text::from(" alpha  other \n beta   value \n ──────────── \n gamma  final ");
+        let bounds = vec![
+            (0, vec![(1, 6), (8, 13)]),
+            (1, vec![(1, 6), (8, 13)]),
+            (3, vec![(1, 6), (8, 13)]),
+        ];
+        let mut selection = Selection::default();
+        selection.start(Point { row: 0, column: 1 }, false);
+        selection.constrain_table(&bounds);
+        selection.extend(Point { row: 9, column: 30 });
+        assert_eq!(selection.contents(&text), "alpha\nbeta\ngamma");
+        selection.start(Point { row: 3, column: 5 }, false);
+        selection.constrain_table(&bounds);
+        selection.extend(Point { row: 0, column: 0 });
+        assert_eq!(selection.contents(&text), "alpha\nbeta\ngamma");
+    }
 
     fn select(start: (usize, usize), end: (usize, usize), rectangular: bool) -> Selection {
         let mut selection = Selection::default();

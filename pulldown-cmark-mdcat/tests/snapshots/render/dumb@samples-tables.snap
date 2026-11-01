@@ -10,6 +10,7 @@ Explicit line breaks in a cell:
 ──────────
  line1  x 
  line2    
+ ──────── 
  b      c 
 ──────────
 

@@ -78,6 +78,7 @@ pub fn run(
     let result = (|| -> Result<()> {
         execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
         let mut text = Text::default();
+        let mut table_bounds = Vec::new();
         let mut rendered_width = None;
         let mut scroll = 0usize;
         let mut dragging_scrollbar = false;
@@ -239,13 +240,14 @@ pub fn run(
                     theme: settings.theme.clone(),
                     syntax_theme: settings.syntax_theme.clone(),
                 };
-                (text, links) = render_document_with_table_width(
+                (text, links) = render_document_with_selection_metadata(
                     &document,
                     &document.input,
                     &settings,
                     resources,
                     options,
                     table_width,
+                    &mut table_bounds,
                 )?;
                 if document.is_directory
                     && selected
@@ -1674,6 +1676,7 @@ pub fn run(
                             ),
                             mouse.modifiers.contains(KeyModifiers::CONTROL),
                         );
+                        selection.constrain_table(&table_bounds);
                         if let Some(diff) = &document.diff {
                             selection.constrain_diff(diff.selection_bounds());
                         }
@@ -2865,6 +2868,30 @@ fn render_document_with_table_width(
     Text<'static>,
     Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
 )> {
+    render_document_with_selection_metadata(
+        document,
+        input,
+        settings,
+        resources,
+        options,
+        table_width,
+        &mut Vec::new(),
+    )
+}
+
+fn render_document_with_selection_metadata(
+    document: &crate::navigation::Document,
+    input: &str,
+    settings: &Settings<'_>,
+    resources: &dyn ResourceUrlHandler,
+    options: mdcat::RenderOptions,
+    table_width: u16,
+    table_bounds: &mut pulldown_cmark_mdcat::ratatui::TableBounds,
+) -> Result<(
+    Text<'static>,
+    Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
+)> {
+    table_bounds.clear();
     if document.image.is_some() {
         return Ok((Text::default(), Vec::new()));
     }
@@ -2985,8 +3012,8 @@ fn render_document_with_table_width(
             vec![event]
         })
         .map(|event| resolve_fragment(event, document));
-    let (text, links) = if options.emoji {
-        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_width(
+    let (text, links, tables) = if options.emoji {
+        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_metadata(
             settings,
             &document.environment,
             resources,
@@ -2994,7 +3021,7 @@ fn render_document_with_table_width(
             table_width,
         )?
     } else {
-        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_width(
+        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_metadata(
             settings,
             &document.environment,
             resources,
@@ -3002,6 +3029,7 @@ fn render_document_with_table_width(
             table_width,
         )?
     };
+    *table_bounds = tables;
     Ok(discover_file_links(document, text, links))
 }
 
@@ -3651,6 +3679,33 @@ impl ResponseWindow {
             }),
             self.area,
         );
+        if self.lines.len() > height && height > 0 && self.area.width > 2 {
+            let track = ratatui::layout::Rect::new(
+                self.area.right() - 1,
+                self.area.y + 1,
+                1,
+                self.area.height - 2,
+            );
+            let mut state = ScrollbarState::new(self.lines.len().saturating_sub(height) + 1)
+                .position(self.scroll)
+                .viewport_content_length(height);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(if self.no_colour {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Rgb(80, 80, 80))
+                })
+                .thumb_style(if self.no_colour {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Rgb(180, 180, 180))
+                });
+            frame.render_stateful_widget(scrollbar, track, &mut state);
+        }
     }
 }
 
