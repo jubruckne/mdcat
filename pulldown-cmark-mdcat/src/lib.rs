@@ -59,6 +59,7 @@ pub use crate::terminal::{TerminalProgram, TerminalSize};
 pub use crate::theme::Theme;
 
 mod frontmatter;
+mod list_spacing;
 #[cfg(feature = "ratatui")]
 pub mod ratatui;
 mod references;
@@ -349,6 +350,8 @@ where
         settings.theme.h1_rule,
         settings.terminal_size.columns,
     );
+    let mut spacing = list_spacing::ListSpacing::default();
+    let mut output = Vec::new();
     let StateAndData(final_state, final_data) = events.try_fold(
         StateAndData(State::default(), StateData::default()),
         |StateAndData(state, data), event| {
@@ -357,15 +360,19 @@ where
             } else {
                 settings
             };
-            write_event(
-                writer,
+            output.clear();
+            let spacing_event = event.clone();
+            let result = write_event(
+                &mut output,
                 event_settings,
                 environment,
                 &resource_handler,
                 state,
                 data,
                 event,
-            )
+            )?;
+            spacing.write_event(writer, event_settings, &spacing_event, &output)?;
+            Ok::<_, std::io::Error>(result)
         },
     )?;
     finish(writer, settings, environment, final_state, final_data)
@@ -412,6 +419,21 @@ mod tests {
         let title = "a".repeat(40);
         let output = render_string(&format!("# {title}"), &settings).unwrap();
         assert!(output.contains(&format!("── {title}\n")));
+    }
+
+    #[test]
+    fn numbered_lists_space_wrapped_items_but_keep_short_lists_compact() {
+        let output = render_string_dumb("1. short\n2. also short\n").unwrap();
+        assert!(output.contains(" 1. short\n 2. also short"));
+        let long = "wrapped words ".repeat(20);
+        let output = render_string_dumb(&format!("1. first\n2. {long}\n3. last\n")).unwrap();
+        assert!(output.contains(" 1. first\n\n 2."));
+        assert!(output.contains("\n\n 3. last"));
+        let output = render_string_dumb("1. first\n\n2. second\n").unwrap();
+        assert!(output.contains("first\n\n 2."));
+        assert!(!output.contains("first\n\n\n"));
+        let output = render_string_dumb(&format!("> 1. {long}\n> 2. last\n")).unwrap();
+        assert!(output.contains("\n  \n   2. last"));
     }
 
     fn render_string_dumb(markup: &str) -> Result<String> {
