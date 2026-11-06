@@ -11,6 +11,8 @@ Inside a Git repository, `mdcat --browse 191f7f1` opens a commit's message and d
 short and full commit hashes work. Existing file and directory paths take precedence.
 Scroll with the arrow keys or j/k, use Page Up/Down and Home/End to navigate,
 and press q to close the current document. Mouse-wheel scrolling and terminal resizing are supported.
+Press Ctrl+D to open the directory from which mdcat was launched in all-files mode,
+even when it has Git changes; q returns to the previous document.
 Drag with the left mouse button to select text; hold Ctrl when starting the drag
 to select a rectangular region. Releasing the button copies the selection to the
 clipboard (macOS uses the system clipboard; other platforms use terminal OSC 52 support).
@@ -144,7 +146,8 @@ Directory links open a nested listing with links to subdirectories and files. Us
 select an entry and Enter to open it. In a Git repository, changed and untracked entries are
 shown in yellow; directories are yellow when they contain changes.
 Raster image files can be opened directly or from links: browse mode initially fits them within
-the window's inner width and height (excluding the border and margins), preserving aspect ratio.
+the window's inner width and height (excluding the border and margins), scaling up or down
+while preserving aspect ratio.
 Click the image to expand it to the full inner width; click again to return to the fitted size.
 Tall expanded images scroll vertically. Browse mode uses terminal graphics when available and
 colored character cells as a fallback. In normal mode,

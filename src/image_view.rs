@@ -43,7 +43,6 @@ impl ImageView {
         } else {
             (f64::from(max_width) / f64::from(image.width()))
                 .min(f64::from(max_height) / f64::from(image.height()))
-                .min(1.0)
         };
         let dimensions = (
             (f64::from(image.width()) * scale).round().max(1.0) as u32,
@@ -146,12 +145,12 @@ mod tests {
         let bounds = Rect::new(0, 0, 100, 40);
         let image = image::DynamicImage::new_rgb8(800, 400);
         let mut view = ImageView::new("landscape.png".into());
-        assert_eq!(view.layout(&image, &picker, bounds), 20);
-        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (800, 400));
+        assert_eq!(view.layout(&image, &picker, bounds), 24);
+        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (960, 480));
         draw(&mut view, &picker, bounds, 0);
-        assert_eq!(view.hit_area, Rect::new(2, 1, 80, 20));
+        assert_eq!(view.hit_area, Rect::new(2, 1, 96, 24));
         assert!(!view.toggle_at(1, 1)); // Margin.
-        assert!(!view.toggle_at(82, 1)); // Empty space beside the image.
+        assert!(!view.toggle_at(98, 1)); // Right margin.
         assert!(view.toggle_at(2, 1));
         assert_eq!(view.layout(&image, &picker, bounds), 24);
         assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (960, 480));
@@ -159,7 +158,7 @@ mod tests {
         assert_eq!(view.hit_area, Rect::new(2, 1, 96, 24));
         assert!(view.toggle_at(97, 24));
         view.layout(&image, &picker, bounds);
-        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (800, 400));
+        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (960, 480));
         // Fitted mode follows the current inner window on resize.
         let smaller = Rect::new(0, 0, 60, 20);
         assert_eq!(view.layout(&image, &picker, smaller), 14);
@@ -203,22 +202,22 @@ mod tests {
     }
 
     #[test]
-    fn small_images_keep_native_size_until_expanded_and_follow_window_resize() {
+    fn small_images_scale_up_to_fit_and_follow_window_resize() {
         let picker = Picker::halfblocks();
         let bounds = Rect::new(0, 0, 100, 40);
-        let image = image::DynamicImage::new_rgb8(8, 4);
+        let image = image::DynamicImage::new_rgb8(8, 8);
         let mut view = ImageView::new("small.png".into());
         view.layout(&image, &picker, bounds);
-        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (8, 4));
+        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (760, 760));
         draw(&mut view, &picker, bounds, 0);
         assert!(view.toggle_at(2, 1));
         view.layout(&image, &picker, bounds);
-        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (960, 480));
+        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (960, 960));
         let smaller = Rect::new(0, 0, 60, 20);
         view.layout(&image, &picker, smaller);
-        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (560, 280));
+        assert_eq!(view.scaled.as_ref().unwrap().dimensions(), (560, 560));
         draw(&mut view, &picker, smaller, 0);
-        assert_eq!(view.hit_area, Rect::new(2, 1, 56, 14));
+        assert_eq!(view.hit_area, Rect::new(2, 1, 56, 18));
         let tiny = Rect::new(0, 0, 3, 1);
         view.layout(&image, &picker, tiny);
         draw(&mut view, &picker, tiny, 0);

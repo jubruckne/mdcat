@@ -803,6 +803,7 @@ pub fn run(
                 continue;
             }
             let mut open_target = None;
+            let mut open_directory_all = false;
             let mut go_back = false;
             let event = event::read()?;
             if let Event::Mouse(mouse) = &event {
@@ -1156,6 +1157,19 @@ pub fn run(
                 {
                     selection = crate::text_selection::Selection::default();
                     status.clear();
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release
+                        && key.code == KeyCode::Char('d')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    match url::Url::from_directory_path(&working_directory) {
+                        Ok(target) => {
+                            open_target = Some(target.to_string());
+                            open_directory_all = true;
+                        }
+                        Err(()) => status = " Could not open the working directory ".into(),
+                    }
                 }
                 Event::Key(key)
                     if key.kind != KeyEventKind::Release
@@ -1844,6 +1858,18 @@ pub fn run(
                     continue;
                 }
                 if is_current_document_link(&document, &target) {
+                    if open_directory_all {
+                        if let Some(view) = document.directory_view.as_mut() {
+                            match view.show_all() {
+                                Ok(()) => status.clear(),
+                                Err(error) => status = format!(" {error:#} "),
+                            }
+                        }
+                        scroll = 0;
+                        rendered_width = None;
+                        selection = crate::text_selection::Selection::default();
+                        continue;
+                    }
                     let url = document.environment.base_url.join(&target)?;
                     pending_anchor = url
                         .fragment()
@@ -1877,6 +1903,11 @@ pub fn run(
                         let path = document.destination(&target)?;
                         crate::navigation::Document::load(path, options)?
                     };
+                    if open_directory_all {
+                        if let Some(view) = next.directory_view.as_mut() {
+                            view.show_all()?;
+                        }
+                    }
                     let anchor = url::Url::parse(&target)?
                         .fragment()
                         .filter(|s| !s.is_empty())

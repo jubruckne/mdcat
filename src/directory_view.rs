@@ -161,6 +161,16 @@ impl DirectoryView {
         view.load_preview()?;
         Ok(view)
     }
+    pub fn show_all(&mut self) -> Result<()> {
+        self.pending_refresh = None;
+        self.changed_only = false;
+        self.grep_query = None;
+        self.grep_all = false;
+        self.rebuild()?;
+        self.ensure_selection_visible();
+        self.load_preview()
+    }
+
     pub fn refresh(&mut self) -> Result<()> {
         self.pending_refresh = None;
         self.last_poll = std::time::Instant::now();
@@ -1738,6 +1748,38 @@ mod tests {
         assert!(view.entries.is_empty());
         assert_eq!(view.preview_scroll, 0);
     }
+    #[test]
+    fn explicit_all_mode_includes_clean_files_and_survives_refresh() {
+        let (dir, _) = crate::git_links::tests::repository();
+        let root = dir.path();
+        std::fs::write(root.join("clean.txt"), "clean\n").unwrap();
+        command(root, &["add", "."]);
+        command(root, &["commit", "-qm", "Add clean file"]);
+        std::fs::write(root.join("example.txt"), "working\n").unwrap();
+        let mut view = DirectoryView::load(root).unwrap();
+        assert!(view.changed_only);
+        assert!(!view
+            .entries
+            .iter()
+            .any(|entry| entry.path.ends_with("clean.txt")));
+        view.show_all().unwrap();
+        select(&mut view, "clean.txt");
+        assert!(!view.changed_only);
+        assert!(matches!(view.open(), Action::Open(_)));
+        view.refresh().unwrap();
+        assert!(!view.changed_only);
+        assert!(view
+            .entries
+            .iter()
+            .any(|entry| entry.path.ends_with("clean.txt")));
+        view.search_grep("working").unwrap();
+        assert!(view.grep_query.is_some());
+        view.show_all().unwrap();
+        assert!(view.grep_query.is_none());
+        assert!(!view.grep_all);
+        select(&mut view, "clean.txt");
+    }
+
     #[test]
     fn directory_combines_staged_and_unstaged_changes_and_handles_other_file_states() {
         let (dir, _) = crate::git_links::tests::repository();
