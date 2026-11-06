@@ -104,10 +104,7 @@ pub fn run(
         let mut grep_snapshot = None;
         let mut grep_deadline: Option<std::time::Instant> = None;
         let mut image_picker: Option<ratatui_image::picker::Picker> = None;
-        let mut image_state: Option<(
-            std::path::PathBuf,
-            ratatui_image::protocol::StatefulProtocol,
-        )> = None;
+        let mut image_state: Option<crate::image_view::ImageView> = None;
 
         let animation_started = std::time::Instant::now();
         let mut focused = true;
@@ -153,23 +150,22 @@ pub fn run(
                 .max(1);
             let table_width = width;
             let height = usize::from(area.height.saturating_sub(2));
-            if let Some(image) = &document.image {
+            let image_height = if let Some(image) = &document.image {
                 if image_state
                     .as_ref()
-                    .is_none_or(|(path, _)| path != &document.path)
+                    .is_none_or(|view| view.path != document.path)
                 {
-                    let picker = image_picker.get_or_insert_with(|| {
-                        pulldown_cmark_mdcat::ratatui::detect_image_picker()
-                            .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
-                    });
-                    image_state = Some((
-                        document.path.clone(),
-                        picker.new_resize_protocol(image.clone()),
-                    ));
+                    image_state = Some(crate::image_view::ImageView::new(document.path.clone()));
                 }
+                let picker = image_picker.get_or_insert_with(|| {
+                    pulldown_cmark_mdcat::ratatui::detect_image_picker()
+                        .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
+                });
+                Some(image_state.as_mut().unwrap().layout(image, picker, area))
             } else {
                 image_state = None;
-            }
+                None
+            };
             if let Some(view) = document.directory_view.as_mut() {
                 if view.height != height {
                     view.height = height;
@@ -358,7 +354,8 @@ pub fn run(
                     continue;
                 }
             }
-            let max_scroll = text.lines.len().saturating_sub(height.max(1));
+            let content_height = image_height.unwrap_or(text.lines.len());
+            let max_scroll = content_height.saturating_sub(height.max(1));
             if search
                 .pending_until
                 .is_some_and(|deadline| std::time::Instant::now() >= deadline)
@@ -494,8 +491,8 @@ pub fn run(
                 frame.render_widget(
                     Paragraph::new(visible).block(document_block(
                         &titles[history.len()],
-                        (scroll + 1).min(text.lines.len()),
-                        text.lines.len(),
+                        (scroll + 1).min(content_height),
+                        content_height,
                         no_colour,
                         true,
                     )),
@@ -504,20 +501,8 @@ pub fn run(
 
                 draw_source_line_highlight(frame, area, scroll, highlighted_row, no_colour || crossterm::style::Colored::ansi_color_disabled(), settings.theme.is_dark);
 
-                if let Some((_, protocol)) = image_state.as_mut() {
-                    let image_area = ratatui::layout::Rect::new(
-                        area.x.saturating_add(2),
-                        area.y.saturating_add(1),
-                        area.width.saturating_sub(4),
-                        area.height.saturating_sub(2),
-                    );
-                    if image_area.width > 0 && image_area.height > 0 {
-                        frame.render_stateful_widget(
-                            ratatui_image::StatefulImage::default(),
-                            image_area,
-                            protocol,
-                        );
-                    }
+                if let (Some(view), Some(picker)) = (image_state.as_mut(), image_picker.as_ref()) {
+                    view.draw(frame, picker, area, scroll);
                 }
 
                 let picker_target = link_picker.as_ref().and_then(LinkPicker::selected_target);
@@ -1655,6 +1640,14 @@ pub fn run(
                     }
                 }
                 Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left)
+                        if image_state
+                            .as_mut()
+                            .is_some_and(|view| view.toggle_at(mouse.column, mouse.row)) =>
+                    {
+                        scroll = 0;
+                        selection = crate::text_selection::Selection::default();
+                    }
                     MouseEventKind::Down(MouseButton::Left)
                         if max_scroll > 0
                             && area.width >= 5

@@ -42,6 +42,7 @@ mod directory_view;
 mod git_directory;
 mod git_links;
 mod history_view;
+mod image_view;
 mod json_view;
 mod link_tree;
 mod navigation;

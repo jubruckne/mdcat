@@ -143,8 +143,11 @@ automatically as indexing completes.
 Directory links open a nested listing with links to subdirectories and files. Use Up/Down to
 select an entry and Enter to open it. In a Git repository, changed and untracked entries are
 shown in yellow; directories are yellow when they contain changes.
-Raster image files can be opened directly or from links: browse mode fits them in the window,
-using terminal graphics when available and colored character cells as a fallback. In normal mode,
+Raster image files can be opened directly or from links: browse mode initially fits them within
+the window's inner width and height (excluding the border and margins), preserving aspect ratio.
+Click the image to expand it to the full inner width; click again to return to the fitted size.
+Tall expanded images scroll vertically. Browse mode uses terminal graphics when available and
+colored character cells as a fallback. In normal mode,
 image files use the terminal's configured image protocol and fit within half of its width and height.
 Attach `:172` (or `#L172`) to a path to jump to source line 172; this works with
 clicks and the link picker. Line links to Markdown files show their literal source.
