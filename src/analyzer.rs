@@ -88,6 +88,7 @@ pub fn run(
         let mut mouse_position = None;
         let mut code_hover = crate::code_hover::Hover::default();
         let mut hover_source: std::sync::Arc<str> = "".into();
+        let mut hover_source_path = None;
         let mut hover_first_row = None;
         let mut hover_revision = 0u64;
         let mut link_picker: Option<LinkPicker> = None;
@@ -307,7 +308,6 @@ pub fn run(
                     None
                 };
                 code_hover.update(None);
-                hover_revision += 1;
                 hover_first_row = None;
                 if document.can_format()
                     && document
@@ -318,12 +318,19 @@ pub fn run(
                             matches!(e, "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx")
                         })
                 {
-                    hover_source = pulldown_cmark_mdcat::expand_tabs(
+                    let source: std::sync::Arc<str> = pulldown_cmark_mdcat::expand_tabs(
                         &document.input,
                         options.tabs.unwrap_or(4),
                     )
                     .into_owned()
                     .into();
+                    if hover_source_path.as_ref() != Some(&document.path) || hover_source != source
+                    {
+                        hover_revision += 1;
+                        hover_source = source;
+                        hover_source_path = Some(document.path.clone());
+                    }
+                    code_hover.prepare(&document.path, hover_source.clone(), hover_revision);
                     hover_first_row = anchor_line_with_table_width(
                         &document,
                         "L1",
@@ -606,6 +613,8 @@ pub fn run(
                     )
                     .len() as u16,
                 );
+                let indexing_status = code_hover.indexing_status();
+                let hint_width = draw_indexing_progress(frame, area, hint_width, indexing_status.as_deref());
                 let search_footer = if let Some(input) = &grep_input {
                     let (footer, cursor) = input.footer(usize::from(hint_width));
                     Some((footer.replacen(" Find:", " Grep:", 1), cursor))
@@ -832,6 +841,16 @@ pub fn run(
                         mouse.row,
                         matches!(mouse.kind, MouseEventKind::ScrollDown),
                     ) => {}
+                Event::Mouse(mouse)
+                    if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                        && code_hover.destination_at(mouse.column, mouse.row).is_some() =>
+                {
+                    open_target = code_hover
+                        .destination_at(mouse.column, mouse.row)
+                        .map(str::to_owned);
+                    code_hover.dismiss();
+                    selection = crate::text_selection::Selection::default();
+                }
                 Event::Mouse(mouse) if code_hover.contains(mouse.column, mouse.row) => {}
                 Event::FocusLost => {
                     code_hover.dismiss();
@@ -1944,6 +1963,26 @@ fn edit_in_nano(
     *terminal = ratatui::try_init()?;
     execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
     Ok(result?)
+}
+
+fn draw_indexing_progress(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    available: u16,
+    status: Option<&str>,
+) -> u16 {
+    let Some(status) = status else {
+        return available;
+    };
+    let width = Line::from(status).width() as u16;
+    if available < width + 8 || area.height == 0 {
+        return available;
+    }
+    frame.render_widget(
+        Line::from(status),
+        ratatui::layout::Rect::new(area.x + 2 + available - width, area.bottom() - 1, width, 1),
+    );
+    available - width - 2
 }
 
 fn zero_match_notice_style(
@@ -3765,6 +3804,46 @@ fn resize_frame(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn indexing_progress_shares_the_footer_and_hides_when_finished_or_narrow() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).unwrap();
+        for status in [Some(" indexing 32% "), None] {
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    frame.render_widget(
+                        super::document_block("sample.cpp", 291, 500, true, true),
+                        area,
+                    );
+                    let width = super::draw_indexing_progress(frame, area, 60, status);
+                    frame.render_widget(
+                        ratatui::text::Line::from(" Source line 291 "),
+                        ratatui::layout::Rect::new(2, 7, width, 1),
+                    );
+                })
+                .unwrap();
+            let footer: String = (0..80)
+                .map(|x| terminal.backend().buffer()[(x, 7)].symbol())
+                .collect();
+            assert!(footer.contains("Source line 291"));
+            assert_eq!(footer.contains("indexing 32%"), status.is_some());
+        }
+        terminal
+            .draw(|frame| {
+                assert_eq!(
+                    super::draw_indexing_progress(
+                        frame,
+                        ratatui::layout::Rect::new(0, 0, 18, 8),
+                        14,
+                        Some(" indexing 32% ")
+                    ),
+                    14
+                );
+            })
+            .unwrap();
+    }
+
     #[test]
     fn formatting_preserves_approximate_code_position_in_both_directions() {
         let original = "void f() {\n  int x=1; int y=2;\n  use(x,y);\n}\n";

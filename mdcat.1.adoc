@@ -181,6 +181,13 @@ In this case remote images render as hyperlinks.
     Tooltips show formatted declarations, multiline function signatures, public
     class/struct/union members, and enum values, following aliases in the same header
     when available. Escape dismisses the popup; the mouse wheel scrolls longer answers.
+    Click the underlined identifier to jump to its implementation when available,
+    falling back to its declaration. Background indexing uses compile_commands.json
+    to find implementations in other source files; jump targets update after indexing.
+    Tooltip parsing and support are warmed in the background when a C/C++ file
+    is first displayed, including a hidden hover request. One clangd connection
+    handles tooltips and navigation independently; cached project indexing may
+    overlap at background priority. Indexing progress appears in the bottom border.
     This also works in formatted views. Accurate results require suitable project
     compile commands or .clangd configuration.
     Ctrl+O toggles a formatted view of C/C++, GLSL, HLSL, and Metal source using

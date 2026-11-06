@@ -4,14 +4,18 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
 };
 use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -33,14 +37,29 @@ impl Target {
             && self.rect == other.rect
     }
 }
+#[derive(Clone)]
 struct Request {
     id: u64,
     target: Target,
 }
+enum Work {
+    Prepare(Target),
+    Hover(Request),
+}
+enum NavigationWork {
+    Target {
+        request: Request,
+        text: String,
+        expand: bool,
+    },
+    IndexReady,
+}
 struct Client {
-    tx: mpsc::Sender<Request>,
+    tx: mpsc::Sender<Work>,
     rx: mpsc::Receiver<(u64, String)>,
+    definitions: mpsc::Receiver<(u64, Option<String>)>,
     child: Arc<Mutex<Option<Child>>>,
+    progress: Arc<Mutex<Option<Option<u8>>>>,
 }
 impl Drop for Client {
     fn drop(&mut self) {
@@ -77,20 +96,58 @@ fn read_message(reader: &mut impl BufRead) -> Result<Value> {
     reader.read_exact(&mut data)?;
     Ok(serde_json::from_slice(&data)?)
 }
-fn response(rx: &mpsc::Receiver<Value>, writer: &mut impl Write, id: u64) -> Result<Value> {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let value = rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))?;
-        if value.get("method").is_some() {
-            if let Some(id) = value.get("id") {
-                send(writer, json!({"jsonrpc":"2.0", "id":id, "result":null}))?;
-            }
-            continue;
-        }
-        if value["id"].as_u64() == Some(id) {
+struct Connection {
+    writer: Mutex<std::process::ChildStdin>,
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, mpsc::Sender<Value>>>,
+    documents: Mutex<HashMap<String, usize>>,
+    next_version: AtomicU64,
+}
+impl Connection {
+    fn send(&self, value: Value) -> Result<()> {
+        send(&mut *self.writer.lock().unwrap(), value)
+    }
+    fn request(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id, tx);
+        let result = (|| {
+            self.send(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
+            let value = rx.recv_timeout(Duration::from_secs(10))?;
             anyhow::ensure!(value.get("error").is_none(), "clangd request failed");
-            return Ok(value["result"].clone());
+            Ok(value["result"].clone())
+        })();
+        if self.pending.lock().unwrap().remove(&id).is_some() {
+            let _ =
+                self.send(json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}}));
         }
+        result
+    }
+    fn open_document(&self, uri: &str, language: &str, text: &str, replace: bool) -> Result<()> {
+        let mut documents = self.documents.lock().unwrap();
+        let version = self.next_version.fetch_add(1, Ordering::Relaxed);
+        if !documents.contains_key(uri) {
+            self.send(json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":language,"version":version,"text":text}}}))?;
+        } else if replace {
+            self.send(json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":uri,"version":version},"contentChanges":[{"text":text}]}}))?;
+        }
+        *documents.entry(uri.to_owned()).or_default() += 1;
+        Ok(())
+    }
+    fn close_document(&self, uri: &str) -> Result<()> {
+        let mut documents = self.documents.lock().unwrap();
+        if let Some(users) = documents.get_mut(uri) {
+            *users -= 1;
+            if *users == 0 {
+                documents.remove(uri);
+                self.send(json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":uri}}}))?;
+            }
+        }
+        Ok(())
+    }
+    fn warm_hover(&self, uri: &str) -> Result<()> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        self.send(json!({"jsonrpc":"2.0","id":id,"method":"textDocument/hover","params":{"textDocument":{"uri":uri},"position":{"line":0,"character":0}}}))
     }
 }
 fn hover_text(value: &Value) -> String {
@@ -347,20 +404,6 @@ fn public_member(record: &Value, member: &Value, source: &str, public_default: b
     }
     access
 }
-fn rpc(
-    writer: &mut impl Write,
-    incoming: &mpsc::Receiver<Value>,
-    next: &mut u64,
-    method: &str,
-    params: Value,
-) -> Result<Value> {
-    *next += 1;
-    send(
-        writer,
-        json!({"jsonrpc":"2.0","id":*next,"method":method,"params":params}),
-    )?;
-    response(incoming, writer, *next)
-}
 fn collect_symbols<'a>(symbols: &'a [Value], out: &mut Vec<&'a Value>) {
     for symbol in symbols {
         out.push(symbol);
@@ -517,12 +560,7 @@ fn member_sections(symbols: &[Value], source: &str, target_line: usize) -> Strin
     }
     sections.join("\n\n")
 }
-fn expand_members(
-    writer: &mut impl Write,
-    incoming: &mpsc::Receiver<Value>,
-    next: &mut u64,
-    target: &Target,
-) -> Result<String> {
+fn expand_members(connection: &Connection, target: &Target) -> Result<String> {
     let uri = url::Url::from_file_path(&target.path)
         .map_err(|_| anyhow::anyhow!("Invalid path"))?
         .to_string();
@@ -541,7 +579,7 @@ fn expand_members(
         .unwrap_or_else(|_| target.path.clone());
     let mut sections = Vec::new();
     for method in ["textDocument/typeDefinition", "textDocument/definition"] {
-        let locations = rpc(writer, incoming, next, method, params.clone())?;
+        let locations = connection.request(method, params.clone())?;
         let location = if let Some(array) = locations.as_array() {
             array.first()
         } else if locations.is_object() {
@@ -587,23 +625,14 @@ fn expand_members(
             std::fs::read_to_string(&path)?
         };
         if !same {
-            send(
-                writer,
-                json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":"cpp","version":1,"text":source}}}),
-            )?;
+            connection.open_document(uri, "cpp", &source, false)?;
         }
-        let result = rpc(
-            writer,
-            incoming,
-            next,
+        let result = connection.request(
             "textDocument/documentSymbol",
             json!({"textDocument":{"uri":uri}}),
         );
         if !same {
-            send(
-                writer,
-                json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":uri}}}),
-            )?;
+            connection.close_document(uri)?;
         }
         let result = result?;
         if let Some(symbols) = result.as_array() {
@@ -616,8 +645,40 @@ fn expand_members(
     Ok(sections.join("\n\n"))
 }
 
+// Definition responses can contain a Location, Location[], or LocationLink[].
+fn definition_target(value: &Value) -> Option<String> {
+    if let Some(locations) = value.as_array() {
+        return locations.iter().find_map(definition_target);
+    }
+    let uri = value["uri"]
+        .as_str()
+        .or_else(|| value["targetUri"].as_str())?;
+    let mut url = url::Url::parse(uri).ok()?;
+    let path = url.to_file_path().ok()?;
+    if !path.is_file() {
+        return None;
+    }
+    let start = if value.get("targetUri").is_some() {
+        &value["targetSelectionRange"]["start"]
+    } else {
+        &value["range"]["start"]
+    };
+    let line = start["line"].as_u64()?.checked_add(1)?;
+    url.set_fragment(Some(&format!("L{line}")));
+    Some(url.to_string())
+}
+
 impl Client {
+    fn request(&self, request: Request) -> Result<()> {
+        self.tx.send(Work::Hover(request))?;
+        Ok(())
+    }
+
     fn start(target: &Target) -> Result<Self> {
+        Self::start_command(target, Command::new("clangd"))
+    }
+
+    fn start_command(target: &Target, mut command: Command) -> Result<Self> {
         let root = target
             .path
             .ancestors()
@@ -626,97 +687,183 @@ impl Client {
             .or_else(|| target.path.parent())
             .context("Missing parent")?
             .to_owned();
-        let mut child = Command::new("clangd")
-            .args(["--background-index=false", "--log=error"])
+        let mut child = command
+            .args([
+                "--background-index",
+                "--background-index-priority=background",
+                "-j=4",
+                "--log=error",
+            ])
             .current_dir(&root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
-        let mut writer = child.stdin.take().context("clangd stdin")?;
+        let writer = child.stdin.take().context("clangd stdin")?;
         let stdout = child.stdout.take().context("clangd stdout")?;
         let child = Arc::new(Mutex::new(Some(child)));
-        let (messages, incoming) = mpsc::channel();
+        let connection = Arc::new(Connection {
+            writer: Mutex::new(writer),
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            documents: Mutex::new(HashMap::new()),
+            next_version: AtomicU64::new(1),
+        });
+        let progress = Arc::new(Mutex::new(None));
+        let (tx, requests) = mpsc::channel::<Work>();
+        let (navigation_tx, navigation_rx) = mpsc::channel::<NavigationWork>();
+        let (out, rx) = mpsc::channel();
+        let (definitions_out, definitions) = mpsc::channel();
+        let reader_connection = connection.clone();
+        let reader_navigation = navigation_tx.clone();
+        let reader_progress = progress.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             while let Ok(message) = read_message(&mut reader) {
-                if messages.send(message).is_err() {
-                    break;
+                if message["method"] == "$/progress"
+                    && message["params"]["token"] == "backgroundIndexProgress"
+                {
+                    let value = &message["params"]["value"];
+                    match value["kind"].as_str() {
+                        Some("begin" | "report") => {
+                            let mut progress = reader_progress.lock().unwrap();
+                            let previous = (*progress).flatten();
+                            *progress = Some(
+                                value["percentage"]
+                                    .as_u64()
+                                    .map(|p| p.min(100) as u8)
+                                    .or(previous),
+                            );
+                        }
+                        Some("end") => {
+                            *reader_progress.lock().unwrap() = None;
+                            let _ = reader_navigation.send(NavigationWork::IndexReady);
+                        }
+                        _ => (),
+                    }
+                }
+                if message.get("method").is_some() {
+                    if let Some(id) = message.get("id") {
+                        let _ =
+                            reader_connection.send(json!({"jsonrpc":"2.0","id":id,"result":null}));
+                    }
+                } else if let Some(id) = message["id"].as_u64() {
+                    if let Some(reply) = reader_connection.pending.lock().unwrap().remove(&id) {
+                        let _ = reply.send(message);
+                    }
                 }
             }
+            // Disconnect all outstanding callers if clangd exits.
+            reader_connection.pending.lock().unwrap().clear();
+            *reader_progress.lock().unwrap() = None;
         });
-        let (tx, requests) = mpsc::channel::<Request>();
-        let (out, rx) = mpsc::channel();
+        let navigation_connection = connection.clone();
+        let navigation_out = out.clone();
         std::thread::spawn(move || {
-            let run = || -> Result<()> {
-                send(
-                    &mut writer,
-                    json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"processId":std::process::id(),"rootUri":url::Url::from_directory_path(root).ok().map(|u| u.to_string()),"capabilities":{"textDocument":{"hover":{"contentFormat":["markdown","plaintext"]},"documentSymbol":{"hierarchicalDocumentSymbolSupport":true}}}}}),
-                )?;
-                response(&incoming, &mut writer, 0)?;
-                send(
-                    &mut writer,
-                    json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
-                )?;
-                let mut opened: Option<(PathBuf, u64)> = None;
-                let mut version = 0;
-                let mut next_rpc = 0;
-                while let Ok(mut request) = requests.recv() {
-                    while let Ok(newer) = requests.try_recv() {
-                        request = newer;
+            let mut last_request: Option<Request> = None;
+            while let Ok(mut work) = navigation_rx.recv() {
+                while let Ok(newer) = navigation_rx.try_recv() {
+                    if !matches!(newer, NavigationWork::IndexReady) {
+                        work = newer;
                     }
-                    let t = &request.target;
-                    let uri = url::Url::from_file_path(&t.path)
-                        .map_err(|_| anyhow::anyhow!("Invalid path"))?
-                        .to_string();
-                    if opened.as_ref() != Some(&(t.path.clone(), t.revision)) {
-                        if let Some((path, _)) = opened.take() {
-                            send(
-                                &mut writer,
-                                json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":url::Url::from_file_path(path).ok().map(|u| u.to_string())}}}),
-                            )?;
-                        }
-                        version += 1;
-                        let language = if t.path.extension().is_some_and(|e| e == "c") {
-                            "c"
-                        } else {
-                            "cpp"
+                }
+                let (request, enrichment) = match work {
+                    NavigationWork::Target {
+                        request,
+                        text,
+                        expand,
+                    } => {
+                        last_request = Some(request.clone());
+                        (request, Some((text, expand)))
+                    }
+                    NavigationWork::IndexReady => {
+                        let Some(request) = last_request.clone() else {
+                            continue;
                         };
-                        send(
-                            &mut writer,
-                            json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":uri,"languageId":language,"version":version,"text":t.text.as_ref()}}}),
-                        )?;
-                        opened = Some((t.path.clone(), t.revision));
+                        (request, None)
                     }
-                    let value = rpc(
-                        &mut writer,
-                        &incoming,
-                        &mut next_rpc,
-                        "textDocument/hover",
-                        json!({"textDocument":{"uri":uri},"position":{"line":t.line,"character":t.character}}),
-                    )?;
-                    let (text, expand) = display_hover(&value["contents"]);
-                    let _ = out.send((request.id, text.clone()));
-                    if let Ok(members) = if expand {
-                        expand_members(&mut writer, &incoming, &mut next_rpc, t)
-                    } else {
-                        Ok(String::new())
-                    } {
+                };
+                let t = &request.target;
+                let Ok(uri) = url::Url::from_file_path(&t.path) else {
+                    continue;
+                };
+                let destination = navigation_connection.request("textDocument/definition",
+                    json!({"textDocument":{"uri":uri.as_str()},"position":{"line":t.line,"character":t.character}}))
+                    .ok().and_then(|value| definition_target(&value));
+                let _ = definitions_out.send((request.id, destination));
+                if let Some((text, true)) = enrichment {
+                    if let Ok(members) = expand_members(&navigation_connection, t) {
                         if !members.is_empty() {
                             let text = if text.contains("using ") || text.contains("typedef ") {
                                 format!("{text}\n\n{members}")
                             } else {
                                 members
                             };
-                            let _ = out.send((request.id, text));
+                            let _ = navigation_out.send((request.id, text));
                         }
                     }
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            let run = || -> Result<()> {
+                connection.request("initialize", json!({"processId":std::process::id(),"rootUri":url::Url::from_directory_path(root).ok().map(|u| u.to_string()),"capabilities":{"window":{"workDoneProgress":true,"implicitWorkDoneProgressCreate":true},"textDocument":{"hover":{"contentFormat":["markdown","plaintext"]},"documentSymbol":{"hierarchicalDocumentSymbolSupport":true}}}}))?;
+                connection.send(json!({"jsonrpc":"2.0","method":"initialized","params":{}}))?;
+                let mut opened: Option<(PathBuf, u64)> = None;
+                while let Ok(mut work) = requests.recv() {
+                    while let Ok(newer) = requests.try_recv() {
+                        work = newer;
+                    }
+                    let (request, prepare_only) = match work {
+                        Work::Prepare(target) => (Request { id: 0, target }, true),
+                        Work::Hover(request) => (request, false),
+                    };
+                    let t = &request.target;
+                    let uri = url::Url::from_file_path(&t.path)
+                        .map_err(|_| anyhow::anyhow!("Invalid path"))?
+                        .to_string();
+                    if opened.as_ref() != Some(&(t.path.clone(), t.revision)) {
+                        if let Some((path, _)) = opened.take() {
+                            if let Ok(uri) = url::Url::from_file_path(path) {
+                                connection.close_document(uri.as_str())?;
+                            }
+                        }
+                        let language = if t.path.extension().is_some_and(|e| e == "c") {
+                            "c"
+                        } else {
+                            "cpp"
+                        };
+                        connection.open_document(&uri, language, &t.text, true)?;
+                        opened = Some((t.path.clone(), t.revision));
+                    }
+                    if prepare_only {
+                        warm_tooltip_support();
+                        connection.warm_hover(&uri)?;
+                        continue;
+                    }
+                    let value = match connection.request("textDocument/hover", json!({"textDocument":{"uri":uri},"position":{"line":t.line,"character":t.character}})) {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+                    let (text, expand) = display_hover(&value["contents"]);
+                    let _ = out.send((request.id, text.clone()));
+                    let _ = navigation_tx.send(NavigationWork::Target {
+                        request,
+                        text,
+                        expand,
+                    });
                 }
                 Ok(())
             };
             let _ = run();
         });
-        Ok(Self { tx, rx, child })
+        Ok(Self {
+            tx,
+            rx,
+            definitions,
+            child,
+            progress,
+        })
     }
 }
 fn readable_namespaces(text: &str) -> String {
@@ -749,19 +896,33 @@ fn tooltip_width(source: &str, available: u16) -> u16 {
         .min(usize::from(available.saturating_sub(4).min(80))) as u16
 }
 
+static TOOLTIP_THEMES: std::sync::LazyLock<two_face::theme::EmbeddedLazyThemeSet> =
+    std::sync::LazyLock::new(two_face::theme::extra);
+
+fn warm_tooltip_support() {
+    let _ = readable_namespaces("std::__1::string");
+    let _ = display_hover(&json!("### function\n```cpp\nint prewarm(int value);\n```"));
+    for theme in [
+        two_face::theme::EmbeddedThemeName::SolarizedDark,
+        two_face::theme::EmbeddedThemeName::SolarizedLight,
+    ] {
+        TOOLTIP_THEMES.get(theme);
+    }
+}
+
 fn tooltip_text(
     source: &str,
     width: usize,
     settings: &pulldown_cmark_mdcat::Settings<'_>,
     plain: bool,
 ) -> Text<'static> {
-    let fallback_themes = two_face::theme::extra();
-    let fallback = fallback_themes.get(if settings.theme.is_dark {
-        two_face::theme::EmbeddedThemeName::SolarizedDark
-    } else {
-        two_face::theme::EmbeddedThemeName::SolarizedLight
+    let theme = settings.syntax_theme.as_ref().unwrap_or_else(|| {
+        TOOLTIP_THEMES.get(if settings.theme.is_dark {
+            two_face::theme::EmbeddedThemeName::SolarizedDark
+        } else {
+            two_face::theme::EmbeddedThemeName::SolarizedLight
+        })
     });
-    let theme = settings.syntax_theme.as_ref().unwrap_or(fallback);
     let syntax = settings
         .syntax_set
         .find_syntax_by_extension("cpp")
@@ -832,12 +993,14 @@ fn tooltip_text(
 #[derive(Default)]
 pub struct Hover {
     client: Option<Client>,
+    prepared: Option<(PathBuf, u64)>,
     target: Option<Target>,
     since: Option<Instant>,
     id: u64,
     sent: bool,
     text: String,
     disabled: bool,
+    destination: Option<String>,
     popup: Rect,
     offset: usize,
     styled: Text<'static>,
@@ -846,6 +1009,36 @@ pub struct Hover {
     styled_plain: bool,
 }
 impl Hover {
+    pub fn prepare(&mut self, path: &std::path::Path, text: Arc<str>, revision: u64) {
+        if self.disabled
+            || self
+                .prepared
+                .as_ref()
+                .is_some_and(|(p, r)| p == path && *r == revision)
+        {
+            return;
+        }
+        let target = Target {
+            path: path.to_owned(),
+            text,
+            revision,
+            line: 0,
+            character: 0,
+            rect: Rect::default(),
+        };
+        if self.client.is_none() {
+            match Client::start(&target) {
+                Ok(client) => self.client = Some(client),
+                Err(_) => self.disabled = true,
+            }
+        }
+        if let Some(client) = &self.client {
+            if client.tx.send(Work::Prepare(target)).is_ok() {
+                self.prepared = Some((path.to_owned(), revision));
+            }
+        }
+    }
+
     pub fn update(&mut self, target: Option<Target>) {
         if !matches!((&self.target, &target), (Some(a), Some(b)) if a.same(b))
             && !(self.target.is_none() && target.is_none())
@@ -855,6 +1048,7 @@ impl Hover {
             self.since = Some(Instant::now());
             self.sent = false;
             self.text.clear();
+            self.destination = None;
             self.offset = 0;
         }
         self.poll();
@@ -873,7 +1067,7 @@ impl Hover {
                     }
                 }
                 if let Some(c) = &self.client {
-                    let _ = c.tx.send(Request {
+                    let _ = c.request(Request {
                         id: self.id,
                         target: target.clone(),
                     });
@@ -882,7 +1076,7 @@ impl Hover {
         }
     }
     fn poll(&mut self) {
-        if let Some(client) = &self.client {
+        for client in self.client.iter() {
             while let Ok((id, text)) = client.rx.try_recv() {
                 if id == self.id {
                     let text: String = text
@@ -893,16 +1087,39 @@ impl Hover {
                     self.text = readable_namespaces(&text);
                 }
             }
+            while let Ok((id, destination)) = client.definitions.try_recv() {
+                if id == self.id {
+                    self.destination = destination;
+                }
+            }
         }
+    }
+    pub fn indexing_status(&self) -> Option<String> {
+        let progress = *self.client.as_ref()?.progress.lock().unwrap();
+        progress.map(|percentage| match percentage {
+            Some(percentage) => format!(" indexing {percentage}% "),
+            None => " indexing… ".to_owned(),
+        })
     }
     pub fn dismiss(&mut self) {
         self.id += 1;
         self.sent = true;
         self.text.clear();
         self.popup = Rect::default();
+        self.destination = None;
     }
     pub fn contains(&self, column: u16, row: u16) -> bool {
         self.visible() && self.popup.contains((column, row).into())
+    }
+    pub fn destination_at(&self, column: u16, row: u16) -> Option<&str> {
+        // A drawn popup means its symbol underline is also on screen.
+        if self.popup.is_empty() || self.contains(column, row) {
+            return None;
+        }
+        self.target
+            .as_ref()
+            .filter(|target| target.rect.contains((column, row).into()))?;
+        self.destination.as_deref()
     }
     pub fn visible(&self) -> bool {
         !self.text.is_empty()
@@ -951,7 +1168,7 @@ impl Hover {
         let lines = &self.styled.lines;
         let height = (lines.len() as u16)
             .saturating_add(2)
-            .min(14)
+            .min(18)
             .min(bounds.height - 2);
         let x = target.rect.x.min(bounds.right() - width);
         let y = if target.rect.y + height + 1 < bounds.bottom() {
@@ -977,6 +1194,29 @@ impl Hover {
             Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
             rect,
         );
+        let visible = usize::from(height - 2);
+        if lines.len() > visible {
+            let track = Rect::new(rect.right() - 1, rect.y + 1, 1, height - 2);
+            let mut state = ScrollbarState::new(lines.len() - visible + 1)
+                .position(self.offset)
+                .viewport_content_length(visible);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .track_symbol(Some("│"))
+                .thumb_symbol("┃")
+                .track_style(if plain {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                })
+                .thumb_style(if plain {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::Gray)
+                });
+            frame.render_stateful_widget(scrollbar, track, &mut state);
+        }
     }
 }
 
@@ -1160,8 +1400,7 @@ mod tests {
         };
         let client = Client::start(&target).unwrap();
         client
-            .tx
-            .send(Request {
+            .request(Request {
                 id: 1,
                 target: target.clone(),
             })
@@ -1186,7 +1425,7 @@ mod tests {
             .position(|line| line.starts_with("enum class Mode"))
             .unwrap();
         target.character = 11;
-        client.tx.send(Request { id: 2, target }).unwrap();
+        client.request(Request { id: 2, target }).unwrap();
         let _ = client.rx.recv_timeout(Duration::from_secs(15)).unwrap();
         let (_, result) = client.rx.recv_timeout(Duration::from_secs(15)).unwrap();
         assert!(
@@ -1246,7 +1485,7 @@ mod tests {
             rect: Rect::new(1, 1, 6, 1),
         };
         let client = Client::start(&target).unwrap();
-        client.tx.send(Request { id: 1, target }).unwrap();
+        client.request(Request { id: 1, target }).unwrap();
         let (_, result) = client.rx.recv_timeout(Duration::from_secs(15)).unwrap();
         assert_eq!(result, "const diagram_layout_hints *hints = nullptr;");
     }
@@ -1286,6 +1525,302 @@ mod tests {
         assert!(!hover.sent);
     }
     #[test]
+    fn definition_locations_use_local_files_and_selection_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with spaces.cpp");
+        std::fs::write(&path, "int x;\n").unwrap();
+        let uri = url::Url::from_file_path(&path).unwrap().to_string();
+        let expected = format!("{uri}#L8");
+        let location = json!({"uri":uri,"range":{"start":{"line":7,"character":2}}});
+        assert_eq!(
+            definition_target(&location).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            definition_target(&json!([null, location])).as_deref(),
+            Some(expected.as_str())
+        );
+        let link = json!({"targetUri":uri,"targetRange":{"start":{"line":0}},"targetSelectionRange":{"start":{"line":7}}});
+        assert_eq!(
+            definition_target(&json!([link])).as_deref(),
+            Some(expected.as_str())
+        );
+        for missing in [
+            Value::Null,
+            json!([]),
+            json!({"uri":"https://example.com/source.cpp","range":{"start":{"line":0}}}),
+        ] {
+            assert!(definition_target(&missing).is_none());
+        }
+        std::fs::remove_file(path).unwrap();
+        assert!(definition_target(&location).is_none());
+    }
+
+    #[test]
+    fn navigation_requires_a_drawn_underline_and_available_definition() {
+        let target = Target {
+            path: PathBuf::from("sample.cpp"),
+            text: "int x;".into(),
+            revision: 1,
+            line: 0,
+            character: 4,
+            rect: Rect::new(4, 2, 1, 1),
+        };
+        let mut hover = Hover::default();
+        hover.update(Some(target.clone()));
+        hover.text = "int x".into();
+        hover.destination = Some("file:///sample.cpp#L1".into());
+        assert!(hover.destination_at(4, 2).is_none());
+        hover.popup = Rect::new(4, 3, 10, 3);
+        assert_eq!(hover.destination_at(4, 2), Some("file:///sample.cpp#L1"));
+        assert!(hover.destination_at(3, 2).is_none());
+        assert!(hover.destination_at(5, 2).is_none());
+        assert!(hover.destination_at(4, 3).is_none());
+        let mut next = target;
+        next.character = 0;
+        hover.update(Some(next));
+        assert!(hover.destination_at(4, 2).is_none());
+        hover.dismiss();
+        assert!(hover.destination_at(4, 2).is_none());
+    }
+
+    #[test]
+    fn clangd_resolves_a_function_call_to_its_body() {
+        if Command::new("clangd").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.cpp");
+        let text: Arc<str> =
+            "int compute();\nint caller() { return compute(); }\nint compute() { return 42; }\n"
+                .into();
+        std::fs::write(&path, text.as_ref()).unwrap();
+        let expected = format!(
+            "{}#L3",
+            url::Url::from_file_path(path.canonicalize().unwrap()).unwrap()
+        );
+        let target = Target {
+            path,
+            text,
+            revision: 1,
+            line: 1,
+            character: 23,
+            rect: Rect::new(1, 1, 7, 1),
+        };
+        let client = Client::start(&target).unwrap();
+        client.request(Request { id: 42, target }).unwrap();
+        let (id, destination) = client
+            .definitions
+            .recv_timeout(Duration::from_secs(15))
+            .unwrap();
+        assert_eq!(id, 42);
+        assert_eq!(destination, Some(expected));
+    }
+
+    #[test]
+    fn clangd_finds_cpp_implementations_in_the_project_index() {
+        if Command::new("clangd").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let header = root.join("api.h");
+        let implementation = root.join("separate_implementation.cpp");
+        let caller = root.join("caller.cpp");
+        let header_text: Arc<str> = "int compute(int);\nint compute(double);\n".into();
+        let caller_text: Arc<str> =
+            "#include \"api.h\"\nint caller() { return compute(2); }\n".into();
+        std::fs::write(&header, header_text.as_ref()).unwrap();
+        std::fs::write(&caller, caller_text.as_ref()).unwrap();
+        std::fs::write(&implementation, "#include \"api.h\"\nint compute(double x) { return 0; }\nint compute(int x) { return x; }\n").unwrap();
+        let commands: Vec<_> = [&caller, &implementation].into_iter().map(|path| {
+            json!({"directory":root,"file":path,"arguments":["clang++","-std=c++17","-c",path]})
+        }).collect();
+        std::fs::write(
+            root.join("compile_commands.json"),
+            serde_json::to_vec(&commands).unwrap(),
+        )
+        .unwrap();
+        let expected = format!("{}#L3", url::Url::from_file_path(&implementation).unwrap());
+        let target = Target {
+            path: caller,
+            text: caller_text,
+            revision: 1,
+            line: 1,
+            character: 23,
+            rect: Rect::new(1, 1, 7, 1),
+        };
+        let client = Client::start(&target).unwrap();
+        // The implementation has never been opened: background indexing must find it.
+        for (id, target) in [
+            (1, target),
+            (
+                2,
+                Target {
+                    path: header,
+                    text: header_text,
+                    revision: 2,
+                    line: 0,
+                    character: 5,
+                    rect: Rect::new(1, 1, 7, 1),
+                },
+            ),
+        ] {
+            client.request(Request { id, target }).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                let (reply_id, destination) = client
+                    .definitions
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("clangd should find the implementation after indexing");
+                if reply_id == id && destination.as_deref() == Some(&expected) {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_connection_prewarms_reports_progress_and_keeps_hover_responsive() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("server.py");
+        std::fs::write(&script, r#"
+import json, pathlib, sys, time, threading
+root = pathlib.Path(sys.argv[1])
+with (root / "starts").open("a") as starts:
+    starts.write("start\n")
+output_lock = threading.Lock()
+def emit(value):
+    data = json.dumps(value).encode()
+    with output_lock:
+        sys.stdout.buffer.write(b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" + data)
+        sys.stdout.buffer.flush()
+def progress(kind, percentage=None):
+    value = {"kind": kind}
+    if percentage is not None:
+        value["percentage"] = percentage
+    emit({"jsonrpc": "2.0", "method": "$/progress", "params": {"token": "backgroundIndexProgress", "value": value}})
+def definition(request):
+    progress("report", 32)
+    (root / "pending").touch()
+    while not (root / "release").exists():
+        time.sleep(0.01)
+    progress("end")
+    emit({"jsonrpc": "2.0", "id": request["id"], "result": {"uri": request["params"]["textDocument"]["uri"], "range": {"start": {"line": 0}}}})
+while True:
+    size = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            sys.exit(0)
+        if line in (b"\r\n", b"\n"):
+            break
+        if line.lower().startswith(b"content-length:"):
+            size = int(line.split(b":", 1)[1])
+    request = json.loads(sys.stdin.buffer.read(size))
+    if request["method"] == "textDocument/didOpen":
+        with (root / "opened").open("a") as opened:
+            opened.write(request["params"]["textDocument"]["text"] + "\n")
+    if "id" not in request:
+        continue
+    method = request["method"]
+    if method == "textDocument/definition":
+        threading.Thread(target=definition, args=(request,), daemon=True).start()
+        continue
+    if method == "textDocument/hover":
+        if request["params"]["position"] == {"line": 0, "character": 0}:
+            progress("begin", 0)
+            (root / "hover_warmed").touch()
+        result = {"contents": "int selected;"}
+    else:
+        result = {}
+    emit({"jsonrpc": "2.0", "id": request["id"], "result": result})
+"#).unwrap();
+        let path = dir.path().join("sample.cpp");
+        std::fs::write(&path, "int selected;").unwrap();
+        let target = Target {
+            path,
+            text: "int selected;".into(),
+            revision: 1,
+            line: 0,
+            character: 4,
+            rect: Rect::new(5, 2, 8, 1),
+        };
+        let mut command = Command::new("python3");
+        command.arg("-u").arg(&script).arg(dir.path());
+        let mut state = Hover {
+            client: Some(Client::start_command(&target, command).unwrap()),
+            ..Hover::default()
+        };
+        state.prepare(&target.path, target.text.clone(), target.revision);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("hover_warmed").exists()
+            || state.indexing_status().as_deref() != Some(" indexing 0% ")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "file and tooltip should warm before hovering"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(state.target.is_none());
+        assert!(!state.visible());
+        state.prepare(&target.path, target.text.clone(), target.revision);
+        let client = state.client.as_ref().unwrap();
+        assert!(matches!(
+            client.rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        let request = Request { id: 1, target };
+        client.request(request.clone()).unwrap();
+        assert_eq!(client.rx.recv_timeout(Duration::from_secs(5)).unwrap().0, 1);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("opened")).unwrap(),
+            "int selected;\n"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("pending").exists()
+            || state.indexing_status().as_deref() != Some(" indexing 32% ")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "navigation should start and report progress"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Both RPCs use the same process and pipe. The definition response is held
+        // until explicitly released, and hover must still complete first.
+        client.request(Request { id: 2, ..request }).unwrap();
+        let (id, text) = client.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!((id, text.as_str()), (2, "int selected;"));
+        assert!(matches!(
+            client.definitions.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("starts")).unwrap(),
+            "start\n"
+        );
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        assert!(client
+            .definitions
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .1
+            .is_some());
+        let (id, destination) = client
+            .definitions
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(id, 2);
+        assert!(destination.is_some());
+        assert!(state.indexing_status().is_none());
+    }
+
+    #[test]
     fn actual_clangd_hover_and_formatted_buffer() {
         if Command::new("clangd").arg("--version").output().is_err() {
             return;
@@ -1303,7 +1838,7 @@ mod tests {
             rect: Rect::new(1, 1, 8, 1),
         };
         let client = Client::start(&target).unwrap();
-        client.tx.send(Request { id: 1, target }).unwrap();
+        client.request(Request { id: 1, target }).unwrap();
         let (_, result) = client.rx.recv_timeout(Duration::from_secs(15)).unwrap();
         assert!(
             result.contains("selected") && result.contains("Selection"),
@@ -1329,7 +1864,7 @@ mod tests {
             rect: Rect::new(1, 1, 6, 1),
         };
         let client = Client::start(&target).unwrap();
-        client.tx.send(Request { id: 1, target }).unwrap();
+        client.request(Request { id: 1, target }).unwrap();
         let _ = client.rx.recv_timeout(Duration::from_secs(15)).unwrap();
         let (_, result) = client.rx.recv_timeout(Duration::from_secs(15)).unwrap();
         assert!(
@@ -1342,6 +1877,7 @@ mod tests {
     #[test]
     fn popup_fits_terminal_and_ignores_late_response() {
         let (reply, rx) = mpsc::channel();
+        let (definition_reply, definitions) = mpsc::channel();
         let (tx, _) = mpsc::channel();
         let mut hover = Hover::default();
         let target = Target {
@@ -1357,14 +1893,20 @@ mod tests {
         hover.client = Some(Client {
             tx,
             rx,
+            definitions,
             child: Arc::new(Mutex::new(None)),
+            progress: Arc::new(Mutex::new(None)),
         });
         reply.send((hover.id - 1, "stale".into())).unwrap();
+        definition_reply
+            .send((hover.id - 1, Some("file:///stale.cpp#L1".into())))
+            .unwrap();
         reply
             .send((hover.id, "int x\nDocumentation".into()))
             .unwrap();
         hover.update(Some(target));
         assert_eq!(hover.text, "int x\nDocumentation");
+        assert!(hover.destination.is_none());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         let syntax = two_face::syntax::extra_newlines();
@@ -1389,6 +1931,65 @@ mod tests {
             .content()
             .iter()
             .any(|cell| cell.symbol() == "D"));
+    }
+    #[test]
+    fn overflowing_popup_is_taller_and_shows_its_scroll_position() {
+        let mut hover = Hover::default();
+        hover.update(Some(Target {
+            path: "/tmp/a.cpp".into(),
+            text: "int x;".into(),
+            revision: 1,
+            line: 0,
+            character: 4,
+            rect: Rect::new(5, 2, 1, 1),
+        }));
+        hover.text = (0..40)
+            .map(|i| format!("int member_{i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 30)).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = pulldown_cmark_mdcat::Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        terminal
+            .draw(|frame| hover.draw(frame, frame.area(), &settings, true))
+            .unwrap();
+        assert_eq!(hover.popup.height, 18);
+        let x = hover.popup.right() - 1;
+        let top = hover.popup.y + 1;
+        let bottom = hover.popup.bottom() - 2;
+        assert_eq!(terminal.backend().buffer()[(x, top)].symbol(), "┃");
+        assert_eq!(terminal.backend().buffer()[(x, bottom)].symbol(), "│");
+        for _ in 0..20 {
+            assert!(hover.scroll(x, top, true));
+        }
+        terminal
+            .draw(|frame| hover.draw(frame, frame.area(), &settings, true))
+            .unwrap();
+        assert_eq!(hover.offset, 24);
+        assert_eq!(terminal.backend().buffer()[(x, top)].symbol(), "│");
+        assert_eq!(terminal.backend().buffer()[(x, bottom)].symbol(), "┃");
+        terminal
+            .draw(|frame| hover.draw(frame, Rect::new(0, 0, 60, 10), &settings, true))
+            .unwrap();
+        assert_eq!(hover.popup.height, 8);
+        assert!(hover.popup.bottom() <= 10);
+        hover.text = "int x;".into();
+        terminal
+            .draw(|frame| hover.draw(frame, frame.area(), &settings, true))
+            .unwrap();
+        assert_eq!(hover.popup.height, 3);
+        assert_eq!(hover.offset, 0);
+        assert_eq!(
+            terminal.backend().buffer()[(hover.popup.right() - 1, hover.popup.y + 1)].symbol(),
+            "│"
+        );
     }
     #[test]
     fn unicode_screen_position_to_utf16() {

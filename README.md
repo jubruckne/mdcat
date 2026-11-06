@@ -127,10 +127,19 @@ In C/C++ source and headers, pause the mouse over an identifier to show symbol i
 from `clangd`. Tooltips show formatted C++ declarations: variables and constants, multiline function
 signatures, public class/struct/union members, and enum values. Aliases are followed
 through related types in the same header when available. Escape dismisses the popup; use the mouse wheel over it to scroll longer
-answers. Hover also works in the Ctrl+O formatted view. `clangd` must be on PATH; it uses
+answers. Click the underlined identifier to jump to its implementation when clangd can locate it,
+falling back to its declaration.
+Hover also works in the Ctrl+O formatted view. `clangd` must be on PATH; it uses
 the project's compile commands and `.clangd` configuration to resolve includes and types.
-Without suitable compiler flags, some symbols may be unavailable. The server starts on the
-first hover and stops when mdcat exits.
+Without suitable compiler flags, some symbols may be unavailable. One clangd process
+starts when a C/C++ file is first displayed. It prewarms parsing and tooltip support
+in the background, including a hidden hover request. Cached project indexing may
+overlap at background priority, using four indexing workers; foreground concurrency
+is also limited to four. Hover and implementation requests share the connection
+with independent reply handling. Indexing progress appears in the bottom border.
+The process stops when mdcat exits. The project’s `compile_commands.json` supplies
+the files and flags for cross-file implementation discovery; navigation updates
+automatically as indexing completes.
 Directory links open a nested listing with links to subdirectories and files. Use Up/Down to
 select an entry and Enter to open it. In a Git repository, changed and untracked entries are
 shown in yellow; directories are yellow when they contain changes.
