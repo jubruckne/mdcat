@@ -54,7 +54,81 @@ enum NavigationWork {
     },
     IndexReady,
 }
+#[derive(Clone, Debug)]
+pub struct DocumentSymbol {
+    pub name: String,
+    pub line: usize,
+    pub kind: crate::scope_hint::SymbolKind,
+    pub container: Option<(usize, String)>,
+}
+/// Separate the owner from the method, ignoring qualifiers inside templates and parameters.
+pub fn qualified_method(name: &str) -> Option<(&str, &str)> {
+    let end = name
+        .find("operator")
+        .or_else(|| name.find('('))
+        .unwrap_or(name.len());
+    let bytes = name.as_bytes();
+    let mut angle = 0usize;
+    let mut split = None;
+    for (i, &byte) in bytes.iter().enumerate().take(end) {
+        match byte {
+            b'<' => angle += 1,
+            b'>' => angle = angle.saturating_sub(1),
+            b':' if angle == 0 && bytes.get(i + 1) == Some(&b':') => split = Some(i),
+            _ => {}
+        }
+    }
+    let split = split?;
+    let owner = name[..split].trim_start_matches("::");
+    let member = &name[split + 2..];
+    (!owner.is_empty() && !member.is_empty()).then_some((owner, member))
+}
+
+type SymbolCache = Arc<Mutex<Option<(PathBuf, u64, Option<Vec<DocumentSymbol>>)>>>;
+
+fn document_symbols(value: &Value) -> Vec<DocumentSymbol> {
+    use crate::scope_hint::SymbolKind;
+    fn collect(
+        values: &[Value],
+        container: Option<(usize, String)>,
+        out: &mut Vec<DocumentSymbol>,
+    ) {
+        for value in values {
+            let line = value["selectionRange"]["start"]["line"]
+                .as_u64()
+                .or_else(|| value["location"]["range"]["start"]["line"].as_u64())
+                .map(|line| line as usize);
+            let kind = SymbolKind::from_lsp(value["kind"].as_u64().unwrap_or(0));
+            let group = matches!(kind, SymbolKind::Type | SymbolKind::Enum);
+            if let (Some(name), Some(line)) = (value["name"].as_str(), line) {
+                out.push(DocumentSymbol {
+                    name: name.into(),
+                    line,
+                    kind,
+                    container: if group { None } else { container.clone() },
+                });
+            }
+            if let Some(children) = value["children"].as_array() {
+                let owner = if group {
+                    line.zip(value["name"].as_str().map(str::to_owned))
+                } else if kind == SymbolKind::Function {
+                    None
+                } else {
+                    container.clone()
+                };
+                collect(children, owner, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(values) = value.as_array() {
+        collect(values, None, &mut out);
+    }
+    out
+}
+
 struct Client {
+    symbols: SymbolCache,
     tx: mpsc::Sender<Work>,
     rx: mpsc::Receiver<(u64, String)>,
     definitions: mpsc::Receiver<(u64, Option<String>)>,
@@ -709,6 +783,8 @@ impl Client {
             documents: Mutex::new(HashMap::new()),
             next_version: AtomicU64::new(1),
         });
+        let symbols: SymbolCache = Arc::new(Mutex::new(None));
+        let worker_symbols = symbols.clone();
         let progress = Arc::new(Mutex::new(None));
         let (tx, requests) = mpsc::channel::<Work>();
         let (navigation_tx, navigation_rx) = mpsc::channel::<NavigationWork>();
@@ -835,6 +911,28 @@ impl Client {
                         };
                         connection.open_document(&uri, language, &t.text, true)?;
                         opened = Some((t.path.clone(), t.revision));
+                        let symbol_connection = connection.clone();
+                        let symbol_cache = worker_symbols.clone();
+                        let symbol_target = t.clone();
+                        let symbol_uri = uri.clone();
+                        *worker_symbols.lock().unwrap() = Some((t.path.clone(), t.revision, None));
+                        std::thread::spawn(move || {
+                            let result = symbol_connection.request(
+                                "textDocument/documentSymbol",
+                                json!({"textDocument":{"uri":symbol_uri}}),
+                            );
+                            let items = result
+                                .map(|value| document_symbols(&value))
+                                .unwrap_or_default();
+                            let mut cache = symbol_cache.lock().unwrap();
+                            if let Some((path, revision, result)) = cache.as_mut() {
+                                if *path == symbol_target.path
+                                    && *revision == symbol_target.revision
+                                {
+                                    *result = Some(items);
+                                }
+                            }
+                        });
                     }
                     if prepare_only {
                         warm_tooltip_support();
@@ -858,6 +956,7 @@ impl Client {
             let _ = run();
         });
         Ok(Self {
+            symbols,
             tx,
             rx,
             definitions,
@@ -1037,6 +1136,17 @@ impl Hover {
                 self.prepared = Some((path.to_owned(), revision));
             }
         }
+    }
+
+    pub fn symbols(&self, path: &std::path::Path, revision: u64) -> Option<Vec<DocumentSymbol>> {
+        if self.disabled {
+            return Some(Vec::new());
+        }
+        let cache = self.client.as_ref()?.symbols.lock().ok()?;
+        let (cached_path, cached_revision, symbols) = cache.as_ref()?;
+        (cached_path == path && *cached_revision == revision)
+            .then(|| symbols.clone())
+            .flatten()
     }
 
     pub fn update(&mut self, target: Option<Target>) {
@@ -1298,6 +1408,66 @@ pub fn target_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn qualified_method_names_ignore_template_and_parameter_qualifiers() {
+        assert_eq!(
+            qualified_method("shader_app::draw_vertices"),
+            Some(("shader_app", "draw_vertices"))
+        );
+        assert_eq!(
+            qualified_method("render::Buffer<std::size_t>::draw(std::vector<foo::Bar>)"),
+            Some(("render::Buffer<std::size_t>", "draw(std::vector<foo::Bar>)"))
+        );
+        assert_eq!(
+            qualified_method("Widget::operator std::size_t"),
+            Some(("Widget", "operator std::size_t"))
+        );
+        assert_eq!(
+            qualified_method("Widget::~Widget"),
+            Some(("Widget", "~Widget"))
+        );
+        assert_eq!(qualified_method("unrelated"), None);
+    }
+
+    #[test]
+    fn symbol_containers_skip_namespaces_and_do_not_nest_type_groups() {
+        let symbols = document_symbols(&json!([
+            {"name":"demo", "kind":3, "selectionRange":{"start":{"line":0}}, "children":[
+                {"name":"Outer", "kind":23, "selectionRange":{"start":{"line":1}}, "children":[
+                    {"name":"method", "kind":6, "selectionRange":{"start":{"line":2}}},
+                    {"name":"Inner", "kind":5, "selectionRange":{"start":{"line":3}}, "children":[
+                        {"name":"field", "kind":8, "selectionRange":{"start":{"line":4}}}
+                    ]},
+                    {"name":"Mode", "kind":10, "selectionRange":{"start":{"line":5}}, "children":[
+                        {"name":"Ready", "kind":22, "selectionRange":{"start":{"line":6}}}
+                    ]}
+                ]}
+            ]}
+        ]));
+        assert_eq!(symbols[1].container, None);
+        assert_eq!(symbols[2].container, Some((1, "Outer".into())));
+        assert_eq!(symbols[3].container, None);
+        assert_eq!(symbols[4].container, Some((3, "Inner".into())));
+        assert_eq!(symbols[5].container, None);
+        assert_eq!(symbols[6].container, Some((5, "Mode".into())));
+    }
+
+    #[test]
+    fn document_symbol_outline_keeps_hierarchy_and_locations() {
+        let result = document_symbols(&json!([
+            {"name":"test", "selectionRange":{"start":{"line":1}}, "children":[
+                {"name":"render", "kind":12, "selectionRange":{"start":{"line":4}}}
+            ]},
+            {"name":"legacy", "location":{"range":{"start":{"line":9}}}}
+        ]));
+        assert_eq!(result.len(), 3);
+        assert_eq!(
+            (result[1].name.as_str(), result[1].line, result[1].kind),
+            ("render", 4, crate::scope_hint::SymbolKind::Function)
+        );
+        assert_eq!(result[2].line, 9);
+    }
+
     #[test]
     fn declarations_are_formatted_as_cpp() {
         assert_eq!(
@@ -1844,6 +2014,28 @@ while True:
             result.contains("selected") && result.contains("Selection"),
             "{result}"
         );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let symbols = loop {
+            if let Some(items) = client
+                .symbols
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|(_, _, items)| items.clone())
+            {
+                break items;
+            }
+            assert!(Instant::now() < deadline, "document symbols should arrive");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol.name == "Selection" && symbol.line == 0));
+        assert!(symbols.iter().any(|symbol| symbol.name == "member_id"
+            && symbol.kind == crate::scope_hint::SymbolKind::Variable));
+        assert!(symbols
+            .iter()
+            .any(|symbol| symbol.name.starts_with('f') && symbol.line == 1));
     }
     #[test]
     fn clangd_expands_project_aliases_to_members() {
@@ -1891,6 +2083,7 @@ while True:
         hover.update(Some(target.clone()));
         hover.sent = true;
         hover.client = Some(Client {
+            symbols: Arc::new(Mutex::new(None)),
             tx,
             rx,
             definitions,

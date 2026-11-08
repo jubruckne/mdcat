@@ -208,8 +208,18 @@ impl Document {
             .and_then(|_| crate::git_links::commit_title(&source));
         let commits = crate::git_links::GitLinks::new(project_root.clone());
         commits.references(&source);
+        let unformatted_input = if matches!(
+            extension.as_str(),
+            "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx"
+        ) {
+            crate::code_format::format(&source)
+                .ok()
+                .map(|formatted| std::mem::replace(&mut input, formatted))
+        } else {
+            None
+        };
         Ok(Self {
-            unformatted_input: None,
+            unformatted_input,
             blame: None,
             file_history: None,
             original_view: None,
@@ -491,9 +501,6 @@ impl Document {
     }
 
     pub fn show_source(&mut self, options: mdcat::RenderOptions) {
-        if let Some(input) = self.unformatted_input.take() {
-            self.input = input;
-        }
         self.json = None;
         self.diff = None;
         if self.language.is_none() {
@@ -755,6 +762,22 @@ mod tests {
     }
 
     #[test]
+    fn line_argument_preserves_automatic_formatting() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "void first(){int x=1;}\nvoid second(){}\n";
+        let Ok(expected) = crate::code_format::format(source) else {
+            return;
+        };
+        std::fs::write(dir.path().join("example.cpp"), source).unwrap();
+        let (document, line) =
+            Document::load_argument_at("example.cpp:2", Default::default(), dir.path()).unwrap();
+        assert_eq!(line, Some(2));
+        assert!(document.is_formatted());
+        assert_eq!(document.input, expected);
+        assert_eq!(document.source, source);
+    }
+
+    #[test]
     fn text_and_source_files_preserve_content_and_binary_files_are_rejected() {
         let dir = tempfile::tempdir().unwrap();
         for extension in ["txt", "json", "c", "cpp", "h", "py", "sh"] {
@@ -769,7 +792,11 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(doc.input, source);
+            assert_eq!(doc.source, source);
+            assert_eq!(
+                doc.unformatted_input.as_deref().unwrap_or(&doc.input),
+                source
+            );
             assert!(doc.language.is_some());
             assert_eq!(
                 doc.destination(Url::from_file_path(&path).unwrap().as_str())

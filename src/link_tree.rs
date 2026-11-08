@@ -1,5 +1,6 @@
 //! Compact directory groups in the link picker while retaining destination indices.
 
+#[derive(Clone)]
 pub struct PickerRow {
     pub label: String,
     pub target: Option<usize>,

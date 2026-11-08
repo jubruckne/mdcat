@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use anyhow::{bail, Context, Result};
 
-const STYLE: &str = "{BasedOnStyle: LLVM, IndentWidth: 4, ContinuationIndentWidth: 4, UseTab: Never, BreakBeforeBraces: Attach, ColumnLimit: 100, AllowShortBlocksOnASingleLine: Never, AllowShortFunctionsOnASingleLine: None, AllowShortIfStatementsOnASingleLine: Never, AllowShortLoopsOnASingleLine: false}";
+const STYLE: &str = "{BasedOnStyle: LLVM, IndentWidth: 4, ContinuationIndentWidth: 4, UseTab: Never, BreakBeforeBraces: Attach, ColumnLimit: 100, SeparateDefinitionBlocks: Always, AllowShortBlocksOnASingleLine: Never, AllowShortFunctionsOnASingleLine: None, AllowShortIfStatementsOnASingleLine: Never, AllowShortLoopsOnASingleLine: false}";
 
 pub fn supports(path: &Path) -> bool {
     path.extension()
@@ -80,6 +80,18 @@ fn format_with(executable: &Path, source: &str) -> Result<String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn formatting_separates_functions_without_adding_gaps_inside_them() {
+        let source = "void first(){if(true){work();}else{other();}}\nvoid second(){}\n";
+        let Ok(formatted) = format(source) else {
+            return;
+        };
+        assert!(formatted.contains("}\n\nvoid second()"), "{formatted}");
+        assert!(formatted.contains("} else {"), "{formatted}");
+        assert!(!formatted.contains("\n\n\n"), "{formatted}");
+        assert_eq!(format(&formatted).unwrap(), formatted);
+    }
 
     #[test]
     fn formatter_errors_do_not_become_display_content() {

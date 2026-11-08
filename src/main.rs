@@ -48,6 +48,7 @@ mod link_tree;
 mod navigation;
 mod picker;
 mod query;
+mod scope_hint;
 mod text_selection;
 
 /// Clear the terminal screen and scrollback, then move the cursor home.

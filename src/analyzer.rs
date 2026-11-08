@@ -90,6 +90,8 @@ pub fn run(
         let mut hover_source: std::sync::Arc<str> = "".into();
         let mut hover_source_path = None;
         let mut hover_first_row = None;
+        let mut scope_first_row = None;
+        let mut code_scopes = Vec::new();
         let mut hover_revision = 0u64;
         let mut link_picker: Option<LinkPicker> = None;
         let mut titles = Vec::new();
@@ -311,7 +313,10 @@ pub fn run(
                         .extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| {
-                            matches!(e, "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx")
+                            matches!(
+                                e.to_ascii_lowercase().as_str(),
+                                "c" | "h" | "cpp" | "hpp" | "cc" | "hh" | "cxx" | "hxx"
+                            )
                         })
                 {
                     let source: std::sync::Arc<str> = pulldown_cmark_mdcat::expand_tabs(
@@ -328,6 +333,19 @@ pub fn run(
                     }
                     code_hover.prepare(&document.path, hover_source.clone(), hover_revision);
                     hover_first_row = anchor_line_with_table_width(
+                        &document,
+                        "L1",
+                        &settings,
+                        resources,
+                        options,
+                        table_width,
+                    )?;
+                }
+                scope_first_row = None;
+                code_scopes.clear();
+                if document.can_format() {
+                    code_scopes = crate::scope_hint::scopes(&document.input);
+                    scope_first_row = anchor_line_with_table_width(
                         &document,
                         "L1",
                         &settings,
@@ -458,6 +476,43 @@ pub fn run(
                 };
                 code_hover.update(target);
             }
+            if let Some(picker) = link_picker.as_mut().filter(|picker| picker.needs_symbols()) {
+                if let (Some(symbols), Some(first_row)) = (
+                    code_hover.symbols(&document.path, hover_revision),
+                    hover_first_row,
+                ) {
+                    picker.load_symbols(&symbols, &document, first_row);
+                }
+            }
+            let hovered_scope = if hover_allowed {
+                mouse_position.and_then(|(x, y)| {
+                    if x <= area.x
+                        || x >= area.right().saturating_sub(1)
+                        || y <= area.y
+                        || y >= area.bottom().saturating_sub(1)
+                    {
+                        return None;
+                    }
+                    let first = scope_first_row?;
+                    let row = (scroll + usize::from(y - area.y - 1)).checked_sub(first)?;
+                    let scope = crate::scope_hint::at(&code_scopes, row)?;
+                    Some(crate::scope_hint::Scope {
+                        first: first + scope.first,
+                        last: first + scope.last,
+                    })
+                })
+            } else {
+                None
+            };
+            let frozen_definition =
+                hovered_scope
+                    .filter(|scope| scope.first < scroll)
+                    .and_then(|scope| {
+                        Some(crate::scope_hint::definition(
+                            &document.input,
+                            scope.first.checked_sub(scope_first_row?)?,
+                        ))
+                    });
             terminal.draw(|frame| {
                 // Each fixed child covers its parent's body, leaving its title bar visible.
                 for (index, (_, position, _)) in history.iter().skip(first_parent).enumerate() {
@@ -500,6 +555,8 @@ pub fn run(
                 );
 
                 draw_source_line_highlight(frame, area, scroll, highlighted_row, no_colour || crossterm::style::Colored::ansi_color_disabled(), settings.theme.is_dark);
+
+                draw_scope_hint(frame, area, scroll, hovered_scope, no_colour);
 
                 if let (Some(view), Some(picker)) = (image_state.as_mut(), image_picker.as_ref()) {
                     view.draw(frame, picker, area, scroll);
@@ -713,6 +770,9 @@ pub fn run(
                         });
                     frame.render_stateful_widget(scrollbar, track, &mut state);
                 }
+                if let Some(definition) = frozen_definition.as_deref() {
+                    draw_frozen_scope(frame, area, definition, no_colour);
+                }
                 code_hover.draw(frame, area, settings, no_colour || crossterm::style::Colored::ansi_color_disabled());
                 if response.visible {
                     response.draw(frame);
@@ -849,11 +909,12 @@ pub fn run(
                 }
                 Event::Key(key) if key.kind != KeyEventKind::Release && link_picker.is_some() => {
                     let picker = link_picker.as_mut().unwrap();
-                    let navigate = matches!(
+                    let mut navigate = matches!(
                         key.code,
-                        KeyCode::Up
+                        KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Up
                             | KeyCode::Down
-                            | KeyCode::Char('j' | 'k')
                             | KeyCode::Tab
                             | KeyCode::BackTab
                             | KeyCode::PageUp
@@ -866,13 +927,30 @@ pub fn run(
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break
                         }
-                        KeyCode::Esc | KeyCode::Char('q' | 'Q') => close = true,
-                        KeyCode::Down | KeyCode::Char('j') => picker.move_by(1),
+                        KeyCode::Esc if !picker.filter.is_empty() => picker.clear_filter(),
+                        KeyCode::Esc => close = true,
+                        KeyCode::Backspace => {
+                            picker.edit_filter(None);
+                            navigate = true;
+                        }
+                        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            picker.clear_filter()
+                        }
+                        KeyCode::Char(character)
+                            if !key.modifiers.intersects(
+                                KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                            ) =>
+                        {
+                            picker.edit_filter(Some(character));
+                            navigate = true;
+                        }
+                        KeyCode::Left | KeyCode::Right => picker.switch_page(),
+                        KeyCode::Down => picker.move_by(1),
                         KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
                             picker.move_by(-1)
                         }
                         KeyCode::Tab => picker.move_by(1),
-                        KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => picker.move_by(-1),
+                        KeyCode::Up | KeyCode::BackTab => picker.move_by(-1),
                         KeyCode::PageDown => picker.move_by(
                             isize::try_from(picker.area.height.saturating_sub(2).max(1)).unwrap(),
                         ),
@@ -881,7 +959,7 @@ pub fn run(
                         ),
                         KeyCode::Home => picker.select_edge(false),
                         KeyCode::End => picker.select_edge(true),
-                        KeyCode::Enter if !picker.targets.is_empty() => {
+                        KeyCode::Enter if picker.selected_target().is_some() => {
                             open_target = picker.selected_target();
                             selected.clone_from(&open_target);
                             close = true;
@@ -900,8 +978,8 @@ pub fn run(
                 Event::Mouse(mouse) if link_picker.is_some() => {
                     let picker = link_picker.as_mut().unwrap();
                     match mouse.kind {
-                        MouseEventKind::ScrollDown => picker.move_by(1),
-                        MouseEventKind::ScrollUp => picker.move_by(-1),
+                        MouseEventKind::ScrollDown => picker.scroll_by(1),
+                        MouseEventKind::ScrollUp => picker.scroll_by(-1),
                         MouseEventKind::Moved => {
                             if let Some(index) = picker.item_at(mouse.column, mouse.row) {
                                 picker.state.select(Some(index));
@@ -1548,8 +1626,12 @@ pub fn run(
                     KeyCode::Backspace | KeyCode::Left => go_back = true,
                     KeyCode::Tab | KeyCode::BackTab => {
                         let targets = available_links(&document, options);
-                        link_picker =
-                            Some(LinkPicker::new(targets, &document, selected.as_deref()));
+                        link_picker = Some(LinkPicker::for_document(
+                            targets,
+                            &document,
+                            selected.as_deref(),
+                            hover_first_row.unwrap_or(0),
+                        ));
                         dragging_scrollbar = false;
                     }
                     KeyCode::Char('?') => {
@@ -2273,6 +2355,58 @@ fn json_left(json: &mut crate::json_view::JsonView, has_parent: bool) -> (bool, 
 const EMPTY_LINK_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const EMPTY_LINK_NOTICE_FADE: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Create display-only class headings for qualified methods whose owner is elsewhere.
+fn group_qualified_methods(
+    items: &mut Vec<crate::code_hover::DocumentSymbol>,
+) -> std::collections::HashSet<(usize, String)> {
+    use crate::scope_hint::SymbolKind;
+    let mut synthetic = std::collections::HashSet::new();
+    let mut groups: Vec<_> = items
+        .iter()
+        .filter(|item| item.kind == SymbolKind::Type)
+        .map(|item| (item.line, item.name.clone()))
+        .collect();
+    let namespaces: Vec<_> = items
+        .iter()
+        .filter(|item| item.kind == SymbolKind::Namespace)
+        .map(|item| item.name.clone())
+        .collect();
+    let mut headings = Vec::new();
+    for item in items.iter_mut() {
+        if item.kind != SymbolKind::Function {
+            continue;
+        }
+        let Some((owner, member)) = crate::code_hover::qualified_method(&item.name) else {
+            continue;
+        };
+        if namespaces.iter().any(|namespace| namespace == owner) {
+            continue;
+        }
+        let owner = owner.to_owned();
+        let member = member.to_owned();
+        let group = item
+            .container
+            .clone()
+            .or_else(|| groups.iter().find(|(_, name)| *name == owner).cloned())
+            .unwrap_or_else(|| {
+                let group = (item.line, owner.clone());
+                groups.push(group.clone());
+                synthetic.insert(group.clone());
+                headings.push(crate::code_hover::DocumentSymbol {
+                    name: owner.clone(),
+                    line: item.line,
+                    kind: SymbolKind::Type,
+                    container: None,
+                });
+                group
+            });
+        item.container = Some(group);
+        item.name = member;
+    }
+    items.extend(headings);
+    synthetic
+}
+
 struct LinkPicker {
     targets: Vec<String>,
     rows: Vec<crate::link_tree::PickerRow>,
@@ -2281,6 +2415,14 @@ struct LinkPicker {
     area: ratatui::layout::Rect,
     opened: std::time::Instant,
     preview_line: Option<usize>,
+    other_page: Option<Box<LinkPicker>>,
+    symbols_page: bool,
+    symbols_loaded: bool,
+    symbol_rows: Vec<usize>,
+    all_rows: Vec<crate::link_tree::PickerRow>,
+    all_symbol_rows: Vec<usize>,
+    filter: String,
+    filter_regex: Option<regex::Regex>,
 }
 
 impl LinkPicker {
@@ -2310,13 +2452,422 @@ impl LinkPicker {
             .or_else(|| file_rows.first().copied());
         Self {
             targets,
+            all_rows: rows.clone(),
             rows,
             file_rows,
             state: ListState::default().with_selected(index),
             area: Default::default(),
             opened: std::time::Instant::now(),
             preview_line: None,
+            other_page: None,
+            symbols_page: false,
+            symbols_loaded: false,
+            symbol_rows: Vec::new(),
+            all_symbol_rows: Vec::new(),
+            filter: String::new(),
+            filter_regex: None,
         }
+    }
+
+    fn for_document(
+        targets: Vec<String>,
+        document: &crate::navigation::Document,
+        selected: Option<&str>,
+        first_row: usize,
+    ) -> Self {
+        let links = Self::new(targets, document, selected);
+        let supported = document.can_format()
+            && document
+                .path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| {
+                    matches!(
+                        e.to_ascii_lowercase().as_str(),
+                        "c" | "cpp" | "h" | "hpp" | "cc" | "cxx" | "hh" | "hxx"
+                    )
+                });
+        if !supported {
+            return links;
+        }
+        let mut symbols = Self::new(Vec::new(), document, None);
+        symbols.symbols_page = true;
+        symbols.other_page = Some(Box::new(links));
+        let local: Vec<_> = crate::scope_hint::local_symbols(&document.input)
+            .into_iter()
+            .map(|symbol| crate::code_hover::DocumentSymbol {
+                name: symbol.name,
+                line: symbol.line,
+                kind: symbol.kind,
+                container: symbol.container,
+            })
+            .collect();
+        symbols.load_symbols(&local, document, first_row);
+        symbols.symbols_loaded = false;
+        symbols
+    }
+
+    fn edit_filter(&mut self, character: Option<char>) {
+        if let Some(character) = character {
+            self.filter.push(character);
+        } else {
+            self.filter.pop();
+        }
+        self.filter_regex = (!self.filter.is_empty()).then(|| {
+            regex::RegexBuilder::new(&regex::escape(&self.filter))
+                .case_insensitive(true)
+                .build()
+                .expect("literal filter regex")
+        });
+        self.apply_filter();
+        *self.state.offset_mut() = 0;
+    }
+
+    fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.filter_regex = None;
+        self.apply_filter();
+        *self.state.offset_mut() = 0;
+    }
+
+    fn apply_filter(&mut self) {
+        let previous = self.selected_target();
+        let mut keep = vec![self.filter_regex.is_none(); self.all_rows.len()];
+        let mut selectable = keep.clone();
+        if let Some(pattern) = &self.filter_regex {
+            let mut ancestors: Vec<(usize, usize)> = Vec::new();
+            for (index, row) in self.all_rows.iter().enumerate() {
+                if self.symbols_page {
+                    keep[index] = pattern.is_match(&row.label);
+                    selectable[index] = keep[index] && row.target.is_some();
+                    continue;
+                }
+                let depth = if self.symbols_page {
+                    usize::from(row.label.starts_with("  "))
+                } else {
+                    row.label
+                        .chars()
+                        .take_while(|ch| matches!(ch, ' ' | '│' | '├' | '╰'))
+                        .count()
+                        / 2
+                };
+                while ancestors
+                    .last()
+                    .is_some_and(|(_, parent_depth)| *parent_depth >= depth)
+                {
+                    ancestors.pop();
+                }
+                let matched = pattern.is_match(&row.label)
+                    || (!self.symbols_page
+                        && ancestors
+                            .iter()
+                            .any(|(parent, _)| pattern.is_match(&self.all_rows[*parent].label)));
+                if matched && row.target.is_some() {
+                    selectable[index] = true;
+                    keep[index] = true;
+                    for (parent, _) in &ancestors {
+                        keep[*parent] = true;
+                    }
+                }
+                let group = row.target.is_none()
+                    || (self.symbols_page
+                        && (row.label.starts_with("◇ ") || row.label.starts_with("≡ ")));
+                if group {
+                    ancestors.push((index, depth));
+                }
+            }
+        }
+        self.rows.clear();
+        self.symbol_rows.clear();
+        for (index, row) in self.all_rows.iter().enumerate() {
+            if keep[index] {
+                let mut row = row.clone();
+                if !selectable[index] {
+                    row.target = None;
+                }
+                self.rows.push(row);
+                if let Some(line) = self.all_symbol_rows.get(index) {
+                    self.symbol_rows.push(*line);
+                }
+            }
+        }
+        self.file_rows = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| row.target.map(|_| index))
+            .collect();
+        let selected = previous
+            .and_then(|target| self.targets.iter().position(|item| *item == target))
+            .and_then(|target| self.rows.iter().position(|row| row.target == Some(target)))
+            .or_else(|| self.file_rows.first().copied());
+        self.state.select(selected);
+    }
+
+    fn highlighted_label(&self, label: &str, no_colour: bool) -> Line<'static> {
+        use ratatui::{style::Modifier, text::Span};
+        let Some(pattern) = &self.filter_regex else {
+            return Line::raw(label.to_owned());
+        };
+        let mut spans = Vec::new();
+        let mut end = 0;
+        let style = Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+        let style = if no_colour {
+            style
+        } else {
+            style.fg(Color::Yellow)
+        };
+        for matched in pattern.find_iter(label) {
+            spans.push(Span::raw(label[end..matched.start()].to_owned()));
+            spans.push(Span::styled(label[matched.range()].to_owned(), style));
+            end = matched.end();
+        }
+        spans.push(Span::raw(label[end..].to_owned()));
+        Line::from(spans)
+    }
+
+    fn switch_page(&mut self) {
+        if let Some(mut other) = self.other_page.take() {
+            std::mem::swap(self, &mut other);
+            self.other_page = Some(other);
+        }
+    }
+
+    fn needs_symbols(&self) -> bool {
+        if self.symbols_page {
+            !self.symbols_loaded
+        } else {
+            self.other_page
+                .as_deref()
+                .is_some_and(|page| page.symbols_page && !page.symbols_loaded)
+        }
+    }
+
+    fn load_symbols(
+        &mut self,
+        items: &[crate::code_hover::DocumentSymbol],
+        document: &crate::navigation::Document,
+        first_row: usize,
+    ) {
+        let page = if self.symbols_page {
+            self
+        } else {
+            let Some(page) = self.other_page.as_deref_mut() else {
+                return;
+            };
+            page
+        };
+        if !page.symbols_page || page.symbols_loaded {
+            return;
+        }
+        page.symbols_loaded = true;
+        // Keep the immediate outline if clangd has no results (for example after a timeout).
+        if items.is_empty() {
+            return;
+        }
+        let mut items = items.to_vec();
+        let local = crate::scope_hint::local_symbols(&document.input);
+        let lines: Vec<_> = document.input.lines().collect();
+        let using_ranges: Vec<_> = local
+            .iter()
+            .filter(|symbol| symbol.kind == crate::scope_hint::SymbolKind::Using)
+            .map(|symbol| {
+                let end = lines
+                    .iter()
+                    .skip(symbol.line)
+                    .position(|line| line.contains(';'))
+                    .unwrap_or(0)
+                    + symbol.line;
+                let statement = lines[symbol.line..=end].join(" ");
+                let mut words = statement.split_whitespace();
+                let namespace = words.next() == Some("using") && words.next() == Some("namespace");
+                (symbol.line, end, symbol.name.clone(), namespace)
+            })
+            .collect();
+        for symbol in local {
+            if symbol.kind != crate::scope_hint::SymbolKind::Macro {
+                continue;
+            }
+            if let Some(item) = items
+                .iter_mut()
+                .find(|item| item.name == symbol.name && item.line == symbol.line)
+            {
+                item.kind = symbol.kind;
+            } else {
+                items.push(crate::code_hover::DocumentSymbol {
+                    name: symbol.name,
+                    line: symbol.line,
+                    kind: symbol.kind,
+                    container: symbol.container,
+                });
+            }
+        }
+        let synthetic_groups = group_qualified_methods(&mut items);
+        items.retain(|symbol| {
+            !matches!(
+                symbol.kind,
+                crate::scope_hint::SymbolKind::Namespace | crate::scope_hint::SymbolKind::Using
+            ) && !using_ranges.iter().any(|(first, last, name, namespace)| {
+                symbol.line >= *first
+                    && symbol.line <= *last
+                    && (*namespace
+                        || symbol.name == *name
+                        || symbol.name.trim_start().starts_with("using ")
+                        || name.rsplit("::").next() == Some(symbol.name.as_str()))
+            })
+        });
+        items.sort_by_key(|symbol| symbol.line);
+        let previous_target = page.selected_target();
+        let previous_row = page
+            .state
+            .selected()
+            .and_then(|index| page.symbol_rows.get(index))
+            .copied();
+        let selected_offset = page
+            .state
+            .selected()
+            .unwrap_or(0)
+            .saturating_sub(page.state.offset());
+        page.targets.clear();
+        page.rows.clear();
+        page.file_rows.clear();
+        page.symbol_rows.clear();
+        let source_rows = document
+            .is_formatted()
+            .then(|| formatted_line_positions(&document.input, &document.source));
+        let is_group = |symbol: &crate::code_hover::DocumentSymbol| {
+            matches!(
+                symbol.kind,
+                crate::scope_hint::SymbolKind::Type | crate::scope_hint::SymbolKind::Enum
+            )
+        };
+        let mut ordered = Vec::new();
+        for symbol in &items {
+            let has_owner = symbol.container.as_ref().is_some_and(|(line, name)| {
+                items
+                    .iter()
+                    .any(|item| is_group(item) && item.line == *line && item.name == *name)
+            });
+            if has_owner {
+                continue;
+            }
+            ordered.push((symbol, false));
+            if is_group(symbol) {
+                ordered.extend(
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item.container.as_ref().is_some_and(|(line, name)| {
+                                *line == symbol.line && *name == symbol.name
+                            })
+                        })
+                        .map(|item| (item, true)),
+                );
+            }
+        }
+        for (symbol, member) in ordered {
+            let synthetic = synthetic_groups.contains(&(symbol.line, symbol.name.clone()));
+            let source_row = source_rows
+                .as_ref()
+                .and_then(|rows| rows.get(symbol.line))
+                .copied()
+                .unwrap_or(symbol.line);
+            let Ok(mut url) = document.file_url() else {
+                continue;
+            };
+            url.set_fragment(Some(&format!("L{}", source_row + 1)));
+            let target = if synthetic {
+                None
+            } else {
+                let target = page.targets.len();
+                page.targets.push(url.to_string());
+                Some(target)
+            };
+            let row = page.rows.len();
+            page.rows.push(crate::link_tree::PickerRow {
+                label: format!(
+                    "{}{} {}{}",
+                    if member { "  " } else { "" },
+                    symbol.kind.glyph(),
+                    symbol.name,
+                    if symbol.kind == crate::scope_hint::SymbolKind::Function
+                        && !symbol.name.ends_with(')')
+                    {
+                        "()"
+                    } else {
+                        ""
+                    }
+                ),
+                target,
+            });
+            if target.is_some() {
+                page.file_rows.push(row);
+            }
+            page.symbol_rows.push(first_row + symbol.line + 1);
+        }
+        let selected = previous_target
+            .and_then(|target| page.targets.iter().position(|item| *item == target))
+            .and_then(|target| page.rows.iter().position(|row| row.target == Some(target)))
+            .or_else(|| {
+                previous_row.and_then(|row| {
+                    page.symbol_rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| page.rows[*index].target.is_some())
+                        .min_by_key(|(_, item)| item.abs_diff(row))
+                        .map(|(index, _)| index)
+                })
+            })
+            .or_else(|| page.file_rows.first().copied());
+        page.state.select(selected);
+        *page.state.offset_mut() = selected.unwrap_or(0).saturating_sub(selected_offset);
+        page.all_rows = page.rows.clone();
+        page.all_symbol_rows = page.symbol_rows.clone();
+        page.apply_filter();
+    }
+
+    fn title(&self) -> Line<'static> {
+        let mut title = self.page_title();
+        if !self.filter.is_empty() {
+            title
+                .spans
+                .push(ratatui::text::Span::raw(format!(" · {} ", self.filter)));
+        }
+        title
+    }
+
+    fn page_title(&self) -> Line<'static> {
+        use ratatui::text::Span;
+        let Some(other) = self.other_page.as_deref() else {
+            return Line::raw(format!(" Links ({}) ", self.targets.len()));
+        };
+        let (symbols, links) = if self.symbols_page {
+            (self, other)
+        } else {
+            (other, self)
+        };
+        let style = |active| {
+            if active {
+                Style::default().add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default()
+            }
+        };
+        let symbol_label = if symbols.symbols_loaded {
+            format!("[{} Symbols]", symbols.targets.len())
+        } else {
+            format!("[{} Symbols …]", symbols.targets.len())
+        };
+        Line::from(vec![
+            Span::raw(" "),
+            Span::styled(symbol_label, style(self.symbols_page)),
+            Span::raw(" ── "),
+            Span::styled(
+                format!("[{} Links]", links.targets.len()),
+                style(!self.symbols_page),
+            ),
+            Span::raw(" "),
+        ])
     }
 
     fn document_line(
@@ -2325,6 +2876,9 @@ impl LinkPicker {
         document: &crate::navigation::Document,
         scroll: usize,
     ) -> Option<usize> {
+        if self.symbols_page {
+            return self.symbol_rows.get(self.state.selected()?).copied();
+        }
         // The renderer includes the local hostname; picker URLs may omit it.
         // Keep fragments in the identity so distinct source-line links stay distinct.
         let identity = |target: &str| {
@@ -2388,7 +2942,8 @@ impl LinkPicker {
     }
 
     fn expired(&self) -> bool {
-        self.targets.is_empty()
+        self.other_page.is_none()
+            && self.targets.is_empty()
             && self
                 .opened
                 .elapsed()
@@ -2407,6 +2962,21 @@ impl LinkPicker {
                 (current as isize + amount).rem_euclid(self.file_rows.len() as isize) as usize;
             self.state.select(Some(self.file_rows[next]));
         }
+    }
+
+    fn scroll_by(&mut self, amount: isize) {
+        if self.file_rows.is_empty() {
+            return;
+        }
+        let current = self
+            .state
+            .selected()
+            .and_then(|selected| self.file_rows.iter().position(|row| *row == selected))
+            .unwrap_or(0);
+        let next = current
+            .saturating_add_signed(amount)
+            .min(self.file_rows.len() - 1);
+        self.state.select(Some(self.file_rows[next]));
     }
 
     fn select_edge(&mut self, last: bool) {
@@ -2453,7 +3023,7 @@ impl LinkPicker {
     ) {
         let max_width = (u32::from(bounds.width) * 60 / 100).max(1) as u16;
         let max_height = (u32::from(bounds.height) * 60 / 100).max(1) as u16;
-        if self.targets.is_empty() {
+        if self.targets.is_empty() && self.other_page.is_none() {
             const MESSAGE: &str = "No local file links in this document.";
             self.area = centered(
                 bounds,
@@ -2502,7 +3072,7 @@ impl LinkPicker {
             return;
         }
         let width = self
-            .rows
+            .all_rows
             .iter()
             .map(|row| Line::raw(&row.label).width())
             .max()
@@ -2520,9 +3090,24 @@ impl LinkPicker {
         frame.render_widget(Clear, self.area);
         let block = popup_block(no_colour)
             .padding(Padding::new(0, 1, 0, 0))
-            .title(format!(" Links ({}) ", self.targets.len()));
+            .title(self.title());
+        if self.rows.is_empty() {
+            let message = if !self.filter.is_empty() {
+                "No matches."
+            } else if self.symbols_page {
+                if self.symbols_loaded {
+                    "No symbols in this file."
+                } else {
+                    "Loading symbols…"
+                }
+            } else {
+                "No local file links in this document."
+            };
+            frame.render_widget(Paragraph::new(message).block(block), self.area);
+            return;
+        }
         let items = self.rows.iter().map(|row| {
-            let item = ListItem::new(row.label.as_str());
+            let item = ListItem::new(self.highlighted_label(&row.label, no_colour));
             if row.target.is_none() {
                 item.style(Style::default().add_modifier(ratatui::style::Modifier::BOLD))
             } else {
@@ -2800,8 +3385,92 @@ fn formatted_line_position(before: &str, after: &str, line: usize) -> usize {
     row.min(after.lines().count().saturating_sub(1))
 }
 
+/// Map all line starts in one pass rather than rescanning both files per symbol.
+fn formatted_line_positions(before: &str, after: &str) -> Vec<usize> {
+    let mut total = 0;
+    let ends: Vec<_> = after
+        .lines()
+        .map(|line| {
+            total += line.chars().filter(|ch| !ch.is_whitespace()).count();
+            total
+        })
+        .collect();
+    let mut offset = 0;
+    let mut row = 0;
+    before
+        .lines()
+        .map(|line| {
+            while row < ends.len() && ends[row] <= offset {
+                row += 1;
+            }
+            let mapped = row.min(ends.len().saturating_sub(1));
+            offset += line.chars().filter(|ch| !ch.is_whitespace()).count();
+            mapped
+        })
+        .collect()
+}
+
 fn source_line_scroll(row: usize, height: usize) -> usize {
     row.saturating_sub(4.min(height.saturating_sub(1)))
+}
+
+fn draw_scope_hint(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    scroll: usize,
+    scope: Option<crate::scope_hint::Scope>,
+    no_colour: bool,
+) {
+    let Some(scope) = scope else {
+        return;
+    };
+    if area.width < 3 || area.height < 3 {
+        return;
+    }
+    let end = (scroll + usize::from(area.height - 2)).min(scope.last + 1);
+    let style = if no_colour {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Rgb(128, 128, 128))
+    };
+    for row in scope.first.max(scroll)..end {
+        let symbol = if row == scope.first {
+            "╭"
+        } else if row == scope.last {
+            "╰"
+        } else {
+            "│"
+        };
+        frame.buffer_mut()[(area.x + 1, area.y + 1 + (row - scroll) as u16)]
+            .set_symbol(symbol)
+            .set_style(style);
+    }
+}
+
+fn draw_frozen_scope(
+    frame: &mut ratatui::Frame<'_>,
+    area: ratatui::layout::Rect,
+    definition: &str,
+    no_colour: bool,
+) {
+    if area.width < 6 || area.height < 5 {
+        return;
+    }
+    // Overlay the top body rows, preserving the frame and scrollbar coordinates.
+    let header = ratatui::layout::Rect::new(area.x + 1, area.y + 1, area.width - 4, 2);
+    frame.render_widget(Clear, header);
+    let style = if no_colour {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Rgb(160, 160, 160))
+    };
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::styled(format!("╭ {definition}"), style),
+            Line::styled("┊", style),
+        ])),
+        header,
+    );
 }
 
 fn draw_source_line_highlight(
@@ -3195,7 +3864,12 @@ fn anchor_line_with_table_width(
                 })
                 .unwrap_or(0);
             let line = line.min(document.source.lines().count().max(1));
-            return Ok(Some(offset + line - 1));
+            let row = if document.is_formatted() {
+                formatted_line_position(&document.source, &document.input, line - 1)
+            } else {
+                line - 1
+            };
+            return Ok(Some(offset + row));
         }
     }
     let anchor = percent_encoding::percent_decode_str(anchor).decode_utf8_lossy();
@@ -3869,6 +4543,16 @@ mod tests {
     }
 
     #[test]
+    fn batch_line_mapping_matches_individual_mapping() {
+        let before = "\nvoid first(){work();}\n\nvoid second(){}\n";
+        let after = "void first() {\n  work();\n}\n\nvoid second() {\n}\n\n";
+        let batch = super::formatted_line_positions(before, after);
+        for (line, row) in batch.into_iter().enumerate() {
+            assert_eq!(row, super::formatted_line_position(before, after, line));
+        }
+    }
+
+    #[test]
     fn formatting_preserves_approximate_code_position_in_both_directions() {
         let original = "void f() {\n  int x=1; int y=2;\n  use(x,y);\n}\n";
         let formatted = "void f() {\n    int x = 1;\n    int y = 2;\n    use(x, y);\n}\n";
@@ -3879,6 +4563,51 @@ mod tests {
         assert_eq!(super::formatted_line_position(original, formatted, 1), 1);
         assert_eq!(super::formatted_line_position("\n\n", "\n", 10), 0);
     }
+    #[test]
+    fn frozen_scope_header_preserves_frame_and_scrollbar() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.buffer_mut()[(0, 1)].set_symbol("│");
+                frame.buffer_mut()[(38, 1)].set_symbol("┃");
+                super::draw_frozen_scope(frame, Rect::new(0, 0, 40, 8), "Example::render()", true);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].symbol(), "│");
+        assert_eq!(buffer[(1, 1)].symbol(), "╭");
+        assert_eq!(buffer[(1, 2)].symbol(), "┊");
+        assert_eq!(buffer[(3, 1)].symbol(), "E");
+        assert_eq!(buffer[(38, 1)].symbol(), "┃");
+    }
+
+    #[test]
+    fn scope_hint_draws_corners_and_clips_to_the_viewport() {
+        use ratatui::{backend::TestBackend, layout::Rect, Terminal};
+        let mut terminal = Terminal::new(TestBackend::new(20, 8)).unwrap();
+        let scope = Some(crate::scope_hint::Scope { first: 1, last: 4 });
+        terminal
+            .draw(|frame| {
+                super::draw_scope_hint(frame, Rect::new(0, 0, 20, 8), 0, scope, true);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 2)].symbol(), "╭");
+        assert_eq!(buffer[(1, 3)].symbol(), "│");
+        assert_eq!(buffer[(1, 5)].symbol(), "╰");
+        terminal
+            .draw(|frame| {
+                super::draw_scope_hint(frame, Rect::new(0, 0, 20, 4), 2, scope, true);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+        assert_eq!(buffer[(1, 1)].symbol(), "│");
+        assert_eq!(buffer[(1, 2)].symbol(), "│");
+        assert_eq!(buffer[(1, 3)].symbol(), " ");
+    }
+
     #[test]
     fn source_line_jump_positions_and_highlights_the_target() {
         use ratatui::{
@@ -4999,6 +5728,510 @@ mod tests {
     }
 
     #[test]
+    fn link_filter_highlights_matches_and_keeps_mouse_targets_aligned() {
+        use ratatui::{backend::TestBackend, layout::Rect, style::Modifier, Terminal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "report").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let targets: Vec<_> = ["src/Render.cpp", "src/render.hpp", "src/unrelated.h"]
+            .iter()
+            .map(|name| {
+                document
+                    .environment
+                    .base_url
+                    .join(name)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let mut picker = LinkPicker::new(targets.clone(), &document, None);
+        for ch in "render".chars() {
+            picker.edit_filter(Some(ch));
+        }
+        assert_eq!(picker.file_rows.len(), 2);
+        assert_eq!(picker.targets.len(), 3);
+        assert!(
+            picker.rows[0].target.is_none(),
+            "directory context remains visible"
+        );
+        assert_eq!(picker.selected_target(), Some(targets[0].clone()));
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| picker.draw(frame, Rect::new(0, 0, 80, 20), false, (28, 28, 28)))
+            .unwrap();
+        let index = picker.state.selected().unwrap();
+        let y = picker.area.y + 1 + (index - picker.state.offset()) as u16;
+        assert_eq!(picker.item_at(picker.area.x + 3, y), Some(index));
+        let highlighted: String = (picker.area.x..picker.area.right())
+            .filter_map(|x| {
+                let cell = &terminal.backend().buffer()[(x, y)];
+                cell.modifier
+                    .contains(Modifier::UNDERLINED)
+                    .then(|| cell.symbol().to_owned())
+            })
+            .collect();
+        assert_eq!(highlighted, "Render");
+        picker.scroll_by(100);
+        assert_eq!(picker.selected_target(), Some(targets[1].clone()));
+        picker.scroll_by(1);
+        assert_eq!(picker.selected_target(), Some(targets[1].clone()));
+        picker.edit_filter(Some('☃'));
+        assert!(picker.rows.is_empty());
+        assert!(picker.selected_target().is_none());
+        picker.edit_filter(None);
+        assert_eq!(picker.file_rows.len(), 2);
+        picker.clear_filter();
+        assert_eq!(picker.file_rows.len(), 3);
+        for ch in "SRC".chars() {
+            picker.edit_filter(Some(ch));
+        }
+        assert_eq!(
+            picker.file_rows.len(),
+            3,
+            "matching directory keeps its files"
+        );
+    }
+
+    #[test]
+    fn symbol_filter_survives_enrichment_and_pages_have_independent_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("methods.cpp");
+        std::fs::write(&path, "void shader_app::draw_vertices() {}\nvoid shader_app::draw_indexed() {}\nvoid unrelated() {}\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let target = document
+            .environment
+            .base_url
+            .join("header.hpp")
+            .unwrap()
+            .to_string();
+        let mut picker = LinkPicker::for_document(vec![target.clone()], &document, None, 1);
+        for ch in "indexed".chars() {
+            picker.edit_filter(Some(ch));
+        }
+        assert_eq!(
+            picker
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            ["  ƒ draw_indexed()"]
+        );
+        let selected = picker.selected_target();
+        let items: Vec<_> = crate::scope_hint::local_symbols(&document.input)
+            .into_iter()
+            .map(|symbol| crate::code_hover::DocumentSymbol {
+                name: symbol.name,
+                line: symbol.line,
+                kind: symbol.kind,
+                container: symbol.container,
+            })
+            .collect();
+        picker.load_symbols(&items, &document, 1);
+        assert_eq!(picker.filter, "indexed");
+        assert_eq!(picker.selected_target(), selected);
+        assert_eq!(picker.file_rows.len(), 1);
+        picker.switch_page();
+        assert!(picker.filter.is_empty());
+        for ch in "header".chars() {
+            picker.edit_filter(Some(ch));
+        }
+        assert_eq!(picker.selected_target(), Some(target));
+        picker.switch_page();
+        assert_eq!(picker.filter, "indexed");
+        assert_eq!(picker.selected_target(), selected);
+        picker.clear_filter();
+        for ch in "shader_app".chars() {
+            picker.edit_filter(Some(ch));
+        }
+        assert!(picker.file_rows.is_empty());
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(picker.rows[0].label, "◇ shader_app");
+        assert!(!picker
+            .rows
+            .iter()
+            .any(|row| row.label.contains("unrelated")));
+    }
+
+    #[test]
+    fn matching_class_names_do_not_include_unmatched_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("watchdog.hpp");
+        std::fs::write(&path, "class direct_sdf_first_frame_watchdog {\npublic:\n direct_sdf_first_frame_watchdog();\n ~direct_sdf_first_frame_watchdog();\n void reset();\n int mutex_;\n int condition_;\n bool completed_;\n int worker_;\n};\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::for_document(Vec::new(), &document, None, 1);
+        for ch in "sdf_first".chars() {
+            picker.edit_filter(Some(ch));
+        }
+        let expected = [
+            "◇ direct_sdf_first_frame_watchdog",
+            "  ƒ direct_sdf_first_frame_watchdog()",
+            "  ƒ ~direct_sdf_first_frame_watchdog()",
+        ];
+        let labels = |picker: &LinkPicker| {
+            picker
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&picker), expected);
+        let semantic: Vec<_> = crate::scope_hint::local_symbols(&document.input)
+            .into_iter()
+            .map(|symbol| crate::code_hover::DocumentSymbol {
+                name: symbol.name,
+                line: symbol.line,
+                kind: symbol.kind,
+                container: symbol.container,
+            })
+            .collect();
+        picker.load_symbols(&semantic, &document, 1);
+        assert_eq!(labels(&picker), expected);
+        picker.clear_filter();
+        assert!(picker.rows.iter().any(|row| row.label == "  ○ mutex_"));
+    }
+
+    #[test]
+    fn filtering_a_class_member_selects_the_match_instead_of_its_context_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("widget.hpp");
+        std::fs::write(
+            &path,
+            "struct Widget {\n void draw();\n void reset();\n};\n",
+        )
+        .unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::for_document(Vec::new(), &document, None, 1);
+        for ch in "draw".chars() {
+            picker.edit_filter(Some(ch));
+        }
+        assert_eq!(picker.rows.len(), 1);
+        assert_eq!(picker.rows[0].label, "  ƒ draw()");
+        assert!(picker.rows[0].target.is_some());
+        assert_eq!(picker.state.selected(), Some(0));
+        assert_eq!(picker.file_rows, [0]);
+        assert!(picker.selected_target().unwrap().ends_with("#L2"));
+        picker.clear_filter();
+        assert!(picker.rows[0].target.is_some());
+        assert_eq!(picker.file_rows.len(), 3);
+    }
+
+    #[test]
+    fn filter_highlighting_preserves_unicode_boundaries_without_colour() {
+        use ratatui::style::Modifier;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "report").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::new(Vec::new(), &document, None);
+        picker.edit_filter(Some('é'));
+        let line = picker.highlighted_label("café Éclair", true);
+        assert_eq!(line.to_string(), "café Éclair");
+        let matched: String = line
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(matched, "éÉ");
+    }
+
+    #[test]
+    fn namespaces_and_usings_are_hidden_without_hiding_their_contents() {
+        use crate::scope_hint::SymbolKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aliases.hpp");
+        std::fs::write(&path, "namespace demo {\nstruct Widget { int value; };\nusing Alias = Widget;\nusing demo::Widget;\nusing namespace demo;\ntemplate<class T> using Pointer = T*;\nvoid render();\n}\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::for_document(Vec::new(), &document, None, 1);
+        let expected = ["◇ Widget", "  ○ value", "ƒ render()"];
+        let labels = |picker: &LinkPicker| {
+            picker
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&picker), expected);
+        let items: Vec<_> = crate::scope_hint::local_symbols(&document.input)
+            .into_iter()
+            .map(|symbol| crate::code_hover::DocumentSymbol {
+                name: if symbol.kind == SymbolKind::Using
+                    && document
+                        .input
+                        .lines()
+                        .nth(symbol.line)
+                        .unwrap()
+                        .trim_start()
+                        .starts_with("using namespace")
+                {
+                    "using namespace demo".into()
+                } else if symbol.kind == SymbolKind::Using {
+                    symbol.name.rsplit("::").next().unwrap().to_owned()
+                } else {
+                    symbol.name
+                },
+                line: symbol.line,
+                kind: if symbol.kind == SymbolKind::Using {
+                    SymbolKind::Type
+                } else {
+                    symbol.kind
+                },
+                container: symbol.container,
+            })
+            .collect();
+        picker.load_symbols(&items, &document, 1);
+        assert_eq!(labels(&picker), expected);
+        assert_eq!(picker.targets.len(), 3);
+    }
+
+    #[test]
+    fn external_class_methods_share_a_heading_without_changing_symbol_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("methods.cpp");
+        std::fs::write(&path, "void shader_app::draw_vertices() {}\nvoid unrelated() {}\nvoid shader_app::draw_indexed() {}\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::for_document(Vec::new(), &document, None, 1);
+        let expected = [
+            "◇ shader_app",
+            "  ƒ draw_vertices()",
+            "  ƒ draw_indexed()",
+            "ƒ unrelated()",
+        ];
+        let labels = |picker: &LinkPicker| {
+            picker
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&picker), expected);
+        assert_eq!(picker.targets.len(), 3);
+        assert!(picker.rows[0].target.is_none());
+        assert_eq!(picker.state.selected(), Some(1));
+        picker.scroll_by(1);
+        assert_eq!(picker.state.selected(), Some(2));
+        let selected = picker.selected_target();
+        assert!(selected.as_ref().unwrap().ends_with("#L3"));
+        let semantic: Vec<_> = crate::scope_hint::local_symbols(&document.input)
+            .into_iter()
+            .map(|symbol| crate::code_hover::DocumentSymbol {
+                name: symbol.name,
+                line: symbol.line,
+                kind: symbol.kind,
+                container: symbol.container,
+            })
+            .collect();
+        picker.load_symbols(&semantic, &document, 1);
+        assert_eq!(labels(&picker), expected);
+        assert_eq!(picker.selected_target(), selected);
+        assert_eq!(picker.state.selected(), Some(2));
+        picker.select_edge(false);
+        picker.scroll_by(-1);
+        assert_eq!(picker.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn qualified_methods_reuse_local_class_headings_and_skip_known_namespaces() {
+        use crate::{code_hover::DocumentSymbol, scope_hint::SymbolKind};
+        let mut items = vec![
+            DocumentSymbol {
+                name: "Widget".into(),
+                line: 0,
+                kind: SymbolKind::Type,
+                container: None,
+            },
+            DocumentSymbol {
+                name: "Widget::draw".into(),
+                line: 4,
+                kind: SymbolKind::Function,
+                container: None,
+            },
+            DocumentSymbol {
+                name: "net".into(),
+                line: 5,
+                kind: SymbolKind::Namespace,
+                container: None,
+            },
+            DocumentSymbol {
+                name: "net::flush".into(),
+                line: 6,
+                kind: SymbolKind::Function,
+                container: None,
+            },
+        ];
+        assert!(super::group_qualified_methods(&mut items).is_empty());
+        assert_eq!(items[1].name, "draw");
+        assert_eq!(items[1].container, Some((0, "Widget".into())));
+        assert_eq!(items[3].name, "net::flush");
+        assert_eq!(items[3].container, None);
+    }
+
+    #[test]
+    fn type_members_form_one_level_groups_before_and_after_enrichment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("groups.hpp");
+        std::fs::write(&path, "namespace demo {\nstruct Outer {\n int value;\n struct Inner {\n  int detail;\n };\n void method();\n enum class Mode { A, B };\n};\nint outside;\n}\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let mut picker = LinkPicker::for_document(Vec::new(), &document, None, 1);
+        let expected = [
+            "◇ Outer",
+            "  ○ value",
+            "  ƒ method()",
+            "◇ Inner",
+            "  ○ detail",
+            "≡ Mode",
+            "  ◆ A",
+            "  ◆ B",
+            "○ outside",
+        ];
+        let labels = |picker: &LinkPicker| {
+            picker
+                .rows
+                .iter()
+                .map(|row| row.label.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&picker), expected);
+        let items: Vec<_> = crate::scope_hint::local_symbols(&document.input)
+            .into_iter()
+            .map(|symbol| crate::code_hover::DocumentSymbol {
+                name: symbol.name,
+                line: symbol.line,
+                kind: symbol.kind,
+                container: symbol.container,
+            })
+            .collect();
+        picker.load_symbols(&items, &document, 1);
+        assert_eq!(labels(&picker), expected);
+        picker.select_edge(true);
+        assert!(picker.selected_target().unwrap().contains("#L10"));
+    }
+
+    #[test]
+    fn symbol_rows_group_enum_values_and_keep_macros_after_enrichment() {
+        use crate::scope_hint::SymbolKind;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.hpp");
+        std::fs::write(&path, "#define LIMIT 4\nnamespace demo {\nstruct Widget {};\nenum class Mode { A, B };\nconstexpr int count = LIMIT;\nint value;\nvoid render();\n}\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let local: Vec<_> = crate::scope_hint::local_symbols(&document.input)
+            .into_iter()
+            .map(|symbol| crate::code_hover::DocumentSymbol {
+                name: symbol.name,
+                line: symbol.line,
+                kind: symbol.kind,
+                container: symbol.container,
+            })
+            .collect();
+        let mut picker = LinkPicker::for_document(Vec::new(), &document, None, 1);
+        let labels: Vec<_> = picker.rows.iter().map(|row| row.label.as_str()).collect();
+        for label in [
+            "◆ LIMIT",
+            "◇ Widget",
+            "≡ Mode",
+            "◆ count",
+            "○ value",
+            "ƒ render()",
+        ] {
+            assert!(labels.contains(&label), "missing {label}: {labels:?}");
+        }
+        assert!(labels.contains(&"  ◆ A"));
+        assert!(labels.contains(&"  ◆ B"));
+        assert!(labels.iter().all(|label| !label.starts_with("    ")));
+        let semantic: Vec<_> = local
+            .into_iter()
+            .filter(|symbol| symbol.kind != SymbolKind::Macro)
+            .collect();
+        picker.load_symbols(&semantic, &document, 1);
+        assert_eq!(
+            picker
+                .rows
+                .iter()
+                .filter(|row| row.label == "◆ LIMIT")
+                .count(),
+            1
+        );
+        assert!(picker.rows.iter().any(|row| row.label == "  ◆ A"));
+        assert!(picker.rows.iter().all(|row| !row.label.starts_with("    ")));
+    }
+
+    #[test]
+    fn code_picker_opens_symbols_and_preserves_each_page_selection() {
+        use crate::code_hover::DocumentSymbol;
+        use ratatui::style::Modifier;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("example.cpp");
+        std::fs::write(&path, "void first() {}\nvoid second() {}\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let target = document
+            .environment
+            .base_url
+            .join("other.h")
+            .unwrap()
+            .to_string();
+        let mut picker = LinkPicker::for_document(vec![target.clone()], &document, None, 1);
+        assert!(picker.symbols_page);
+        assert!(!picker.expired());
+        assert!(
+            !picker.targets.is_empty(),
+            "local symbols are available before clangd responds"
+        );
+        assert!(!picker.symbols_loaded);
+        picker.move_by(1);
+        let initial_selection = picker.selected_target();
+        let second_line = document
+            .input
+            .lines()
+            .position(|line| line.starts_with("void second"))
+            .unwrap();
+        picker.load_symbols(
+            &[
+                DocumentSymbol {
+                    name: "first".into(),
+                    line: 0,
+                    kind: crate::scope_hint::SymbolKind::Function,
+                    container: None,
+                },
+                DocumentSymbol {
+                    name: "second".into(),
+                    line: second_line,
+                    kind: crate::scope_hint::SymbolKind::Function,
+                    container: None,
+                },
+            ],
+            &document,
+            1,
+        );
+        assert_eq!(picker.selected_target(), initial_selection);
+        assert!(picker.title().spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert!(!picker.title().spans[3]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        assert_eq!(
+            picker.document_line(&[], &document, 0),
+            Some(second_line + 2)
+        );
+        let selected_symbol = picker.selected_target();
+        picker.switch_page();
+        assert!(!picker.symbols_page);
+        assert_eq!(picker.selected_target(), Some(target));
+        assert!(picker.title().spans[3]
+            .style
+            .add_modifier
+            .contains(Modifier::BOLD));
+        picker.scroll_by(1);
+        picker.switch_page();
+        assert_eq!(picker.selected_target(), selected_symbol);
+        picker.scroll_by(1);
+        assert_eq!(picker.state.selected(), Some(1));
+    }
+
+    #[test]
     fn link_picker_lists_destinations_and_scrolls_selection_into_view() {
         use ratatui::{backend::TestBackend, layout::Rect, Terminal};
         let dir = tempfile::tempdir().unwrap();
@@ -5017,6 +6250,14 @@ mod tests {
             .collect::<Vec<_>>();
         let mut picker = LinkPicker::new(targets.clone(), &document, None);
         assert_eq!(picker.rows[0].label, "./child-0.md");
+        assert_eq!(picker.selected_target(), Some(targets[0].clone()));
+        picker.scroll_by(-1);
+        assert_eq!(picker.selected_target(), Some(targets[0].clone()));
+        picker.scroll_by(100);
+        assert_eq!(picker.selected_target(), Some(targets[19].clone()));
+        picker.scroll_by(1);
+        assert_eq!(picker.selected_target(), Some(targets[19].clone()));
+        picker.scroll_by(-100);
         assert_eq!(picker.selected_target(), Some(targets[0].clone()));
         picker.move_by(-1);
         assert_eq!(picker.selected_target(), Some(targets[19].clone()));
