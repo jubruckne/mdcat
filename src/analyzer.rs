@@ -5,7 +5,10 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::{
-    event::{DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture},
+    event::{
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture,
+    },
     execute,
 };
 use pulldown_cmark::{CodeBlockKind, Event as MarkdownEvent, LinkType, Parser, Tag, TagEnd};
@@ -20,6 +23,22 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState,
     },
 };
+
+fn install_terminal_panic_hook() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = execute!(
+                std::io::stdout(),
+                DisableMouseCapture,
+                DisableFocusChange,
+                DisableBracketedPaste
+            );
+            previous(info);
+        }));
+    });
+}
 
 fn apply_grep(
     view: Option<&mut crate::directory_view::DirectoryView>,
@@ -85,9 +104,16 @@ pub fn run(
             .environment(document.environment.clone())
             .resource_handler(resources),
     );
+    // Ratatui installs its own hook for raw mode and the alternate screen.
+    install_terminal_panic_hook();
     let mut terminal = ratatui::try_init()?;
     let result = (|| -> Result<()> {
-        execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
+        execute!(
+            std::io::stdout(),
+            EnableMouseCapture,
+            EnableFocusChange,
+            EnableBracketedPaste
+        )?;
         let mut text = Text::default();
         let mut table_bounds = Vec::new();
         let mut table_rows = Vec::new();
@@ -1007,6 +1033,7 @@ pub fn run(
                 continue;
             }
             let mut open_target = None;
+            let mut pasted_path = false;
             let mut open_directory_all = false;
             let mut go_back = false;
             let event = event::read()?;
@@ -1015,6 +1042,13 @@ pub fn run(
             }
             let is_mouse = matches!(event, Event::Mouse(_));
             match event {
+                Event::Paste(path) => {
+                    let path = path.trim_end_matches(['\r', '\n']);
+                    if !path.is_empty() {
+                        open_target = Some(path.to_owned());
+                        pasted_path = true;
+                    }
+                }
                 Event::Key(key)
                     if key.kind != KeyEventKind::Release
                         && key.code == KeyCode::Esc
@@ -2137,7 +2171,7 @@ pub fn run(
                 }
             }
             if let Some(target) = open_target {
-                if matches!(target.as_str(), "mdcat-blame:" | "mdcat-history:") {
+                if !pasted_path && matches!(target.as_str(), "mdcat-blame:" | "mdcat-history:") {
                     let source = document
                         .original_view
                         .as_ref()
@@ -2170,7 +2204,7 @@ pub fn run(
                     }
                     continue;
                 }
-                if is_current_document_link(&document, &target) {
+                if !pasted_path && is_current_document_link(&document, &target) {
                     if open_directory_all {
                         if let Some(view) = document.directory_view.as_mut() {
                             match view.show_all() {
@@ -2206,6 +2240,11 @@ pub fn run(
                     continue;
                 }
                 let result = (|| -> Result<_> {
+                    if pasted_path {
+                        let (next, line) =
+                            crate::navigation::Document::load_argument(&target, options)?;
+                        return Ok((next, line.map(|line| format!("L{line}"))));
+                    }
                     let mut next = if target == "mdcat-directory-diff:" {
                         document.open_directory_diff()?
                     } else if target == "mdcat-history-diff:" {
@@ -2253,6 +2292,7 @@ pub fn run(
                         status.clear();
                         query = crate::query::Query::new(model);
                         response.visible = false;
+                        link_picker = None;
                         search = Search::default();
                     }
                     Err(error) => status = format!(" {error:#} "),
@@ -2261,7 +2301,12 @@ pub fn run(
         }
         Ok(())
     })();
-    let mouse_restore = execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange);
+    let mouse_restore = execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableFocusChange,
+        DisableBracketedPaste
+    );
     let restore = ratatui::try_restore();
     result?;
     mouse_restore?;
@@ -2273,7 +2318,12 @@ fn edit_in_nano(
     terminal: &mut ratatui::DefaultTerminal,
     path: &std::path::Path,
 ) -> Result<std::process::ExitStatus> {
-    execute!(std::io::stdout(), DisableMouseCapture, DisableFocusChange)?;
+    execute!(
+        std::io::stdout(),
+        DisableMouseCapture,
+        DisableFocusChange,
+        DisableBracketedPaste
+    )?;
     ratatui::try_restore()?;
     let shell = std::env::var_os("SHELL").map(std::path::PathBuf::from);
     let shell_name = shell
@@ -2298,7 +2348,12 @@ fn edit_in_nano(
             .status(),
     };
     *terminal = ratatui::try_init()?;
-    execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
+    execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        EnableFocusChange,
+        EnableBracketedPaste
+    )?;
     Ok(result?)
 }
 
@@ -4743,6 +4798,43 @@ fn resize_frame(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn panic_restores_extra_terminal_modes() {
+        const CHILD: &str = "MDCAT_TEST_TERMINAL_PANIC_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            super::install_terminal_panic_hook();
+            if std::env::var_os("MDCAT_TEST_TERMINAL_PANIC_TTY").is_some() {
+                let _terminal = ratatui::try_init().unwrap();
+                crossterm::execute!(
+                    std::io::stdout(),
+                    crossterm::event::EnableMouseCapture,
+                    crossterm::event::EnableFocusChange,
+                    crossterm::event::EnableBracketedPaste
+                )
+                .unwrap();
+            }
+            panic!("terminal cleanup test");
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "analyzer::tests::panic_restores_extra_terminal_modes",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        for sequence in ["\x1b[?1000l", "\x1b[?1004l", "\x1b[?2004l"] {
+            assert!(output
+                .stdout
+                .windows(sequence.len())
+                .any(|s| s == sequence.as_bytes()));
+        }
+        assert!(String::from_utf8_lossy(&output.stderr).contains("terminal cleanup test"));
+    }
+
     #[test]
     fn indexing_progress_shares_the_footer_and_hides_when_finished_or_narrow() {
         let mut terminal =
