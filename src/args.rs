@@ -205,9 +205,12 @@ impl std::ops::Deref for Command {
 #[derive(Debug, clap::Args)]
 // #[command(author, version, about, after_help = after_help(), long_version = long_version())]
 pub struct CommonArgs {
-    /// Browse a file, directory, or Git commit (default: current directory); accepts path:line (requires a terminal).
-    #[arg(long, visible_alias = "browse", conflicts_with_all = ["watch", "paginate", "no_pager"])]
+    /// Browse a file, directory, or Git commit; accepts path:line (default on a terminal).
+    #[arg(long, visible_alias = "browse", conflicts_with_all = ["watch", "paginate", "no_pager", "no_browse"])]
     pub analyzer: bool,
+    /// Render output directly instead of opening the browser.
+    #[arg(long)]
+    pub no_browse: bool,
     /// Model for questions in browse mode (default: apple).
     #[arg(short = 'm', long, value_enum)]
     pub model: Option<QueryModel>,

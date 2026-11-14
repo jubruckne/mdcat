@@ -26,19 +26,15 @@ mod cli {
     }
 
     #[test]
-    fn analyzer_requires_one_file_and_a_terminal() {
-        for args in [
-            vec!["--analyzer", "-"],
-            vec!["--analyzer", "sample/common-mark.md", "README.md"],
-        ] {
-            let output = run_cargo_mdcat(args);
-            assert!(!output.status.success());
-            assert!(String::from_utf8_lossy(&output.stderr).contains("requires exactly one file"));
-            assert!(output.stdout.is_empty());
-        }
+    fn analyzer_requires_one_input_and_a_terminal() {
+        let output = run_cargo_mdcat(["--analyzer", "sample/common-mark.md", "README.md"]);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires exactly one input"));
+        assert!(output.stdout.is_empty());
         for args in [
             vec!["--browse"],
             vec!["--analyzer"],
+            vec!["--analyzer", "-"],
             vec!["--analyzer", "sample/common-mark.md"],
         ] {
             let output = run_cargo_mdcat(args);
@@ -51,6 +47,18 @@ mod cli {
             assert!(!output.status.success());
             assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"));
         }
+    }
+
+    #[test]
+    fn redirected_output_renders_without_browsing() {
+        let output = run_cargo_mdcat(["--no-browse", "sample/common-mark.md"]);
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+        let output = run_cargo_mdcat(["sample/common-mark.md"]);
+        assert!(output.status.success());
+        assert!(!output.stdout.is_empty());
+        let output = run_cargo_mdcat(["--browse", "--no-browse"]);
+        assert!(!output.status.success());
     }
 
     #[test]

@@ -6,7 +6,7 @@ Fancy `cat` for Markdown (that is, [CommonMark][]):
 $ mdcat sample.md
 ```
 
-Use `mdcat --browse sample.md` (also available as `--analyzer`) for the built-in Ratatui/Crossterm viewer.
+On a terminal, `mdcat sample.md` opens the built-in Ratatui/Crossterm viewer; `mdcat` alone opens the current directory. Piped input can also be browsed, for example `cat sample.md | mdcat`. Use `--no-browse` to render directly to the terminal. Redirected output is rendered directly, and `--paginate`, `--no-pager`, and `--watch` select their respective output modes. `--browse` (also available as `--analyzer`) explicitly requests the viewer.
 Inside a Git repository, `mdcat --browse 191f7f1` opens a commit's message and diff;
 short and full commit hashes work. Existing file and directory paths take precedence.
 Scroll with the arrow keys or j/k, use Page Up/Down and Home/End to navigate,

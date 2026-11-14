@@ -415,22 +415,33 @@ fn main() {
         args.filenames.clone()
     };
 
-    if args.analyzer && filenames == ["-"] && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    let pagination = args.pagination(defaults.and_then(|d| d.paginate));
+    let browse = args.analyzer
+        || (matches!(
+            &args,
+            mdcat::args::Command::Mdcat {
+                paginate: false,
+                no_pager: false,
+                ..
+            }
+        ) && !args.no_browse
+            && !args.watch
+            && std::io::IsTerminal::is_terminal(&std::io::stdout()));
+    if browse && filenames == ["-"] && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         filenames[0] = ".".to_owned();
     }
-    let pagination = args.pagination(defaults.and_then(|d| d.paginate));
-    if args.analyzer && filenames.len() != 1 {
+    if browse && filenames.len() != 1 {
         eprintln!("Error: --analyzer requires exactly one input");
         std::process::exit(1);
     }
-    if args.analyzer
+    if browse
         && !(std::io::IsTerminal::is_terminal(&std::io::stdout())
             && (filenames[0] == "-" || std::io::IsTerminal::is_terminal(&std::io::stdin())))
     {
         eprintln!("Error: --analyzer requires an interactive terminal on stdin and stdout");
         std::process::exit(1);
     }
-    let piped_source = if args.analyzer && filenames[0] == "-" {
+    let piped_source = if browse && filenames[0] == "-" {
         match mdcat::read_input("-").and_then(|(_, source)| {
             analyzer::reconnect_terminal_input()?;
             Ok(source)
@@ -444,7 +455,7 @@ fn main() {
     } else {
         None
     };
-    let paginate = !args.analyzer
+    let paginate = !browse
         && match pagination {
             mdcat::config::Pagination::Enabled(value) => value,
             mdcat::config::Pagination::Auto(_) => {
@@ -464,7 +475,7 @@ fn main() {
 
     let (terminal, terminal_was_auto_detected) = if args.no_colour {
         (TerminalProgram::Dumb, false)
-    } else if args.ansi_only || args.analyzer || (paginate && !paginating_with_lessi) {
+    } else if args.ansi_only || browse || (paginate && !paginating_with_lessi) {
         (TerminalProgram::Ansi, false)
     } else if paginating_with_lessi || std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         (TerminalProgram::detect(), true)
@@ -539,7 +550,7 @@ fn main() {
         };
         let syntax_theme = resolve_syntax_theme(resolved.is_light, resolved.default_syntax);
         let theme = resolved.mdcat;
-        if args.analyzer {
+        if browse {
             let settings = Settings {
                 terminal_capabilities,
                 terminal_size,
