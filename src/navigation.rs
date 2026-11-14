@@ -146,6 +146,14 @@ impl Document {
         if source.contains('\0') {
             bail!("{} contains binary data", path.display());
         }
+        Self::from_source(path, source, options)
+    }
+
+    pub fn from_source(
+        path: PathBuf,
+        source: String,
+        options: mdcat::RenderOptions,
+    ) -> Result<Self> {
         let extension = path
             .extension()
             .and_then(|ext| ext.to_str())

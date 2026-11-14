@@ -48,6 +48,9 @@ tracing-subscriber = { version = "0.3.18", default-features = false, features = 
 url = { workspace = true }
 terminal-colorsaurus = "1.0.3"
 
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", features = ["fs", "term"] }
+
 [dev-dependencies]
 similar-asserts = { workspace = true }
 

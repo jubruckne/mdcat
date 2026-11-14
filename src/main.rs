@@ -391,7 +391,7 @@ fn main() {
         tabs,
     };
 
-    let filenames: Vec<String> = if let mdcat::args::Command::Mdpick { .. } = &args {
+    let mut filenames: Vec<String> = if let mdcat::args::Command::Mdpick { .. } = &args {
         match args.filenames.as_slice() {
             [] | [_] => {}
             _ => {
@@ -415,18 +415,35 @@ fn main() {
         args.filenames.clone()
     };
 
+    if args.analyzer && filenames == ["-"] && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        filenames[0] = ".".to_owned();
+    }
     let pagination = args.pagination(defaults.and_then(|d| d.paginate));
-    if args.analyzer && (filenames.len() != 1 || filenames[0] == "-") {
-        eprintln!("Error: --analyzer requires exactly one file argument (not stdin)");
+    if args.analyzer && filenames.len() != 1 {
+        eprintln!("Error: --analyzer requires exactly one input");
         std::process::exit(1);
     }
     if args.analyzer
         && !(std::io::IsTerminal::is_terminal(&std::io::stdout())
-            && std::io::IsTerminal::is_terminal(&std::io::stdin()))
+            && (filenames[0] == "-" || std::io::IsTerminal::is_terminal(&std::io::stdin())))
     {
         eprintln!("Error: --analyzer requires an interactive terminal on stdin and stdout");
         std::process::exit(1);
     }
+    let piped_source = if args.analyzer && filenames[0] == "-" {
+        match mdcat::read_input("-").and_then(|(_, source)| {
+            analyzer::reconnect_terminal_input()?;
+            Ok(source)
+        }) {
+            Ok(source) => Some(source),
+            Err(error) => {
+                eprintln!("Error: {error:#}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let paginate = !args.analyzer
         && match pagination {
             mdcat::config::Pagination::Enabled(value) => value,
@@ -538,6 +555,7 @@ fn main() {
             .and_then(|handler| {
                 analyzer::run(
                     &filenames[0],
+                    piped_source,
                     &settings,
                     &handler,
                     render_options,

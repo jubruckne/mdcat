@@ -212,7 +212,7 @@ pub struct CommonArgs {
     #[arg(short = 'm', long, value_enum)]
     pub model: Option<QueryModel>,
     /// Files to read.  If - read from standard input instead.
-    #[arg(default_value="-", default_value_if("analyzer", "true", "."), value_hint = ValueHint::FilePath)]
+    #[arg(default_value="-", value_hint = ValueHint::FilePath)]
     pub filenames: Vec<String>,
     /// Disable all colours and other styles.
     #[arg(short = 'c', long, aliases=["nocolour", "no-color", "nocolor"])]
@@ -329,7 +329,7 @@ mod tests {
     fn browse_defaults_to_current_directory() {
         for flag in ["--browse", "--analyzer"] {
             let args = Args::try_parse_from(["mdcat", flag]).unwrap();
-            assert_eq!(args.command.filenames, ["."]);
+            assert_eq!(args.command.filenames, ["-"]);
             for path in ["-", "README.md", "."] {
                 let args = Args::try_parse_from(["mdcat", flag, path]).unwrap();
                 assert_eq!(args.command.filenames, [path]);

@@ -49,6 +49,7 @@ fn counterpart(path: &std::path::Path) -> Option<std::path::PathBuf> {
 
 pub fn run(
     filename: &str,
+    piped_source: Option<String>,
     settings: &Settings<'_>,
     resources: &dyn ResourceUrlHandler,
     options: mdcat::RenderOptions,
@@ -57,8 +58,18 @@ pub fn run(
     model: Option<mdcat::args::QueryModel>,
 ) -> Result<()> {
     let working_directory = std::env::current_dir()?;
-    let (mut document, initial_line) =
-        crate::navigation::Document::load_argument(filename, options)?;
+    let (mut document, initial_line) = if let Some(source) = piped_source {
+        (
+            crate::navigation::Document::from_source(
+                working_directory.join("stdin.md"),
+                source,
+                options,
+            )?,
+            None,
+        )
+    } else {
+        crate::navigation::Document::load_argument(filename, options)?
+    };
     let mut query = crate::query::Query::new(model);
     let mut response = ResponseWindow {
         no_colour,
@@ -6899,4 +6910,18 @@ mod tests {
         assert_eq!(buffer[(original.x, original.y)].symbol(), ".");
         assert_eq!(buffer[(window.area.x, window.area.y)].symbol(), "╭");
     }
+}
+
+#[cfg(unix)]
+pub fn reconnect_terminal_input() -> Result<()> {
+    let path = nix::unistd::ttyname(std::io::stdout())
+        .context("Browse mode requires a terminal on stdout")?;
+    let tty = std::fs::File::open(path).context("Browse mode requires a controlling terminal")?;
+    nix::unistd::dup2_stdin(&tty)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub fn reconnect_terminal_input() -> Result<()> {
+    anyhow::bail!("Piped input in browse mode is not supported on this platform")
 }
