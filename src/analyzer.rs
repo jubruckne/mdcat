@@ -90,9 +90,16 @@ pub fn run(
         execute!(std::io::stdout(), EnableMouseCapture, EnableFocusChange)?;
         let mut text = Text::default();
         let mut table_bounds = Vec::new();
+        let mut table_rows = Vec::new();
+        let mut markdown_table_bounds = Vec::new();
+        let mut text_table_bounds = Vec::new();
+        let mut table_sorts = std::collections::HashMap::new();
+        let mut text_table_sorts = std::collections::HashMap::new();
+        let mut table_sort_document = None;
         let mut rendered_width = None;
         let mut scroll = 0usize;
         let mut dragging_scrollbar = false;
+        let mut pinned_table_click = None;
         let mut selection = crate::text_selection::Selection::default();
         let mut links = Vec::<pulldown_cmark_mdcat::ratatui::LinkRegion>::new();
         let mut selected: Option<String> = None;
@@ -238,6 +245,15 @@ pub fn run(
                 }
             };
             if rendered_width != Some((width, table_width)) {
+                let identity = (&document.path, &document.input);
+                if table_sort_document
+                    .as_ref()
+                    .is_none_or(|(path, input)| (path, input) != identity)
+                {
+                    table_sorts.clear();
+                    text_table_sorts.clear();
+                    table_sort_document = Some((document.path.clone(), document.input.clone()));
+                }
                 selection = crate::text_selection::Selection::default();
                 let settings = Settings {
                     terminal_size: pulldown_cmark_mdcat::TerminalSize {
@@ -258,7 +274,30 @@ pub fn run(
                     options,
                     table_width,
                     &mut table_bounds,
+                    &mut table_rows,
+                    &table_sorts,
                 )?;
+                markdown_table_bounds = table_bounds
+                    .iter()
+                    .filter(|(_, ranges)| !ranges.is_empty())
+                    .cloned()
+                    .collect();
+                crate::table_chart::add_text_tables(&text, &mut table_bounds);
+                text_table_bounds = table_bounds
+                    .iter()
+                    .filter(|(row, _)| {
+                        !markdown_table_bounds
+                            .iter()
+                            .any(|(markdown_row, _)| markdown_row == row)
+                    })
+                    .cloned()
+                    .collect();
+                crate::table_chart::sort_text_tables(
+                    &mut text,
+                    &mut links,
+                    &text_table_bounds,
+                    &text_table_sorts,
+                );
                 if document.is_directory
                     && selected
                         .as_ref()
@@ -384,7 +423,17 @@ pub fn run(
                 }
             }
             let content_height = image_height.unwrap_or(text.lines.len());
-            let max_scroll = content_height.saturating_sub(height.max(1));
+            let base_max_scroll = content_height.saturating_sub(height.max(1));
+            let extra_scroll = crate::table_chart::pinned_header(
+                &text,
+                &table_bounds,
+                base_max_scroll,
+                usize::from(area.height.saturating_sub(3)),
+            )
+            .map_or(0, |(_, lines)| lines);
+            let max_scroll = base_max_scroll
+                .saturating_add(extra_scroll)
+                .min(content_height.saturating_sub(1));
             if search
                 .pending_until
                 .is_some_and(|deadline| std::time::Instant::now() >= deadline)
@@ -397,19 +446,33 @@ pub fn run(
                 }
             }
             scroll = scroll.min(max_scroll);
+            let table_pin = crate::table_chart::pinned_header(
+                &text,
+                &table_bounds,
+                scroll,
+                usize::from(area.height.saturating_sub(3)),
+            );
             let pin_active = document
                 .diff
                 .as_ref()
                 .and_then(|diff| diff.pinned_header(scroll))
                 .is_some()
                 && area.height > 3;
-            let selection_area = if pin_active {
-                ratatui::layout::Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+            let pin_lines = table_pin.map_or(usize::from(pin_active), |(_, lines)| lines);
+            let selection_area = if pin_lines > 0 {
+                ratatui::layout::Rect::new(
+                    area.x,
+                    area.y + pin_lines as u16,
+                    area.width,
+                    area.height - pin_lines as u16,
+                )
             } else {
                 area
             };
             if !query.open && !response.visible && link_picker.is_none() {
-                let offset = usize::from(pin_active);
+                let offset = table_pin.map_or(pin_lines, |(first, lines)| {
+                    (first + lines).saturating_sub(scroll)
+                });
                 scroll = selection
                     .auto_scroll(
                         mouse_position,
@@ -425,12 +488,43 @@ pub fn run(
                 .as_ref()
                 .and_then(|diff| diff.pinned_header(scroll))
                 .filter(|_| area.height > 3);
-            let selection_area = if pinned_header.is_some() {
-                ratatui::layout::Rect::new(area.x, area.y + 1, area.width, area.height - 1)
+            let table_pin = crate::table_chart::pinned_header(
+                &text,
+                &table_bounds,
+                scroll,
+                usize::from(area.height.saturating_sub(3)),
+            );
+            let pin_lines =
+                table_pin.map_or(usize::from(pinned_header.is_some()), |(_, lines)| lines);
+            let pinned_mouse_row = |row: u16| {
+                table_pin.and_then(|(first, lines)| {
+                    let offset = row.checked_sub(area.y + 1)? as usize;
+                    (offset < lines).then_some(first + offset)
+                })
+            };
+            let selection_area = if pin_lines > 0 {
+                ratatui::layout::Rect::new(
+                    area.x,
+                    area.y + pin_lines as u16,
+                    area.width,
+                    area.height - pin_lines as u16,
+                )
             } else {
                 area
             };
-            let selection_scroll = scroll + usize::from(pinned_header.is_some());
+            let selection_scroll = table_pin.map_or(scroll + pin_lines, |(first, lines)| {
+                scroll.max(first + lines)
+            });
+            let table_body_area = if table_pin.is_some() {
+                selection_area
+            } else {
+                area
+            };
+            let table_body_scroll = if table_pin.is_some() {
+                selection_scroll
+            } else {
+                scroll
+            };
             if !query.open && !response.visible && link_picker.is_none() {
                 if let Some(view) = document.directory_view.as_mut() {
                     if view.selection_auto_scroll(mouse_position, area, std::time::Instant::now()) {
@@ -446,7 +540,10 @@ pub fn run(
                         && !selection.dragging
                         && link_picker.is_none()
                 })
-                .and_then(|(column, row)| link_at(&links, area, scroll, column, row))
+                .filter(|&(_, row)| pinned_mouse_row(row).is_none())
+                .and_then(|(column, row)| {
+                    link_at(&links, table_body_area, table_body_scroll, column, row)
+                })
                 .filter(|link| document.can_open(&link.target))
                 .map(|link| link.target.as_str());
             let hovered_grep = mouse_position
@@ -547,11 +644,18 @@ pub fn run(
                 frame.render_widget(Clear, area);
                 // Slice with usize so documents beyond 65,535 lines remain navigable.
                 let visible = Text::from(
-                    text.lines
+                    std::iter::repeat_n(Line::default(), table_pin.map_or(0, |(_, lines)| lines)).chain(text.lines
                         .iter()
-                        .skip(scroll)
-                        .take(height)
-                        .cloned()
+                        .skip(table_body_scroll)
+                        .take(height.saturating_sub(table_pin.map_or(0, |(_, lines)| lines)))
+                        .enumerate()
+                        .map(|(index, line)| {
+                            if index == 0 && crate::table_chart::is_closing_rule_at_top(&text, &table_bounds, table_body_scroll) {
+                                Line::default()
+                            } else {
+                                line.clone()
+                            }
+                        }))
                         .collect::<Vec<_>>(),
                 );
                 frame.render_widget(
@@ -564,6 +668,12 @@ pub fn run(
                     )),
                     area,
                 );
+
+                if hover_allowed {
+                    if let Some(mouse) = mouse_position.filter(|&(_, row)| pinned_mouse_row(row).is_none()) {
+                        crate::table_chart::highlight_hover(frame, table_body_area, table_body_scroll, &table_bounds, &table_rows, mouse, no_colour || crossterm::style::Colored::ansi_color_disabled(), settings.theme.is_dark);
+                    }
+                }
 
                 draw_source_line_highlight(frame, area, scroll, highlighted_row, no_colour || crossterm::style::Colored::ansi_color_disabled(), settings.theme.is_dark);
 
@@ -585,8 +695,8 @@ pub fn run(
                 draw_link_highlights(
                     frame,
                     &links,
-                    area,
-                    scroll,
+                    table_body_area,
+                    table_body_scroll,
                     if document.is_directory {
                         selected.as_deref()
                     } else {
@@ -645,13 +755,23 @@ pub fn run(
                 }
                 search.highlight(
                     frame,
-                    area,
-                    scroll,
+                    table_body_area,
+                    table_body_scroll,
                     no_colour || crossterm::style::Colored::ansi_color_disabled(),
                 );
                 selection.highlight(frame, &text, selection_area, selection_scroll);
                 if let Some(header) = pinned_header.and_then(|row| text.lines.get(row)) {
                     frame.render_widget(Paragraph::new(header.clone()), ratatui::layout::Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 1));
+                }
+                if let Some((first, lines)) = table_pin {
+                    let rect = ratatui::layout::Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), lines as u16);
+                    frame.render_widget(Clear, rect);
+                    frame.render_widget(Paragraph::new(Text::from(text.lines[first..first + lines].to_vec())), rect);
+                    if hover_allowed {
+                        if let Some(mouse) = mouse_position {
+                            crate::table_chart::highlight_pinned(frame, area, table_body_scroll, &table_bounds, (first, lines), mouse, no_colour || crossterm::style::Colored::ansi_color_disabled(), settings.theme.is_dark);
+                        }
+                    }
                 }
                 let hovered_path = hovered.and_then(|target| hover_path(&document, target, &working_directory))
                     .or_else(|| hovered_grep.as_ref().map(|(path, line, _)| {
@@ -785,6 +905,19 @@ pub fn run(
                     draw_frozen_scope(frame, area, definition, no_colour);
                 }
                 code_hover.draw(frame, area, settings, no_colour || crossterm::style::Colored::ansi_color_disabled());
+                if hover_allowed && hovered.is_none() && !code_hover.visible() {
+                    if let Some(mouse) = mouse_position {
+                        let is_pinned = pinned_mouse_row(mouse.1).is_some();
+                        let chart_scroll = if is_pinned { table_pin.unwrap().0 } else { table_body_scroll };
+                        let chart_area = if is_pinned { area } else { table_body_area };
+                        let uncoloured = no_colour || crossterm::style::Colored::ansi_color_disabled();
+                        if !crate::table_chart::draw_column_aligned(frame, chart_area, chart_scroll, table_body_area, table_body_scroll, &text, &table_bounds, &table_rows, mouse, uncoloured) {
+                            crate::table_chart::highlight_all_chart_rows(frame, table_body_area, table_body_scroll, &text, &table_bounds, &table_rows, chart_area, chart_scroll, mouse, uncoloured);
+                            crate::table_chart::draw(frame, chart_area, chart_scroll, &text, &table_bounds, &table_rows, mouse, uncoloured);
+                            crate::table_chart::highlight_row_chart_headers(frame, area, table_body_area, table_body_scroll, table_pin, &text, &table_bounds, &table_rows, chart_area, chart_scroll, mouse, uncoloured);
+                        }
+                    }
+                }
                 if response.visible {
                     response.draw(frame);
                 }
@@ -1748,6 +1881,51 @@ pub fn run(
                 }
                 Event::Mouse(mouse) => match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left)
+                        if pinned_mouse_row(mouse.row).is_some()
+                            && mouse.column >= area.x + 2
+                            && mouse.column < area.right().saturating_sub(2) =>
+                    {
+                        pinned_table_click = Some((
+                            mouse.column,
+                            mouse.row,
+                            pinned_mouse_row(mouse.row).unwrap(),
+                        ));
+                        selection = crate::text_selection::Selection::default();
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if pinned_table_click.is_some() => {
+                        let (x, y, row) = pinned_table_click.take().unwrap();
+                        if (x, y) == (mouse.column, mouse.row) {
+                            let col = usize::from(x - area.x - 2);
+                            let target =
+                                crate::table_chart::header_at(&markdown_table_bounds, row, col)
+                                    .map(|(table, column)| (false, table, column))
+                                    .or_else(|| {
+                                        crate::table_chart::header_at(&text_table_bounds, row, col)
+                                            .map(|(table, column)| (true, table, column))
+                                    });
+                            if let Some((is_text, table, column)) = target {
+                                let sorts = if is_text {
+                                    &mut text_table_sorts
+                                } else {
+                                    &mut table_sorts
+                                };
+                                let descending = sorts.get(&table).is_some_and(
+                                    |sort: &crate::table_chart::Sort| {
+                                        sort.column == column && !sort.descending
+                                    },
+                                );
+                                sorts
+                                    .insert(table, crate::table_chart::Sort { column, descending });
+                                rendered_width = None;
+                                status = if descending {
+                                    " Sorted descending ".into()
+                                } else {
+                                    " Sorted ascending ".into()
+                                };
+                            }
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
                         if image_state
                             .as_mut()
                             .is_some_and(|view| view.toggle_at(mouse.column, mouse.row)) =>
@@ -1830,7 +2008,44 @@ pub fn run(
                             && mouse.row > area.y
                             && mouse.row < area.bottom().saturating_sub(1)
                         {
-                            let row = scroll + usize::from(mouse.row - area.y - 1);
+                            let row = table_body_scroll
+                                + usize::from(mouse.row.saturating_sub(table_body_area.y + 1));
+                            let target = crate::table_chart::header_at(
+                                &markdown_table_bounds,
+                                row,
+                                usize::from(mouse.column - area.x - 2),
+                            )
+                            .map(|(table, column)| (false, table, column))
+                            .or_else(|| {
+                                crate::table_chart::header_at(
+                                    &text_table_bounds,
+                                    row,
+                                    usize::from(mouse.column - area.x - 2),
+                                )
+                                .map(|(table, column)| (true, table, column))
+                            });
+                            if let Some((is_text, table, column)) = target {
+                                let sorts = if is_text {
+                                    &mut text_table_sorts
+                                } else {
+                                    &mut table_sorts
+                                };
+                                let descending = sorts.get(&table).is_some_and(
+                                    |sort: &crate::table_chart::Sort| {
+                                        sort.column == column && !sort.descending
+                                    },
+                                );
+                                sorts
+                                    .insert(table, crate::table_chart::Sort { column, descending });
+                                selection = crate::text_selection::Selection::default();
+                                rendered_width = None;
+                                status = if descending {
+                                    " Sorted descending ".into()
+                                } else {
+                                    " Sorted ascending ".into()
+                                };
+                                continue;
+                            }
                             let folded = document
                                 .diff
                                 .as_mut()
@@ -1838,9 +2053,14 @@ pub fn run(
                             if folded.is_some() {
                                 rendered_width = None;
                             } else {
-                                open_target =
-                                    link_at(&links, area, scroll, mouse.column, mouse.row)
-                                        .map(|link| link.target.clone());
+                                open_target = link_at(
+                                    &links,
+                                    table_body_area,
+                                    table_body_scroll,
+                                    mouse.column,
+                                    mouse.row,
+                                )
+                                .map(|link| link.target.clone());
                             }
                             if open_target.is_none() {
                                 if let Some(json) = document.json.as_mut() {
@@ -3619,6 +3839,8 @@ fn render_document_with_table_width(
         options,
         table_width,
         &mut Vec::new(),
+        &mut Vec::new(),
+        &std::collections::HashMap::new(),
     )
 }
 
@@ -3630,11 +3852,14 @@ fn render_document_with_selection_metadata(
     options: mdcat::RenderOptions,
     table_width: u16,
     table_bounds: &mut pulldown_cmark_mdcat::ratatui::TableBounds,
+    table_rows: &mut pulldown_cmark_mdcat::ratatui::TableRows,
+    table_sorts: &std::collections::HashMap<usize, crate::table_chart::Sort>,
 ) -> Result<(
     Text<'static>,
     Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
 )> {
     table_bounds.clear();
+    table_rows.clear();
     if document.image.is_some() {
         return Ok((Text::default(), Vec::new()));
     }
@@ -3704,9 +3929,13 @@ fn render_document_with_selection_metadata(
     };
     let mut link_depth = 0usize;
     let mut link_target = None;
+    let parsed = crate::table_chart::sort_markdown(
+        Parser::new_ext(input, parse_options).collect(),
+        table_sorts,
+    );
     let events = toc
         .into_iter()
-        .chain(Parser::new_ext(input, parse_options))
+        .chain(parsed)
         .flat_map(|event| {
             match &event {
                 MarkdownEvent::Start(Tag::Link { dest_url, .. }) => {
@@ -3755,8 +3984,8 @@ fn render_document_with_selection_metadata(
             vec![event]
         })
         .map(|event| resolve_fragment(event, document));
-    let (text, links, tables) = if options.emoji {
-        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_metadata(
+    let (text, links, tables, rows) = if options.emoji {
+        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_rows(
             settings,
             &document.environment,
             resources,
@@ -3764,7 +3993,7 @@ fn render_document_with_selection_metadata(
             table_width,
         )?
     } else {
-        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_metadata(
+        pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_rows(
             settings,
             &document.environment,
             resources,
@@ -3773,6 +4002,7 @@ fn render_document_with_selection_metadata(
         )?
     };
     *table_bounds = tables;
+    *table_rows = rows;
     Ok(discover_file_links(document, text, links))
 }
 
@@ -4971,6 +5201,154 @@ mod tests {
             buffer[(2 + clean.start as u16, 1 + clean.line as u16)].fg,
             Color::Yellow
         );
+    }
+
+    #[test]
+    fn sorted_tables_keep_wrapped_rows_and_links_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "| Name | Value |\n|---|---:|\n| [Long alpha name that must wrap](a.md) | 10 |\n| [Long beta name that must wrap](b.md) | -2 |\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: pulldown_cmark_mdcat::TerminalSize {
+                columns: 24,
+                ..Default::default()
+            },
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let mut sorts = std::collections::HashMap::new();
+        sorts.insert(
+            0,
+            crate::table_chart::Sort {
+                column: 1,
+                descending: false,
+            },
+        );
+        let mut table_bounds = Vec::new();
+        let mut table_rows = Vec::new();
+        let (text, links) = render_document_with_selection_metadata(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+            24,
+            &mut table_bounds,
+            &mut table_rows,
+            &sorts,
+        )
+        .unwrap();
+        let beta = links
+            .iter()
+            .find(|link| link.target.ends_with("b.md"))
+            .unwrap();
+        let alpha = links
+            .iter()
+            .find(|link| link.target.ends_with("a.md"))
+            .unwrap();
+        assert!(beta.line < alpha.line);
+        assert!(text.lines[beta.line].to_string().contains("beta"));
+        assert!(text.lines[alpha.line].to_string().contains("alpha"));
+        let &(first, last) = table_rows
+            .iter()
+            .find(|&&(first, last)| first <= beta.line && beta.line <= last)
+            .unwrap();
+        assert!(last > first, "row should wrap");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 20)).unwrap();
+        let x = (table_bounds
+            .iter()
+            .find(|(row, _)| *row == first)
+            .unwrap()
+            .1[0]
+            .0
+            + 2) as u16;
+        terminal
+            .draw(|frame| {
+                crate::table_chart::highlight_hover(
+                    frame,
+                    ratatui::layout::Rect::new(0, 0, 40, 20),
+                    0,
+                    &table_bounds,
+                    &table_rows,
+                    (x, (last + 1) as u16),
+                    false,
+                    true,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for row in first..=last {
+            assert_eq!(
+                buffer[(x, (row + 1) as u16)].bg,
+                ratatui::style::Color::Rgb(54, 54, 54)
+            );
+        }
+        assert_ne!(
+            buffer[(x, (alpha.line + 1) as u16)].bg,
+            ratatui::style::Color::Rgb(54, 54, 54)
+        );
+    }
+
+    #[test]
+    fn numeric_table_hover_draws_chart_from_rendered_markdown() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "| Input | Delta | SD |\n|---|---:|---:|\n| Spiral 512k | −1.763 ms (−27.32%) | 0.351 ms |\n| Spiral 1m | −2.922 ms (−22.89%) | 0.712 ms |\n| Control | +0.013 ms (+6.21%) | 0.011 ms |\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: pulldown_cmark_mdcat::TerminalSize {
+                columns: 100,
+                ..Default::default()
+            },
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let mut bounds = Vec::new();
+        let (text, _) = render_document_with_selection_metadata(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+            100,
+            &mut bounds,
+            &mut Vec::new(),
+            &std::collections::HashMap::new(),
+        )
+        .unwrap();
+        let (row, ranges) = &bounds[1];
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                crate::table_chart::draw(
+                    frame,
+                    ratatui::layout::Rect::new(0, 0, 120, 20),
+                    0,
+                    &text,
+                    &bounds,
+                    &Vec::new(),
+                    ((ranges[1].0 + 2) as u16, (*row + 1) as u16),
+                    false,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered: String = (0..20)
+            .flat_map(|y| (0..120).map(move |x| buffer[(x, y)].symbol()))
+            .collect();
+        assert!(rendered.contains("Spiral 512k"), "{rendered}");
+        assert!(rendered.contains("−1.763"), "{rendered}");
+        assert!(rendered.contains("+0.013"), "{rendered}");
+        assert!(rendered.contains('█'), "{rendered}");
     }
 
     #[test]

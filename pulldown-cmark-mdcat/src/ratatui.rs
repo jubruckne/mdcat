@@ -862,6 +862,9 @@ where
 /// Column content ranges for each rendered table line (terminal cell coordinates).
 pub type TableBounds = Vec<(usize, Vec<(usize, usize)>)>;
 
+/// Inclusive rendered line ranges for logical table rows.
+pub type TableRows = Vec<(usize, usize)>;
+
 /// Render linked text and retain table column boundaries for mouse selection.
 pub fn push_linked_text_with_table_metadata<'e, I>(
     settings: &Settings,
@@ -870,6 +873,27 @@ pub fn push_linked_text_with_table_metadata<'e, I>(
     events: I,
     table_columns: u16,
 ) -> Result<(Text<'static>, Vec<LinkRegion>, TableBounds)>
+where
+    I: Iterator<Item = Event<'e>>,
+{
+    let (text, links, bounds, _) = push_linked_text_with_table_rows(
+        settings,
+        environment,
+        resource_handler,
+        events,
+        table_columns,
+    )?;
+    Ok((text, links, bounds))
+}
+
+/// Render linked text and retain table column and logical row boundaries.
+pub fn push_linked_text_with_table_rows<'e, I>(
+    settings: &Settings,
+    environment: &Environment,
+    resource_handler: &dyn ResourceUrlHandler,
+    events: I,
+    table_columns: u16,
+) -> Result<(Text<'static>, Vec<LinkRegion>, TableBounds, TableRows)>
 where
     I: Iterator<Item = Event<'e>>,
 {
@@ -896,12 +920,15 @@ where
 
 #[cfg(test)]
 fn ansi_to_linked_text(input: &str) -> (Text<'static>, Vec<LinkRegion>) {
-    let (text, links, _) = ansi_to_linked_text_with_tables(input);
+    let (text, links, _, _) = ansi_to_linked_text_with_tables(input);
     (text, links)
 }
 
-fn ansi_to_linked_text_with_tables(input: &str) -> (Text<'static>, Vec<LinkRegion>, TableBounds) {
+fn ansi_to_linked_text_with_tables(
+    input: &str,
+) -> (Text<'static>, Vec<LinkRegion>, TableBounds, TableRows) {
     let mut tables = Vec::new();
+    let mut table_rows: TableRows = Vec::new();
     let mut builder = TextBuilder::default();
     let mut style = CurrentStyle::default();
     let mut active: Option<(String, usize)> = None;
@@ -930,6 +957,16 @@ fn ansi_to_linked_text_with_tables(input: &str) -> (Text<'static>, Vec<LinkRegio
             '\x1b' => {
                 builder.flush_span(style);
                 if let Some(osc) = parse_escape(&mut chars, &mut style) {
+                    if let Some(index) = osc
+                        .strip_prefix("777;mdcat-table-row;")
+                        .and_then(|s| s.parse::<usize>().ok())
+                    {
+                        if index == 0 {
+                            table_rows.push((builder.lines.len(), builder.lines.len()));
+                        } else if let Some(row) = table_rows.last_mut() {
+                            row.1 = builder.lines.len();
+                        }
+                    }
                     if let Some(widths) = osc.strip_prefix("777;mdcat-table;") {
                         let mut left = column(&builder);
                         let ranges = widths
@@ -962,7 +999,7 @@ fn ansi_to_linked_text_with_tables(input: &str) -> (Text<'static>, Vec<LinkRegio
         }
     }
     finish(&builder, &active, &mut links);
-    (builder.finish(style), links, tables)
+    (builder.finish(style), links, tables, table_rows)
 }
 
 /// Render a markdown string into Ratatui text.
@@ -1488,7 +1525,7 @@ mod tests {
 
     #[test]
     fn table_metadata_tracks_unicode_columns_without_changing_text() {
-        let (text, links, bounds) = ansi_to_linked_text_with_tables(
+        let (text, links, bounds, _) = ansi_to_linked_text_with_tables(
             "  \x1b]777;mdcat-table;4,5\x1b\\ 界   hello \n\x1b]777;mdcat-table;\x1b\\after\n",
         );
         assert_eq!(text.lines[0].to_string(), "   界   hello ");

@@ -29,6 +29,7 @@ pulldown-cmark = { workspace = true, features = ['simd'] }
 pulldown-cmark-mdcat = { workspace = true, default-features = true, features = ["ratatui"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 ratatui-image = { version = "11.0", default-features = false, features = ["image-defaults", "crossterm"] }
+tui-chart = { version = "0.6.6", default-features = false }
 regex = "1"
 crossterm = "0.29"
 serde = { version = "1.0.210", default-features = false, features = ["derive"] }

@@ -732,6 +732,7 @@ fn write_table_row<W: Write>(
     for line_idx in 0..height {
         write_table_prefix(writer, indent, line_prefix)?;
         if output.capabilities.style.is_some() {
+            write!(writer, "\x1b]777;mdcat-table-row;{line_idx}\x1b\\")?;
             let widths = widths
                 .iter()
                 .map(usize::to_string)

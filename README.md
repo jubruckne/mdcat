@@ -11,6 +11,10 @@ Inside a Git repository, `mdcat --browse 191f7f1` opens a commit's message and d
 short and full commit hashes work. Existing file and directory paths take precedence.
 Scroll with the arrow keys or j/k, use Page Up/Down and Home/End to navigate,
 and press q to close the current document. Mouse-wheel scrolling and terminal resizing are supported.
+Hover over a numeric column header in a Markdown table or an aligned, rule-bordered text table to compare its rows in a bar chart aligned with the table. Visible row headers match their bars' colors. Text tables need to preserve their spacing, for example in a fenced code block. The first number in each cell is charted, including its sign; the full cell text is shown alongside the bar when space permits.
+Hover over a row's first cell to chart its numeric values by column; the column headers match the colors of their bars. Hover over the table's top-left header cell to see a small chart for each numeric column, with a separate scale per chart; visible row headers match the colors of their bars. With colors disabled, matching identifiers appear next to headers and chart values. A row or column needs at least two numeric values to be charted; nonnumeric cells are shown as missing (∅), rather than zero.
+Click a table column header to sort its rows; click it again to reverse the order. Columns containing only numbers (optionally followed by units) sort numerically; other columns sort alphabetically. Sorting affects the current view, not the file.
+When a table scrolls past its headings, the headings stay visible at the top of the document. Hovering a wrapped Markdown table row highlights all of its visible lines.
 Press Ctrl+D to open the directory from which mdcat was launched in all-files mode,
 even when it has Git changes; q returns to the previous document.
 Drag with the left mouse button to select text; hold Ctrl when starting the drag
