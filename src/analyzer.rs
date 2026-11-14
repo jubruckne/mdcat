@@ -2255,6 +2255,8 @@ pub fn run(
                         document.open_directory_diff()?
                     } else if target == "mdcat-history-diff:" {
                         document.open_history_diff()?
+                    } else if crate::table_diff::paths(&target).is_some() {
+                        document.open_file_diff(&target)?
                     } else if crate::git_links::commit_id(&target).is_some() {
                         document.open_commit(&target)?
                     } else {
@@ -3563,7 +3565,11 @@ fn directory_title(path: &std::path::Path, cwd: &std::path::Path) -> String {
 }
 
 fn same_local_link(document: &crate::navigation::Document, left: &str, right: &str) -> bool {
-    if crate::git_links::commit_id(left).is_some() || crate::git_links::commit_id(right).is_some() {
+    if crate::table_diff::paths(left).is_some()
+        || crate::table_diff::paths(right).is_some()
+        || crate::git_links::commit_id(left).is_some()
+        || crate::git_links::commit_id(right).is_some()
+    {
         return left == right;
     }
     let identity = |target: &str| {
@@ -3997,6 +4003,7 @@ fn render_document_with_selection_metadata(
         Parser::new_ext(input, parse_options).collect(),
         table_sorts,
     );
+    let parsed = crate::table_diff::augment(parsed, document);
     let events = toc
         .into_iter()
         .chain(parsed)
@@ -4304,9 +4311,13 @@ fn available_file_links(
     };
     let mut targets = Vec::new();
     let mut depth = 0usize;
+    let parsed = crate::table_diff::augment(
+        Parser::new_ext(&document.input, parse_options).collect(),
+        document,
+    );
     for event in toc
         .into_iter()
-        .chain(Parser::new_ext(&document.input, parse_options))
+        .chain(parsed)
         .map(|event| resolve_fragment(event, document))
     {
         let url = match event {
@@ -5973,6 +5984,50 @@ mod tests {
                 .open_blame()
                 .is_err()
         );
+    }
+
+    #[test]
+    fn before_after_table_diff_is_rendered_and_in_link_picker() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("before.txt"), "old\n").unwrap();
+        std::fs::write(dir.path().join("after.txt"), "new\n").unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "| Stage | Before | After |\n|---|---|---|\n| example | [before](before.txt) | [after](after.txt) |\n").unwrap();
+        let document = crate::navigation::Document::load(path, Default::default()).unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: Default::default(),
+            syntax_set: &syntax,
+            theme: pulldown_cmark_mdcat::Theme::gruvbox_browse(),
+            syntax_theme: None,
+        };
+        let (text, links) = render_document(
+            &document,
+            &document.input,
+            &settings,
+            &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(text
+            .lines
+            .iter()
+            .any(|line| line.to_string().contains("(diff)")));
+        let target = links
+            .iter()
+            .find(|link| crate::table_diff::paths(&link.target).is_some())
+            .unwrap();
+        assert!(available_links(&document, Default::default()).contains(&target.target));
+        assert!(document
+            .link_label(&target.target)
+            .unwrap()
+            .starts_with("Diff:"));
+        assert!(document
+            .open_file_diff(&target.target)
+            .unwrap()
+            .source
+            .contains("+new"));
     }
 
     #[test]

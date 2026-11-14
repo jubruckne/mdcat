@@ -15,6 +15,7 @@ Hover over a numeric column header in a Markdown table or an aligned, rule-borde
 Hover over a row's first cell to chart its numeric values by column; the column headers match the colors of their bars. Hover over the table's top-left header cell to see a small chart for each numeric column, with a separate scale per chart; visible row headers match the colors of their bars. With colors disabled, matching identifiers appear next to headers and chart values. A row or column needs at least two numeric values to be charted; nonnumeric cells are shown as missing (∅), rather than zero.
 Click a table column header to sort its rows; click it again to reverse the order. Columns containing only numbers (optionally followed by units) sort numerically; other columns sort alphabetically. Sorting affects the current view, not the file.
 When a table scrolls past its headings, the headings stay visible at the top of the document. Hovering a wrapped Markdown table row highlights all of its visible lines.
+In browse mode, a Markdown table whose last two headers are `Before` and `After` gains a `(diff)` column when a row links to two existing local files. Open a `(diff)` link to compare the files in a nested window; press `q` to return. Rows without a valid pair have an empty `(diff)` cell. The Markdown file is not changed.
 Press Ctrl+D to open the directory from which mdcat was launched in all-files mode,
 even when it has Git changes; q returns to the previous document.
 Drag with the left mouse button to select text; hold Ctrl when starting the drag

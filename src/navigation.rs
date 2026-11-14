@@ -428,8 +428,49 @@ impl Document {
     }
 
     pub fn can_open(&self, target: &str) -> bool {
-        crate::git_links::commit_id(target).is_some() && self.commits.root.is_some()
+        crate::table_diff::paths(target).is_some()
+            || crate::git_links::commit_id(target).is_some() && self.commits.root.is_some()
             || self.destination(target).is_ok()
+    }
+
+    pub fn open_file_diff(&self, target: &str) -> Result<Self> {
+        let (before, after) = crate::table_diff::paths(target).context("Invalid diff link")?;
+        let output = std::process::Command::new("git")
+            .args([
+                "--no-pager",
+                "diff",
+                "--no-index",
+                "--no-ext-diff",
+                "--text",
+                "--",
+            ])
+            .arg(&before)
+            .arg(&after)
+            .output()
+            .context("Failed to run git diff")?;
+        if !matches!(output.status.code(), Some(0 | 1)) {
+            bail!(
+                "Could not compare files: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let source = if output.stdout.is_empty() {
+            "Files are identical".to_owned()
+        } else {
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let mut next = Self::load(before.clone(), Default::default())?;
+        let label = format!("{} → {}", before.display(), after.display());
+        next.title = Some(format!("Diff: {label}"));
+        next.source = source.clone();
+        next.input = source.clone();
+        let mut diff = crate::diff_view::DiffView::parse(&source);
+        diff.set_comparison_label(&label);
+        diff.fold_all(false);
+        next.diff = Some(diff);
+        next.language = Some("diff".into());
+        next.json = None;
+        Ok(next)
     }
 
     pub fn open_commit(&self, target: &str) -> Result<Self> {
@@ -618,6 +659,9 @@ impl Document {
     }
 
     pub fn link_label(&self, target: &str) -> Result<String> {
+        if let Some((before, after)) = crate::table_diff::paths(target) {
+            return Ok(format!("Diff: {} → {}", before.display(), after.display()));
+        }
         if let Some(id) = crate::git_links::commit_id(target) {
             return Ok(format!("commit {}", &id[..12]));
         }
