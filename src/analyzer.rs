@@ -159,6 +159,7 @@ pub fn run(
                 if matches!(event::read()?, Event::FocusGained) {
                     focused = true;
                     if let Some(view) = document.directory_view.as_mut() {
+                        view.set_marker_focus(true);
                         view.refresh_on_focus();
                     }
                 }
@@ -1078,10 +1079,14 @@ pub fn run(
                 Event::Mouse(mouse) if code_hover.contains(mouse.column, mouse.row) => {}
                 Event::FocusLost => {
                     code_hover.dismiss();
+                    if let Some(view) = document.directory_view.as_mut() {
+                        view.set_marker_focus(false);
+                    }
                     focused = false;
                 }
                 Event::FocusGained => {
                     if let Some(view) = document.directory_view.as_mut() {
+                        view.set_marker_focus(true);
                         view.refresh_on_focus();
                     }
                 }
@@ -2153,6 +2158,7 @@ pub fn run(
                             crate::git_directory::changed_entries(&document.path);
                     }
                     if let Some(view) = document.directory_view.as_mut() {
+                        view.set_marker_focus(true);
                         if let Err(error) = view.refresh() {
                             status = format!(" {error:#} ");
                         }
@@ -2278,6 +2284,9 @@ pub fn run(
                         grep_input = None;
                         grep_snapshot = None;
                         grep_deadline = None;
+                        if let Some(view) = document.directory_view.as_mut() {
+                            view.set_marker_focus(false);
+                        }
                         history.push((
                             std::mem::replace(&mut document, next),
                             scroll,

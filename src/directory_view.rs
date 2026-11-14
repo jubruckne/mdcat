@@ -83,8 +83,43 @@ pub struct DirectoryView {
     pub height: usize,
     last_poll: std::time::Instant,
     pending_refresh: Option<std::sync::mpsc::Receiver<RefreshResult>>,
-    recent: BTreeMap<PathBuf, Cell<Option<std::time::Instant>>>,
+    recent: BTreeMap<PathBuf, Cell<Marker>>,
+    marker_focused: bool,
 }
+
+#[derive(Clone, Copy)]
+struct Marker {
+    age: std::time::Duration,
+    updated: std::time::Instant,
+    visible: bool,
+    selected: bool,
+}
+impl Marker {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            age: std::time::Duration::ZERO,
+            updated: now,
+            visible: false,
+            selected: false,
+        }
+    }
+    fn update(&mut self, now: std::time::Instant) {
+        let elapsed = now.saturating_duration_since(self.updated);
+        self.age += if !self.visible {
+            elapsed / 4
+        } else if self.selected {
+            elapsed * 2
+        } else {
+            elapsed
+        };
+        self.updated = now;
+    }
+}
+
+fn marker_stage(age: std::time::Duration) -> u8 {
+    (age.as_secs() / 20).min(3) as u8
+}
+
 fn git(root: &Path, args: &[&str], paths: &[PathBuf]) -> Result<Vec<u8>> {
     let out = Command::new("git")
         .args(["--no-pager", "--literal-pathspecs", "-C"])
@@ -153,6 +188,7 @@ impl DirectoryView {
             last_poll: std::time::Instant::now(),
             pending_refresh: None,
             recent: BTreeMap::new(),
+            marker_focused: true,
         };
         view.read_changes()?;
         view.changed_only = !view.changes.is_empty();
@@ -201,13 +237,34 @@ impl DirectoryView {
         } else {
             std::time::Duration::from_secs(2).saturating_sub(self.last_poll.elapsed())
         };
-        self.recent
-            .values()
-            .filter_map(Cell::get)
-            .fold(refresh, |timeout, started| {
-                timeout.min(std::time::Duration::from_secs(60).saturating_sub(started.elapsed()))
+        self.recent.values().fold(refresh, |timeout, cell| {
+            let mut marker = cell.get();
+            marker.update(std::time::Instant::now());
+            let next = std::time::Duration::from_secs(u64::from(marker_stage(marker.age) + 1) * 20);
+            let remaining = next.saturating_sub(marker.age);
+            timeout.min(if !marker.visible {
+                remaining * 4
+            } else if marker.selected {
+                remaining / 2
+            } else {
+                remaining
             })
+        })
     }
+    pub fn set_marker_focus(&mut self, focused: bool) {
+        let now = std::time::Instant::now();
+        self.marker_focused = focused;
+        for cell in self.recent.values() {
+            let mut marker = cell.get();
+            marker.update(now);
+            if !focused {
+                marker.visible = false;
+                marker.selected = false;
+            }
+            cell.set(marker);
+        }
+    }
+
     pub fn refresh_on_focus(&mut self) {
         self.pending_refresh = None;
         self.last_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
@@ -243,14 +300,20 @@ impl DirectoryView {
                     if changed {
                         for (path, change) in &next.changes {
                             if self.changes.get(path) != Some(change) {
-                                self.recent.insert(path.clone(), Cell::new(None));
+                                self.recent.insert(
+                                    path.clone(),
+                                    Cell::new(Marker::new(std::time::Instant::now())),
+                                );
                             }
                         }
                         for entry in &next.entries {
                             if !entry.directory
                                 && !self.entries.iter().any(|old| old.path == entry.path)
                             {
-                                self.recent.insert(entry.path.clone(), Cell::new(None));
+                                self.recent.insert(
+                                    entry.path.clone(),
+                                    Cell::new(Marker::new(std::time::Instant::now())),
+                                );
                             }
                         }
                         if self.selected_path() != next.selected_path() {
@@ -307,6 +370,7 @@ impl DirectoryView {
                 last_poll: self.last_poll,
                 pending_refresh: None,
                 recent: BTreeMap::new(),
+                marker_focused: self.marker_focused,
             };
             let (sender, receiver) = std::sync::mpsc::channel();
             self.pending_refresh = Some(receiver);
@@ -337,14 +401,19 @@ impl DirectoryView {
         Ok(expired)
     }
     fn expire_markers(&mut self, now: std::time::Instant) -> bool {
-        let before = self.recent.len();
-        self.recent.retain(|_, started| {
-            started.get().is_none_or(|started| {
-                now.saturating_duration_since(started) < std::time::Duration::from_secs(60)
-            })
+        let mut changed = false;
+        self.recent.retain(|_, cell| {
+            let mut marker = cell.get();
+            let before = marker_stage(marker.age);
+            marker.update(now);
+            let after = marker_stage(marker.age);
+            changed |= before != after;
+            cell.set(marker);
+            after < 3
         });
-        self.recent.len() != before
+        changed
     }
+
     fn read_changes(&mut self) -> Result<()> {
         let relative = self.directory.strip_prefix(&self.root)?;
         let path = if relative.as_os_str().is_empty() {
@@ -1150,22 +1219,35 @@ impl DirectoryView {
     pub fn draw_decorations(&self, frame: &mut ratatui::Frame<'_>, area: Rect, no_colour: bool) {
         let width = usize::from(area.width.saturating_sub(4));
         let height = usize::from(area.height.saturating_sub(2));
+        let now = std::time::Instant::now();
+        let start = self.list_start();
+        for (path, cell) in &self.recent {
+            let mut marker = cell.get();
+            marker.update(now);
+            marker.visible = self.marker_focused
+                && width > 0
+                && height > 0
+                && self
+                    .entries
+                    .iter()
+                    .skip(start)
+                    .take(height)
+                    .any(|entry| &entry.path == path);
+            marker.selected = marker.visible && self.selected_path() == Some(path.as_path());
+            cell.set(marker);
+        }
         if width == 0 || height == 0 {
             return;
         }
-        for (row, entry) in self
-            .entries
-            .iter()
-            .skip(self.list_start())
-            .take(height)
-            .enumerate()
-        {
-            if let Some(started) = self.recent.get(&entry.path) {
-                if started.get().is_none() {
-                    started.set(Some(std::time::Instant::now()));
-                }
+        for (row, entry) in self.entries.iter().skip(start).take(height).enumerate() {
+            if let Some(cell) = self.recent.get(&entry.path) {
+                let symbol = match marker_stage(cell.get().age) {
+                    0 => "⦁",
+                    1 => "•",
+                    _ => "·",
+                };
                 frame.buffer_mut()[(area.x + 1, area.y + 1 + row as u16)]
-                    .set_symbol("·")
+                    .set_symbol(symbol)
                     .set_style(if no_colour {
                         Style::default()
                     } else {
@@ -1571,53 +1653,63 @@ mod tests {
         assert!(view.entries.is_empty());
     }
     #[test]
-    fn polling_markers_start_on_render_and_expire_after_one_minute() {
+    fn marker_clock_tracks_visibility_and_focus() {
+        let now = std::time::Instant::now();
+        let mut marker = Marker::new(now);
+        marker.update(now + std::time::Duration::from_secs(40));
+        assert_eq!(marker.age.as_secs(), 10);
+        marker.visible = true;
+        marker.update(now + std::time::Duration::from_secs(50));
+        assert_eq!(marker_stage(marker.age), 1);
+        marker.selected = true;
+        marker.update(now + std::time::Duration::from_secs(60));
+        assert_eq!(marker_stage(marker.age), 2);
+        marker.visible = false;
+        marker.update(now + std::time::Duration::from_secs(100));
+        assert_eq!(marker_stage(marker.age), 2);
+        marker.update(now + std::time::Duration::from_secs(140));
+        assert_eq!(marker_stage(marker.age), 3);
+    }
+    #[test]
+    fn marker_rendering_updates_visibility_and_symbols() {
         let (dir, _) = crate::git_links::tests::repository();
         let mut view = DirectoryView::load(dir.path()).unwrap();
         select(&mut view, "example.txt");
-        assert!(view.recent.is_empty());
-        std::fs::write(dir.path().join("example.txt"), "new edit\n").unwrap();
-        std::fs::write(dir.path().join("new.txt"), "new file\n").unwrap();
-        assert!(background_refresh(&mut view));
         let path = view.directory.join("example.txt");
-        let new_path = view.directory.join("new.txt");
-        assert!(view.recent[&path].get().is_none());
-        assert!(view.recent[&new_path].get().is_none());
-        // Time before the first draw does not consume the marker's lifetime.
-        assert!(
-            !view.expire_markers(std::time::Instant::now() + std::time::Duration::from_secs(120))
+        view.recent.insert(
+            path.clone(),
+            Cell::new(Marker::new(std::time::Instant::now())),
         );
-        let text = view.render(120, true);
-        let selected_row = view.cursor - view.list_start();
-        assert!(text.lines[selected_row]
-            .to_string()
-            .starts_with("example.txt"));
-        assert!(
-            view.recent[&path].get().is_none(),
-            "layout must not start the timer"
-        );
+        let row = view.cursor - view.list_start();
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(124, 22)).unwrap();
+        for (age, symbol) in [(0, "⦁"), (20, "•"), (40, "·")] {
+            let mut marker = view.recent[&path].get();
+            marker.age = std::time::Duration::from_secs(age);
+            marker.updated = std::time::Instant::now();
+            view.recent[&path].set(marker);
+            terminal
+                .draw(|frame| view.draw_decorations(frame, Rect::new(0, 0, 124, 22), false))
+                .unwrap();
+            assert_eq!(
+                terminal.backend().buffer()[(1, 1 + row as u16)].symbol(),
+                symbol
+            );
+            assert!(view.recent[&path].get().visible);
+            assert!(view.recent[&path].get().selected);
+        }
+        view.set_marker_focus(false);
+        assert!(!view.recent[&path].get().visible);
+        assert!(!view.recent[&path].get().selected);
+        view.set_marker_focus(true);
         terminal
-            .draw(|frame| {
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(text),
-                    Rect::new(2, 1, 120, 20),
-                );
-                view.draw_decorations(frame, Rect::new(0, 0, 124, 22), false);
-            })
+            .draw(|frame| view.draw_decorations(frame, Rect::new(0, 0, 124, 22), false))
             .unwrap();
-        let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(1, 1 + selected_row as u16)].symbol(), "·");
-        assert_eq!(buffer[(1, 1 + selected_row as u16)].fg, Color::Yellow);
-        assert_eq!(buffer[(2, 1 + selected_row as u16)].symbol(), "e");
-        let started = view.recent[&path].get().unwrap();
-        assert!(!background_refresh(&mut view));
-        assert_eq!(view.recent[&path].get(), Some(started));
-        assert!(!view.expire_markers(started + std::time::Duration::from_secs(59)));
-        assert!(view.expire_markers(started + std::time::Duration::from_secs(61)));
-        assert!(!view.recent.contains_key(&path));
-        assert!(!view.render(120, true).to_string().contains('·'));
+        assert!(view.recent[&path].get().visible);
+        terminal
+            .draw(|frame| view.draw_decorations(frame, Rect::new(0, 0, 124, 2), false))
+            .unwrap();
+        assert!(!view.recent[&path].get().visible);
     }
     #[test]
     fn pane_scrollbars_render_and_support_clicks_and_dragging() {
