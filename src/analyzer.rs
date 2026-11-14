@@ -835,6 +835,8 @@ pub fn run(
                         " Ctrl+H: back · ↑↓: select · Space/right click: base · Enter: diff · Tab: focus · PgUp/Dn: scroll · Ctrl+F: find "
                     } else if document.blame.is_some() {
                         " Ctrl+B: back · click commit: diff · Ctrl+F: search "
+                    } else if let Some(mode) = document.diff.as_ref().and_then(|diff| diff.view_mode()) {
+                        if mode == "full" { " Full files · v: changed sections · c/e: fold/expand " } else { " Changed sections · v: full files · c/e: fold/expand " }
                     } else if document.json.is_some() {
                         " Enter: fold · c/e: fold/expand all · Ctrl+B: blame "
                     } else if document.is_formatted() {
@@ -1717,7 +1719,7 @@ pub fn run(
                         && document.diff.is_some()
                         && matches!(
                             key.code,
-                            KeyCode::Enter | KeyCode::Char(' ' | 'c' | 'e' | 'n' | 'p')
+                            KeyCode::Enter | KeyCode::Char(' ' | 'c' | 'e' | 'n' | 'p' | 'v')
                         ) =>
                 {
                     let diff = document.diff.as_mut().unwrap();
@@ -1731,6 +1733,15 @@ pub fn run(
                         KeyCode::Char('c' | 'e') => {
                             scroll = diff.fold_all(key.code == KeyCode::Char('c'));
                             rendered_width = None;
+                        }
+                        KeyCode::Char('v') => {
+                            if let Some(source) = diff.toggle_view_mode() {
+                                document.source = source.to_owned();
+                                document.input = document.source.clone();
+                                scroll = 0;
+                                selection = crate::text_selection::Selection::default();
+                                rendered_width = None;
+                            }
                         }
                         KeyCode::Char('n' | 'p') => {
                             scroll = diff.next_file(scroll, key.code == KeyCode::Char('n'))

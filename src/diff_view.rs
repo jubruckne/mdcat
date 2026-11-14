@@ -40,6 +40,13 @@ pub struct DiffView {
     files: Vec<File>,
     layout: RefCell<Layout>,
     selected_file: Option<usize>,
+    variants: Option<DiffVariants>,
+}
+
+struct DiffVariants {
+    changed: String,
+    full: String,
+    showing_full: bool,
 }
 
 fn flush(rows: &mut Vec<Row>, old: &mut Vec<Cell>, new: &mut Vec<Cell>) {
@@ -120,6 +127,7 @@ impl DiffView {
             files: Vec::new(),
             layout: RefCell::new(Layout::default()),
             selected_file: None,
+            variants: None,
         };
         let (mut old_number, mut new_number) = (0, 0);
         let (mut removed, mut added) = (Vec::new(), Vec::new());
@@ -313,6 +321,43 @@ impl DiffView {
         } else {
             row
         }
+    }
+
+    pub fn set_file_variants(&mut self, changed: String, full: String) {
+        self.variants = Some(DiffVariants {
+            changed,
+            full,
+            showing_full: false,
+        });
+    }
+
+    pub fn view_mode(&self) -> Option<&'static str> {
+        self.variants
+            .as_ref()
+            .map(|v| if v.showing_full { "full" } else { "changed" })
+    }
+
+    pub fn toggle_view_mode(&mut self) -> Option<&str> {
+        let mut variants = self.variants.take()?;
+        variants.showing_full = !variants.showing_full;
+        let source = if variants.showing_full {
+            &variants.full
+        } else {
+            &variants.changed
+        };
+        let mut next = Self::parse(source);
+        next.comparison_label = self.comparison_label.take();
+        next.show_fold_markers = self.show_fold_markers;
+        for (index, new) in next.files.iter_mut().enumerate() {
+            new.collapsed = self.files.get(index).is_some_and(|old| old.collapsed);
+        }
+        next.variants = Some(variants);
+        *self = next;
+        Some(if self.variants.as_ref().unwrap().showing_full {
+            &self.variants.as_ref().unwrap().full
+        } else {
+            &self.variants.as_ref().unwrap().changed
+        })
     }
 
     pub fn set_comparison_label(&mut self, label: &str) {

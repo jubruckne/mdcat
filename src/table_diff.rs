@@ -199,6 +199,52 @@ mod tests {
     }
 
     #[test]
+    fn file_comparison_switches_between_changed_and_complete_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = format!(
+            "beginning marker\n{}old\n{}ending marker\n",
+            "unchanged\n".repeat(8),
+            "unchanged\n".repeat(8)
+        );
+        let new = old.replace("old\n", "new\n");
+        std::fs::write(dir.path().join("before.txt"), &old).unwrap();
+        std::fs::write(dir.path().join("after.txt"), &new).unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "").unwrap();
+        let document = Document::load(path, Default::default()).unwrap();
+        let target = target(&document, "before.txt", "after.txt").unwrap();
+        let mut comparison = document.open_file_diff(&target).unwrap();
+        let view = comparison.diff.as_mut().unwrap();
+        assert_eq!(view.view_mode(), Some("changed"));
+        assert!(!comparison.source.contains("beginning marker"));
+        let full = view.toggle_view_mode().unwrap().to_owned();
+        assert_eq!(view.view_mode(), Some("full"));
+        assert!(full.contains("beginning marker") && full.contains("ending marker"));
+        let rendered = view.render(120, true).to_string();
+        assert!(rendered.contains("beginning marker") && rendered.contains("ending marker"));
+        assert!(rendered.contains("old") && rendered.contains("new"));
+        let changed = view.toggle_view_mode().unwrap().to_owned();
+        assert_eq!(changed, comparison.source);
+        assert_eq!(view.view_mode(), Some("changed"));
+    }
+
+    #[test]
+    fn identical_file_comparison_can_show_the_full_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), "same contents\n").unwrap();
+        std::fs::write(dir.path().join("b"), "same contents\n").unwrap();
+        let path = dir.path().join("report.md");
+        std::fs::write(&path, "").unwrap();
+        let document = Document::load(path, Default::default()).unwrap();
+        let target = target(&document, "a", "b").unwrap();
+        let mut comparison = document.open_file_diff(&target).unwrap();
+        let view = comparison.diff.as_mut().unwrap();
+        assert!(view.toggle_view_mode().unwrap().contains("same contents"));
+        assert!(view.render(80, true).to_string().contains("same contents"));
+        assert_eq!(view.toggle_view_mode(), Some("Files are identical"));
+    }
+
+    #[test]
     fn leaves_unrelated_or_invalid_tables_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("report.md");

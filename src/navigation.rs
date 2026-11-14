@@ -435,29 +435,55 @@ impl Document {
 
     pub fn open_file_diff(&self, target: &str) -> Result<Self> {
         let (before, after) = crate::table_diff::paths(target).context("Invalid diff link")?;
-        let output = std::process::Command::new("git")
-            .args([
+        let compare = |full: bool| -> Result<String> {
+            let mut command = std::process::Command::new("git");
+            command.args([
                 "--no-pager",
                 "diff",
                 "--no-index",
                 "--no-ext-diff",
                 "--text",
-                "--",
-            ])
-            .arg(&before)
-            .arg(&after)
-            .output()
-            .context("Failed to run git diff")?;
-        if !matches!(output.status.code(), Some(0 | 1)) {
-            bail!(
-                "Could not compare files: {}",
-                String::from_utf8_lossy(&output.stderr)
+            ]);
+            if full {
+                command.arg("--unified=1000000000");
+            }
+            let output = command
+                .arg("--")
+                .arg(&before)
+                .arg(&after)
+                .output()
+                .context("Failed to run git diff")?;
+            if !matches!(output.status.code(), Some(0 | 1)) {
+                bail!(
+                    "Could not compare files: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        let changed = compare(false)?;
+        let full = if changed.is_empty() {
+            let contents = std::fs::read(&before).context("Could not read identical files")?;
+            let contents = String::from_utf8_lossy(&contents);
+            let lines: Vec<_> = contents.lines().collect();
+            let mut patch = format!(
+                "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,{} +1,{} @@\n",
+                lines.len(),
+                lines.len()
             );
-        }
-        let source = if output.stdout.is_empty() {
+            for line in lines {
+                patch.push(' ');
+                patch.push_str(line);
+                patch.push('\n');
+            }
+            patch
+        } else {
+            compare(true)?
+        };
+        let source = if changed.is_empty() {
             "Files are identical".to_owned()
         } else {
-            String::from_utf8_lossy(&output.stdout).into_owned()
+            changed
         };
         let mut next = Self::load(before.clone(), Default::default())?;
         let label = format!("{} → {}", before.display(), after.display());
@@ -467,6 +493,7 @@ impl Document {
         let mut diff = crate::diff_view::DiffView::parse(&source);
         diff.set_comparison_label(&label);
         diff.fold_all(false);
+        diff.set_file_variants(source, full);
         next.diff = Some(diff);
         next.language = Some("diff".into());
         next.json = None;
