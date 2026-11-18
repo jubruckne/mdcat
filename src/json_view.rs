@@ -233,6 +233,10 @@ impl JsonView {
             .min(self.rows.len().saturating_sub(1));
     }
 
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
     pub fn select_row(&mut self, row: usize) {
         self.cursor = row.min(self.rows.len().saturating_sub(1));
     }

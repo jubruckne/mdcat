@@ -51,6 +51,8 @@ mod query;
 mod scope_hint;
 mod table_chart;
 mod table_diff;
+mod tensor_stats;
+mod tensor_view;
 mod text_selection;
 
 /// Clear the terminal screen and scrollback, then move the cursor home.

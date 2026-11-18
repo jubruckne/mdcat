@@ -48,6 +48,9 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", default-features = false, features = ["env-filter", "std", "fmt", "ansi"] }
 url = { workspace = true }
 terminal-colorsaurus = "1.0.3"
+gguf-rs = { version = "=0.1.8", features = ["mmap"] }
+memmap2 = "0.9.12"
+half = "2.7.1"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", features = ["fs", "term"] }

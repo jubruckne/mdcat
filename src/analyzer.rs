@@ -228,6 +228,26 @@ pub fn run(
             if let Some(json) = document.json.as_mut() {
                 json.prepare_for_height(height);
             }
+            if let Some(tensor) = document.tensor.as_mut() {
+                if tensor.resize(usize::from(area.width.saturating_sub(4)), height) {
+                    rendered_width = None;
+                }
+                scroll = 0;
+                let pointer = mouse_position
+                    .filter(|&(x, y)| {
+                        !query.open
+                            && !response.visible
+                            && link_picker.is_none()
+                            && !selection.dragging
+                            && !tensor.is_editing()
+                            && x >= area.x + 2
+                            && x < area.right().saturating_sub(2)
+                            && y > area.y
+                            && y < area.bottom().saturating_sub(1)
+                    })
+                    .map(|(x, y)| (usize::from(x - area.x - 2), usize::from(y - area.y - 1)));
+                tensor.update_hover(pointer);
+            }
             let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             let tick = (animation_started.elapsed().as_millis() / 100) % spinner.len() as u128;
             if rendered_width.is_none() {
@@ -262,6 +282,7 @@ pub fn run(
                 || document.blame.is_some()
                 || document.file_history.is_some()
                 || document.directory_view.is_some()
+                || document.tensor.is_some()
             {
                 width
             } else {
@@ -339,7 +360,16 @@ pub fn run(
                     for line in &mut text.lines {
                         line.style = Style::default();
                         for span in &mut line.spans {
-                            span.style = Style::default();
+                            let selected_cell = document.tensor.is_some()
+                                && span
+                                    .style
+                                    .add_modifier
+                                    .contains(ratatui::style::Modifier::REVERSED);
+                            span.style = if selected_cell {
+                                Style::default().add_modifier(ratatui::style::Modifier::REVERSED)
+                            } else {
+                                Style::default()
+                            };
                         }
                     }
                 }
@@ -648,6 +678,13 @@ pub fn run(
                             scope.first.checked_sub(scope_first_row?)?,
                         ))
                     });
+            let position_indicator = document
+                .tensor
+                .as_ref()
+                .map(|view| view.coordinates())
+                .unwrap_or_else(|| {
+                    format!("{} / {}", (scroll + 1).min(content_height), content_height)
+                });
             terminal.draw(|frame| {
                 // Each fixed child covers its parent's body, leaving its title bar visible.
                 for (index, (_, position, _)) in history.iter().skip(first_parent).enumerate() {
@@ -686,12 +723,8 @@ pub fn run(
                         .collect::<Vec<_>>(),
                 );
                 frame.render_widget(
-                    Paragraph::new(visible).block(document_block(
-                        &titles[history.len()],
-                        (scroll + 1).min(content_height),
-                        content_height,
-                        no_colour,
-                        true,
+                    Paragraph::new(visible).block(document_block_with_position(
+                        &titles[history.len()], &position_indicator, no_colour, true,
                     )),
                     area,
                 );
@@ -806,12 +839,7 @@ pub fn run(
                         match line { Some(line) => format!(" {}:{line} ", path.display()), None => format!(" {} ", path.display()) }
                     }));
                 let hint_width = area.width.saturating_sub(
-                    4 + format!(
-                        " {} / {} ──",
-                        (scroll + 1).min(text.lines.len()),
-                        text.lines.len()
-                    )
-                    .len() as u16,
+                    4 + format!(" {position_indicator} ──").len() as u16,
                 );
                 let indexing_status = code_hover.indexing_status();
                 let hint_width = draw_indexing_progress(frame, area, hint_width, indexing_status.as_deref());
@@ -824,12 +852,17 @@ pub fn run(
                     None
                 };
                 let directory_footer = document.directory_view.as_ref().map(|view| view.footer());
+                let tensor_footer = document.tensor.as_ref().map(|view| view.footer());
                 let hint = if let Some((hint, _)) = search_footer.as_ref() {
                     hint.as_str()
+                } else if document.has_inline_gguf_metadata() && !status.is_empty() {
+                    status.as_str()
                 } else if let Some(path) = hovered_path.as_deref() {
                     path
                 } else if status.is_empty() {
-                    if directory_footer.is_some() {
+                    if let Some(footer) = tensor_footer.as_deref() {
+                        footer
+                    } else if directory_footer.is_some() {
                         ""
                     } else if document.file_history.is_some() {
                         " Ctrl+H: back · ↑↓: select · Space/right click: base · Enter: diff · Tab: focus · PgUp/Dn: scroll · Ctrl+F: find "
@@ -934,7 +967,12 @@ pub fn run(
                     draw_frozen_scope(frame, area, definition, no_colour);
                 }
                 code_hover.draw(frame, area, settings, no_colour || crossterm::style::Colored::ansi_color_disabled());
-                if hover_allowed && hovered.is_none() && !code_hover.visible() {
+                if hover_allowed {
+                    if let Some(tensor)=document.tensor.as_ref() {
+                        tensor.draw_hover(frame,area,settings.theme.is_dark,no_colour || crossterm::style::Colored::ansi_color_disabled());
+                    }
+                }
+                if hover_allowed && hovered.is_none() && !code_hover.visible() && !document.has_inline_gguf_metadata() && document.tensor.is_none() {
                     if let Some(mouse) = mouse_position {
                         let is_pinned = pinned_mouse_row(mouse.1).is_some();
                         let chart_scroll = if is_pinned { table_pin.unwrap().0 } else { table_body_scroll };
@@ -1005,6 +1043,10 @@ pub fn run(
                     || response.visible
                     || link_picker.is_some()
                     || search.open
+                    || document
+                        .tensor
+                        .as_ref()
+                        .is_some_and(|view| view.hover_needs_tick())
                     || grep_input.is_some()
                     || selection.poll_timeout(std::time::Duration::MAX, std::time::Instant::now())
                         != std::time::Duration::MAX
@@ -1051,6 +1093,43 @@ pub fn run(
                         open_target = Some(path.to_owned());
                         pasted_path = true;
                     }
+                }
+                Event::Key(key)
+                    if key.kind != KeyEventKind::Release && document.tensor.is_some() =>
+                {
+                    if key.code == KeyCode::Char('c')
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        break;
+                    }
+                    let tensor = document.tensor.as_mut().unwrap();
+                    if !tensor.is_editing()
+                        && matches!(
+                            key.code,
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Backspace
+                        )
+                    {
+                        go_back = true;
+                    } else if tensor.key(key) {
+                        rendered_width = None;
+                    }
+                }
+                Event::Mouse(mouse) if document.tensor.is_some() => {
+                    let tensor = document.tensor.as_mut().unwrap();
+                    match mouse.kind {
+                        MouseEventKind::ScrollDown => tensor.wheel(true),
+                        MouseEventKind::ScrollUp => tensor.wheel(false),
+                        MouseEventKind::Down(MouseButton::Left)
+                            if mouse.column >= area.x + 2 && mouse.row > area.y =>
+                        {
+                            tensor.click(
+                                usize::from(mouse.column - area.x - 2),
+                                usize::from(mouse.row - area.y - 1),
+                            );
+                        }
+                        _ => (),
+                    }
+                    rendered_width = None;
                 }
                 Event::Key(key)
                     if key.kind != KeyEventKind::Release
@@ -1756,6 +1835,18 @@ pub fn run(
                             .modifiers
                             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
                         && document.json.is_some()
+                        && (!document.has_inline_gguf_metadata()
+                            || (scroll < document.json.as_ref().unwrap().row_count()
+                                && !matches!(
+                                    key.code,
+                                    KeyCode::End
+                                        | KeyCode::Char('G')
+                                        | KeyCode::PageDown
+                                        | KeyCode::PageUp
+                                )
+                                && !(matches!(key.code, KeyCode::Down | KeyCode::Char('j'))
+                                    && document.json.as_ref().unwrap().cursor + 1
+                                        >= document.json.as_ref().unwrap().row_count())))
                         && matches!(
                             key.code,
                             KeyCode::Up
@@ -2118,7 +2209,7 @@ pub fn run(
                                     // Clamp to real rows rather than a click below the document.
                                     let old = json.cursor;
                                     json.cursor = row;
-                                    if row < text.lines.len() {
+                                    if row < json.row_count() {
                                         if json.toggle(row) {
                                             rendered_width = None;
                                         }
@@ -2188,6 +2279,9 @@ pub fn run(
                 }
             }
             if let Some(target) = open_target {
+                if let Some(tensor) = document.tensor.as_mut() {
+                    tensor.clear_hover();
+                }
                 if !pasted_path && matches!(target.as_str(), "mdcat-blame:" | "mdcat-history:") {
                     let source = document
                         .original_view
@@ -2259,10 +2353,12 @@ pub fn run(
                 let result = (|| -> Result<_> {
                     if pasted_path {
                         let (next, line) =
-                            crate::navigation::Document::load_argument(&target, options)?;
+                            crate::navigation::Document::load_pasted_argument(&target, options)?;
                         return Ok((next, line.map(|line| format!("L{line}"))));
                     }
-                    let mut next = if target == "mdcat-directory-diff:" {
+                    let mut next = if let Some(index) = target.strip_prefix("mdcat-tensor:") {
+                        document.open_tensor(index.parse()?, options)?
+                    } else if target == "mdcat-directory-diff:" {
                         document.open_directory_diff()?
                     } else if target == "mdcat-history-diff:" {
                         document.open_history_diff()?
@@ -2272,7 +2368,8 @@ pub fn run(
                         document.open_commit(&target)?
                     } else {
                         let path = document.destination(&target)?;
-                        crate::navigation::Document::load(path, options)?
+                        crate::navigation::Document::load(path, options)
+                            .with_context(|| format!("Could not open link {target}"))?
                     };
                     if open_directory_all {
                         if let Some(view) = next.directory_view.as_mut() {
@@ -3941,6 +4038,9 @@ fn render_document_with_selection_metadata(
 )> {
     table_bounds.clear();
     table_rows.clear();
+    if let Some(tensor) = &document.tensor {
+        return Ok((tensor.render(settings.theme.is_dark), Vec::new()));
+    }
     if document.image.is_some() {
         return Ok((Text::default(), Vec::new()));
     }
@@ -3975,7 +4075,11 @@ fn render_document_with_selection_metadata(
             Vec::new(),
         ));
     }
-    if let Some(json) = document.json.as_ref() {
+    if let Some(json) = document
+        .json
+        .as_ref()
+        .filter(|_| !document.has_inline_gguf_metadata())
+    {
         return Ok(discover_file_links(
             document,
             json.render(&document.source, settings.theme.is_dark),
@@ -4066,7 +4170,7 @@ fn render_document_with_selection_metadata(
             vec![event]
         })
         .map(|event| resolve_fragment(event, document));
-    let (text, links, tables, rows) = if options.emoji {
+    let (mut text, mut links, mut tables, mut rows) = if options.emoji {
         pulldown_cmark_mdcat::ratatui::push_linked_text_with_table_rows(
             settings,
             &document.environment,
@@ -4083,9 +4187,113 @@ fn render_document_with_selection_metadata(
             table_width,
         )?
     };
+    if document.has_inline_gguf_metadata() {
+        expand_tensor_row_links(&mut links, &rows, usize::from(table_width));
+        for &(first, last) in &rows {
+            let content = text.lines[first..=last]
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let color = content
+                .split_whitespace()
+                .find_map(|word| gguf_tensor_color(word, settings.theme.is_dark));
+            if let Some(color) = color {
+                for line in &mut text.lines[first..=last] {
+                    for span in &mut line.spans {
+                        span.style = span.style.fg(color);
+                    }
+                }
+            }
+        }
+        let mut prefix = document
+            .json
+            .as_ref()
+            .unwrap()
+            .render(&document.source, settings.theme.is_dark);
+        prefix.lines.push(Line::default());
+        let offset = prefix.lines.len();
+        for link in &mut links {
+            link.line += offset;
+        }
+        for (line, _) in &mut tables {
+            *line += offset;
+        }
+        for (start, end) in &mut rows {
+            *start += offset;
+            *end += offset;
+        }
+        prefix.lines.append(&mut text.lines);
+        text = prefix;
+    }
     *table_bounds = tables;
     *table_rows = rows;
     Ok(discover_file_links(document, text, links))
+}
+
+fn expand_tensor_row_links(
+    links: &mut Vec<pulldown_cmark_mdcat::ratatui::LinkRegion>,
+    rows: &pulldown_cmark_mdcat::ratatui::TableRows,
+    width: usize,
+) {
+    for &(first, last) in rows {
+        let Some(link) = links
+            .iter()
+            .find(|link| {
+                (first..=last).contains(&link.line) && link.target.starts_with("mdcat-tensor:")
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        links.retain(|link| {
+            !(first..=last).contains(&link.line) || !link.target.starts_with("mdcat-tensor:")
+        });
+        for line in first..=last {
+            let mut region = link.clone();
+            region.line = line;
+            region.start = 0;
+            region.end = width;
+            links.push(region);
+        }
+    }
+}
+
+fn gguf_tensor_color(name: &str, dark: bool) -> Option<Color> {
+    let group = match name {
+        "output.weight" => 0,
+        "output_norm.weight" => 1,
+        "token_embd.weight" => 2,
+        _ => name
+            .strip_prefix("blk.")?
+            .split_once('.')?
+            .0
+            .parse::<usize>()
+            .ok()?
+            .checked_add(3)?,
+    };
+    // Chart palette, with additional shades for models with more layers.
+    let palette = [
+        (70, 195, 210),
+        (225, 195, 80),
+        (200, 110, 200),
+        (100, 190, 110),
+        (100, 145, 225),
+        (220, 100, 100),
+        (230, 145, 65),
+        (105, 170, 130),
+        (180, 145, 220),
+    ];
+    let (r, g, b) = palette[group % palette.len()];
+    let shade = group / palette.len();
+    let amount = if shade == 0 {
+        0.0
+    } else {
+        0.5 * (1.0 - 1.0 / (shade as f64 + 1.0))
+    };
+    let target = if dark { 255.0 } else { 0.0 };
+    let tint = |channel: i32| (channel as f64 * (1.0 - amount) + target * amount).round() as u8;
+    Some(Color::Rgb(tint(r), tint(g), tint(b)))
 }
 
 fn discover_file_links(
@@ -4230,8 +4438,9 @@ fn resolve_fragment<'a>(
             dest_url,
             title,
             id,
-        }) if dest_url.starts_with('#')
-            || crate::navigation::split_line_reference(&dest_url).is_some() =>
+        }) if !dest_url.starts_with("mdcat-tensor:")
+            && (dest_url.starts_with('#')
+                || crate::navigation::split_line_reference(&dest_url).is_some()) =>
         {
             let target = if let Some(url) = document.line_link(&dest_url) {
                 url.to_string()
@@ -4278,7 +4487,11 @@ fn available_file_links(
     document: &crate::navigation::Document,
     options: mdcat::RenderOptions,
 ) -> Vec<String> {
-    if let Some(json) = &document.json {
+    if let Some(json) = document
+        .json
+        .as_ref()
+        .filter(|_| !document.has_inline_gguf_metadata())
+    {
         let mut targets = Vec::new();
         for string in json.strings(&document.source) {
             let urls = if let Some(url) = document.code_link(&string) {
@@ -4440,6 +4653,15 @@ fn document_block(
     no_colour: bool,
     active: bool,
 ) -> Block<'static> {
+    document_block_with_position(title, &format!("{current} / {total}"), no_colour, active)
+}
+
+fn document_block_with_position(
+    title: &str,
+    position: &str,
+    no_colour: bool,
+    active: bool,
+) -> Block<'static> {
     let style = if no_colour {
         if active {
             Style::default()
@@ -4456,7 +4678,7 @@ fn document_block(
         .title_style(style)
         .padding(Padding::new(1, 1, 0, 0))
         .title(format!(" {title} "))
-        .title_bottom(Line::raw(format!(" {current} / {total} ──")).right_aligned())
+        .title_bottom(Line::raw(format!(" {position} ──")).right_aligned())
 }
 
 fn popup_block<'a>(no_colour: bool) -> Block<'a> {
@@ -5324,6 +5546,119 @@ mod tests {
             buffer[(2 + clean.start as u16, 1 + clean.line as u16)].fg,
             Color::Yellow
         );
+    }
+
+    #[test]
+    fn tensor_caption_and_coordinates_use_window_borders() {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new("cells").block(document_block_with_position(
+                        "blk.0.attn_q.weight · Q8_0 · 4096 × 2880",
+                        "[1, 2]",
+                        true,
+                        true,
+                    )),
+                    ratatui::layout::Rect::new(0, 0, 90, 6),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| (0..90).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+        assert!(row(0).contains("blk.0.attn_q.weight · Q8_0 · 4096 × 2880"));
+        assert!(row(5).contains("[1, 2]"));
+        assert!(!row(5).contains(" / "));
+        assert!(!row(5).contains('='));
+    }
+
+    #[test]
+    fn gguf_tensor_colors_are_consistent_and_distinct_by_layer() {
+        let mut colors = std::collections::HashSet::new();
+        for dark in [false, true] {
+            colors.clear();
+            for name in ["output.weight", "output_norm.weight", "token_embd.weight"] {
+                assert!(colors.insert(gguf_tensor_color(name, dark).unwrap()));
+            }
+            for layer in 0..24 {
+                let color = gguf_tensor_color(&format!("blk.{layer}.attn_q.weight"), dark).unwrap();
+                assert!(colors.insert(color));
+                assert_eq!(
+                    Some(color),
+                    gguf_tensor_color(&format!("blk.{layer}.ffn_norm.weight"), dark)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gguf_inline_json_moves_table_rows_when_expanded() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "| Tensor | Shape |\n| --- | ---: |\n| [weights](mdcat-tensor:9) | 4 × 32 |\n\n## Metadata\n\n```json\n{\"name\": \"Example\", \"tokens\": [1, 2]}\n```\n";
+        let mut document = crate::navigation::Document::from_source(
+            dir.path().join("model.gguf"),
+            source.into(),
+            Default::default(),
+        )
+        .unwrap();
+        let syntax = two_face::syntax::extra_newlines();
+        let settings = Settings {
+            terminal_capabilities: pulldown_cmark_mdcat::TerminalProgram::Ansi.capabilities(),
+            terminal_size: pulldown_cmark_mdcat::TerminalSize {
+                columns: 80,
+                ..Default::default()
+            },
+            syntax_set: &syntax,
+            theme: Default::default(),
+            syntax_theme: None,
+        };
+        let mut heights = Vec::new();
+        for expand in [false, true] {
+            if expand {
+                document.json.as_mut().unwrap().toggle(0);
+            }
+            let mut tables = Vec::new();
+            let mut rows = Vec::new();
+            let (text, links) = render_document_with_selection_metadata(
+                &document,
+                &document.input,
+                &settings,
+                &pulldown_cmark_mdcat::resources::NoopResourceHandler,
+                Default::default(),
+                80,
+                &mut tables,
+                &mut rows,
+                &std::collections::HashMap::new(),
+            )
+            .unwrap();
+            assert!(!text
+                .lines
+                .iter()
+                .any(|line| line.to_string().contains("Version:")));
+            let line = text
+                .lines
+                .iter()
+                .position(|line| line.to_string().contains("weights"))
+                .unwrap();
+            assert!(tables.iter().any(|(row, _)| *row == line));
+            assert!(rows
+                .iter()
+                .any(|(start, end)| *start <= line && line <= *end));
+            for scroll in [0, line.saturating_sub(2)] {
+                let hit = link_at(
+                    &links,
+                    ratatui::layout::Rect::new(0, 0, 84, 30),
+                    scroll,
+                    57,
+                    (line - scroll + 1) as u16,
+                )
+                .unwrap();
+                assert_eq!(hit.target, "mdcat-tensor:9");
+            }
+            heights.push(line);
+        }
+        assert!(heights[1] > heights[0]);
     }
 
     #[test]

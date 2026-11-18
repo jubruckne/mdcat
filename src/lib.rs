@@ -10,7 +10,9 @@
 //! Use [`pulldown_cmark_mdcat`] instead.
 
 #![deny(warnings, missing_docs, clippy::all)]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
+
+pub mod gguf_view;
 
 use std::fs::File;
 use std::io::stdin;
@@ -139,8 +141,16 @@ pub fn read_input<T: AsRef<str>>(filename: T) -> Result<(PathBuf, String)> {
         stdin().read_to_string(&mut buffer)?;
         Ok((cd, buffer))
     } else {
-        let mut source = File::open(filename.as_ref())?;
-        source.read_to_string(&mut buffer)?;
+        let path = std::path::Path::new(filename.as_ref());
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            buffer = gguf_view::render(path)?;
+        } else {
+            let mut source = File::open(path)?;
+            source.read_to_string(&mut buffer)?;
+        }
         let base_dir = cd
             .join(filename.as_ref())
             .parent()

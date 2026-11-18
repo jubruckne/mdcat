@@ -18,6 +18,7 @@ pub struct Document {
     pub diff: Option<crate::diff_view::DiffView>,
     pub blame: Option<crate::blame_view::BlameView>,
     pub file_history: Option<crate::history_view::HistoryView>,
+    pub tensor: Option<crate::tensor_view::TensorView>,
     pub original_view: Option<(Box<Document>, usize, Option<String>)>,
     pub image: Option<image::DynamicImage>,
     pub is_directory: bool,
@@ -58,12 +59,53 @@ impl Document {
         Self::load_argument_at(reference, options, &std::env::current_dir()?)
     }
 
+    /// Open a pasted path, expanding the current user's home directory.
+    pub fn load_pasted_argument(
+        reference: &str,
+        options: mdcat::RenderOptions,
+    ) -> Result<(Self, Option<usize>)> {
+        let result = Self::load_argument_with_home(
+            reference,
+            options,
+            &std::env::current_dir()?,
+            std::env::var_os("HOME")
+                .as_deref()
+                .map(std::path::Path::new),
+        );
+        match result {
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                }) =>
+            {
+                bail!("No such file or directory: {reference}")
+            }
+            result => result,
+        }
+    }
+
     fn load_argument_at(
         reference: &str,
         options: mdcat::RenderOptions,
         directory: &std::path::Path,
     ) -> Result<(Self, Option<usize>)> {
-        if !directory.join(reference).exists()
+        Self::load_argument_with_home(reference, options, directory, None)
+    }
+
+    fn load_argument_with_home(
+        reference: &str,
+        options: mdcat::RenderOptions,
+        directory: &std::path::Path,
+        home: Option<&std::path::Path>,
+    ) -> Result<(Self, Option<usize>)> {
+        let resolve = |path: &str| match (home, path.strip_prefix("~/")) {
+            (Some(home), Some(rest)) => home.join(rest),
+            (Some(home), None) if path == "~" => home.to_path_buf(),
+            _ => directory.join(path),
+        };
+        if !resolve(reference).exists()
             && ((7..=40).contains(&reference.len()) || reference.len() == 64)
             && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
         {
@@ -81,13 +123,13 @@ impl Document {
             return Ok((Self::from_commit(&commits, target.as_str())?, None));
         }
         // A literal existing filename wins, including names containing colons.
-        let (filename, line) = if directory.join(reference).exists() {
+        let (filename, line) = if resolve(reference).exists() {
             (reference, None)
         } else {
             split_line_reference(reference)
                 .map_or((reference, None), |(path, line)| (path, Some(line)))
         };
-        let mut document = Self::load(directory.join(filename), options)?;
+        let mut document = Self::load(resolve(filename), options)?;
         if line.is_some() {
             if document.is_directory || document.image.is_some() {
                 bail!("Source line references require a text file");
@@ -100,13 +142,25 @@ impl Document {
     pub fn load(path: PathBuf, options: mdcat::RenderOptions) -> Result<Self> {
         // Resolve relative links from the displayed path, including symlink paths.
         let path = std::env::current_dir()?.join(path);
-        let metadata = std::fs::metadata(&path)?;
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("Could not open {}", path.display()))?;
         if metadata.is_dir() {
             return Self::load_directory(path);
         }
         if !metadata.is_file() {
             bail!("{} is not a regular file", path.display());
         }
+        // The model is reopened for tensor exploration. Retain its resolved
+        // location rather than carrying launch-directory components into that view.
+        let path = if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            path.canonicalize()
+                .with_context(|| format!("Could not resolve GGUF file {}", path.display()))?
+        } else {
+            path
+        };
         if mdcat::is_image_path(&path) {
             let image = image::ImageReader::open(&path)
                 .with_context(|| format!("Failed to open {}", path.display()))?
@@ -128,6 +182,7 @@ impl Document {
                 unformatted_input: None,
                 blame: None,
                 file_history: None,
+                tensor: None,
                 original_view: None,
                 environment,
                 language: None,
@@ -141,8 +196,15 @@ impl Document {
                 project_root,
             });
         }
-        let source = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
+        let source = if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            mdcat::gguf_view::render(&path)?
+        } else {
+            std::fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?
+        };
         if source.contains('\0') {
             bail!("{} contains binary data", path.display());
         }
@@ -151,7 +213,7 @@ impl Document {
 
     pub fn from_source(
         path: PathBuf,
-        source: String,
+        mut source: String,
         options: mdcat::RenderOptions,
     ) -> Result<Self> {
         let extension = path
@@ -159,14 +221,36 @@ impl Document {
             .and_then(|ext| ext.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let json = if extension == "json" {
+        let gguf_table = if extension == "gguf" {
+            let (overview, metadata) = source
+                .split_once("\n## Metadata\n\n```json\n")
+                .context("Missing GGUF metadata")?;
+            let table = overview;
+            let metadata = metadata
+                .strip_suffix("\n```\n")
+                .context("Invalid GGUF metadata")?;
+            let table = table.to_owned();
+            source = metadata.to_owned();
+            Some(table)
+        } else {
+            None
+        };
+        let json = if extension == "gguf" {
+            let mut json = crate::json_view::JsonView::parse_embedded(&source)
+                .context("Invalid GGUF metadata JSON")?;
+            json.fold_all(true);
+            json.select_row(0);
+            json.toggle(0);
+            Some(json)
+        } else if extension == "json" {
             crate::json_view::JsonView::parse(&source)
         } else if matches!(extension.as_str(), "txt" | "log") {
             crate::json_view::JsonView::parse_embedded(&source)
         } else {
             None
         };
-        let markdown = ["md", "markdown", "mdown", "mkd", "mkdn"].contains(&extension.as_str());
+        let markdown =
+            ["md", "markdown", "mdown", "mkd", "mkdn", "gguf"].contains(&extension.as_str());
         let language = if markdown {
             None
         } else {
@@ -196,6 +280,9 @@ impl Document {
         };
         if let Some(width) = options.tabs {
             input = expand_tabs(&input, width).into_owned();
+        }
+        if let Some(table) = gguf_table {
+            input = table;
         }
         let environment =
             Environment::for_local_directory(&path.parent().context("Missing parent")?)?;
@@ -230,6 +317,7 @@ impl Document {
             unformatted_input,
             blame: None,
             file_history: None,
+            tensor: None,
             original_view: None,
             commits,
             diff,
@@ -246,6 +334,27 @@ impl Document {
             input,
             environment,
         })
+    }
+
+    pub fn open_tensor(&self, index: usize, options: mdcat::RenderOptions) -> Result<Self> {
+        let view = crate::tensor_view::TensorView::open(&self.path, index).with_context(|| {
+            format!("Could not open tensor {index} from {}", self.path.display())
+        })?;
+        let mut document =
+            Self::from_source(self.path.with_extension("txt"), String::new(), options)?;
+        document.path = self.path.clone();
+        document.title = Some(view.caption());
+        document.language = None;
+        document.tensor = Some(view);
+        Ok(document)
+    }
+
+    pub fn has_inline_gguf_metadata(&self) -> bool {
+        self.json.is_some()
+            && self
+                .path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
     }
 
     fn load_directory(path: PathBuf) -> Result<Self> {
@@ -300,6 +409,7 @@ impl Document {
             unformatted_input: None,
             blame: None,
             file_history: None,
+            tensor: None,
             original_view: None,
             path,
             title: None,
@@ -409,6 +519,7 @@ impl Document {
             diff: None,
             blame: Some(blame),
             file_history: None,
+            tensor: None,
             original_view: None,
             image: None,
             is_directory: false,
@@ -428,7 +539,11 @@ impl Document {
     }
 
     pub fn can_open(&self, target: &str) -> bool {
-        crate::table_diff::paths(target).is_some()
+        target
+            .strip_prefix("mdcat-tensor:")
+            .is_some_and(|id| id.parse::<usize>().is_ok())
+            && self.has_inline_gguf_metadata()
+            || crate::table_diff::paths(target).is_some()
             || crate::git_links::commit_id(target).is_some() && self.commits.root.is_some()
             || self.destination(target).is_ok()
     }
@@ -514,6 +629,7 @@ impl Document {
             unformatted_input: None,
             blame: None,
             file_history: None,
+            tensor: None,
             original_view: None,
             diff: Some(crate::diff_view::DiffView::parse(&source)),
             image: None,
@@ -686,6 +802,9 @@ impl Document {
     }
 
     pub fn link_label(&self, target: &str) -> Result<String> {
+        if let Some(index) = target.strip_prefix("mdcat-tensor:") {
+            return Ok(format!("Tensor {index}"));
+        }
         if let Some((before, after)) = crate::table_diff::paths(target) {
             return Ok(format!("Diff: {} → {}", before.display(), after.display()));
         }
@@ -720,6 +839,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gguf_tensor_open_retains_resolved_model_path() {
+        let (dir, path) = crate::tensor_view::tests::fixture();
+        let launch = dir.path().join("repos/project");
+        std::fs::create_dir_all(&launch).unwrap();
+        let (document, _) =
+            Document::load_argument_at("../../tensor.gguf", Default::default(), &launch).unwrap();
+        assert_eq!(document.path, path.canonicalize().unwrap());
+        let explorer = document.open_tensor(0, Default::default()).unwrap();
+        assert_eq!(
+            explorer.tensor.as_ref().unwrap().data.value(0).unwrap(),
+            "0"
+        );
+        drop(explorer);
+        std::fs::remove_file(&path).unwrap();
+        let error = match document.open_tensor(0, Default::default()) {
+            Ok(_) => panic!("Deleted model unexpectedly reopened"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(error.contains("tensor 0"));
+        assert!(error.contains("tensor.gguf"));
+    }
+
+    #[test]
+    fn gguf_metadata_is_collapsed_inline_above_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = "| Tensor | Shape |\n| --- | ---: |\n| weights | 4 × 32 |\n\n## Metadata\n\n```json\n{\"general.name\": \"Example\", \"tokens\": [1, 2]}\n```\n";
+        let mut doc = Document::from_source(
+            dir.path().join("model.gguf"),
+            source.into(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(doc.input.starts_with("| Tensor"));
+        assert!(doc.has_inline_gguf_metadata());
+        let json = doc.json.as_mut().unwrap();
+        assert_eq!(json.row_count(), 1);
+        assert!(json.toggle(0));
+        assert!(json.row_count() > 2);
+    }
+
+    #[test]
     fn viewer_arguments_open_commits_with_existing_paths_taking_precedence() {
         let (dir, id) = crate::git_links::tests::repository();
         let nested = dir.path().join("nested");
@@ -740,6 +900,52 @@ mod tests {
             Document::load_argument_at(&id[..7], Default::default(), dir.path()).unwrap();
         assert_eq!(document.source, "literal file\n");
         assert!(document.diff.is_none());
+    }
+
+    #[test]
+    fn pasted_home_paths_open_files_and_line_references() {
+        let home = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("models")).unwrap();
+        let path = home.path().join("models/chat_template.jinja");
+        std::fs::write(&path, "first\nsecond\n").unwrap();
+        for (reference, expected_line) in [
+            ("~/models/chat_template.jinja", None),
+            ("~/models/chat_template.jinja:2", Some(2)),
+        ] {
+            let (document, line) = Document::load_argument_with_home(
+                reference,
+                Default::default(),
+                cwd.path(),
+                Some(home.path()),
+            )
+            .unwrap();
+            assert_eq!(document.path, path);
+            assert_eq!(line, expected_line);
+        }
+        let (document, _) = Document::load_argument_with_home(
+            "~",
+            Default::default(),
+            cwd.path(),
+            Some(home.path()),
+        )
+        .unwrap();
+        assert!(document.is_directory);
+    }
+
+    #[test]
+    fn missing_pasted_path_reports_original_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        let reference = path.to_str().unwrap();
+        let error = match Document::load_pasted_argument(reference, Default::default()) {
+            Ok(_) => panic!("missing file unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            format!("No such file or directory: {reference}")
+        );
     }
 
     #[test]
